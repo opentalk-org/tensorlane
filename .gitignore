@@ -1,0 +1,6 @@
+.direnv/
+target/
+.dnvr/
+.envrc
+.cache/
+.givemedata/

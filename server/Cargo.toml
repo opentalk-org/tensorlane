@@ -1,0 +1,42 @@
+[package]
+name = "givemedata"
+version = "0.1.0"
+edition = "2024"
+authors = ["Adam Cholewiński <me@adamchol.com>"]
+
+[[bin]]
+name = "givemedata"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+axum = "0.8.8"
+aws-config = "1.10.1"
+aws-sdk-s3 = "1.141.0"
+blake2 = "0.10.6"
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["env", "derive"] }
+clap_complete = "4.6.6"
+futures = "0.3.31"
+hound = "3.5.1"
+prost = "0.13.5"
+rand = "0.10.2"
+rubato = "5.0.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.20"
+time = { version = "0.3", features = ["serde-well-known"] }
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-stream = "0.1.17"
+tokio-util = { version = "0.7.19", features = ["rt"] }
+tonic = "0.13.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+uuid = { version = "1.16.0", features = ["v4", "serde"] }
+clickhouse = { version = "0.15.2", features = ["uuid", "time"] }
+
+[build-dependencies]
+protox = "0.7.2"
+tonic-build = { version = "0.13.1", default-features = false, features = ["prost"] }

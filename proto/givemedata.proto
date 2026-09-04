@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+service GiveMeData {
+  rpc Init (InitRequest) returns (InitResponse);
+  rpc Data (stream DataRequest) returns (stream DataResponse);
+  rpc Asset (AssetRequest) returns (stream AssetResponse);
+  rpc Checkpoint (stream CheckpointRequest) returns (CheckpointResponse);
+  rpc Metrics (stream MetricsRequest) returns (MetricsResponse);
+  rpc End (EndRequest) returns (EndResponse);
+}
+
+message InitRequest {
+  string run_id = 1;
+}
+
+message InitResponse {
+  string run_id = 1;
+  string train_config = 2;
+}
+
+enum Split {
+  TRAINING = 0;
+  VALIDATION = 1;
+}
+
+message DataRequest {
+  string run_id = 1;
+  Split split = 2;
+}
+
+message Sample {
+  bytes wave = 1;
+  double duration = 2;
+  int64 speaker_id = 3;
+  int32 language_id = 4;
+  bytes text = 5;
+}
+
+message DataResponse {
+  repeated Sample batch = 1;
+}
+
+message AssetRequest {
+  string run_id = 1;
+  // key into the service's assets map from the data config
+  string name = 2;
+}
+
+message AssetMetadata {
+  optional string entrypoint = 1;
+}
+
+message AssetResponse {
+  oneof payload {
+    // must be the first message of the stream
+    AssetMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message CheckpointMetadata {
+  string run_id = 1;
+  uint64 step = 2;
+}
+
+message CheckpointRequest {
+  oneof payload {
+    // must be the first message of the stream
+    CheckpointMetadata metadata = 1;
+    bytes chunk = 2;
+  }
+}
+
+message CheckpointResponse {}
+
+message MetricsStreamMetadata {
+  string run_id = 1;
+}
+
+message ScalarMetric {
+  uint64 step = 1;
+  int64 timestamp_unix_ms = 2;
+  string name = 3;
+  float value = 4;
+}
+
+message ArrayMetric {
+  uint64 step = 1;
+  int64 timestamp_unix_ms = 2;
+  string name = 3;
+  repeated float value = 4;
+}
+
+message ArtifactMetric {
+  uint64 step = 1;
+  int64 timestamp_unix_ms = 2;
+  string name = 3;
+  string content_type = 4;
+  uint64 size_bytes = 5;
+}
+
+message ArtifactChunk {
+  bytes data = 1;
+}
+
+message MetricsRequest {
+  oneof payload {
+    // Must be the first message of the stream and appear exactly once.
+    MetricsStreamMetadata metadata = 1;
+    ScalarMetric metric = 2;
+    ArtifactMetric artifact = 3;
+    ArtifactChunk artifact_chunk = 4;
+    ArrayMetric array_metric = 5;
+  }
+}
+
+message MetricsResponse {
+  uint64 metrics_received = 1;
+  uint64 artifacts_received = 2;
+  uint64 artifact_bytes_received = 3;
+  uint64 array_metrics_received = 4;
+}
+
+message EndRequest {
+  string run_id = 1;
+}
+
+message EndResponse {}
