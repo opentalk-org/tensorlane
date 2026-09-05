@@ -3,7 +3,7 @@ from dataclasses import dataclass, fields
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from .client import TensorLaneClient
+from .client import Client
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class Batch:
 class _StreamDataset(IterableDataset):
     def __init__(
         self,
-        client: TensorLaneClient,
+        client: Client,
         validation: bool,
         prefetch: int,
         samples_per_epoch: int | None,
@@ -75,7 +75,7 @@ def _batch(parts) -> Batch:
 
 
 def dataloader(
-    client: TensorLaneClient,
+    client: Client,
     validation: bool = False,
     prefetch: int = 4,
     device: str = "cpu",

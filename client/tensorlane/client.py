@@ -8,11 +8,11 @@ from .metrics import MetricsStream
 DEFAULT_ADDR = "localhost:8181"
 
 
-class TensorLaneClient:
-    def __init__(self, training_id: str, addr: str | None = None) -> None:
+class Client:
+    def __init__(self, run_id: str, addr: str | None = None) -> None:
         address = addr or os.environ.get("TENSORLANE_ADDR", DEFAULT_ADDR)
-        self._native = _native.Client(training_id, address)
-        self.training_id: str = self._native.training_id
+        self._native = _native.Client(run_id, address)
+        self.run_id: str = self._native.run_id
         self.train_config: str = self._native.train_config
         self._metrics: MetricsStream | None = None
         self._closed = False
