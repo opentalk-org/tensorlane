@@ -40,21 +40,13 @@
                 manifest = (pkgs.lib.importTOML ./server/Cargo.toml).package;
               in
               pkgs.rustPlatform.buildRustPackage {
-                inherit (manifest) name version;
+                pname = manifest.name;
+                version = manifest.version;
                 cargoLock = {
                   lockFile = ./Cargo.lock;
                 };
-                src =
-                  with pkgs.lib.fileset;
-                  toSource {
-                    root = ./.;
-                    fileset = unions [
-                      ./Cargo.lock
-                      ./Cargo.toml
-                      ./server
-                      ./proto
-                    ];
-                  };
+                src = ./.;
+                buildAndTestSubdir = "server";
               };
           };
 
@@ -94,6 +86,8 @@
 
               UV_PYTHON_PREFERENCE = "only-system";
               UV_PYTHON_DOWNLOADS = "never";
+
+              LIBTORCH_USE_PYTORCH = "1";
             };
 
             shellHook = ''
@@ -107,6 +101,14 @@
                 . .venv/bin/activate
               fi
             '';
+
+            scripts.server = {
+              description = "The main server.";
+              runtimeInputs = [ pkgs.cargo ];
+              text = ''
+                cargo run --bin givemedata
+              '';
+            };
           };
         };
     };
