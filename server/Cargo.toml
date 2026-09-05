@@ -1,11 +1,11 @@
 [package]
-name = "givemedata"
+name = "tensorlane"
 version = "0.1.0"
 edition = "2024"
 authors = ["Adam Cholewiński <me@adamchol.com>"]
 
 [[bin]]
-name = "givemedata"
+name = "tensorlane"
 path = "src/main.rs"
 
 [dependencies]

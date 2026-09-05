@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::audio::{AudioProcessor, ProcessedSample};
 use crate::data_pipeline::Pipeline;
 use crate::proto::DataResponse;
-use crate::proto::give_me_data_client::GiveMeDataClient;
+use crate::proto::tensor_lane_client::TensorLaneClient;
 
 type BatchParts = (
     Vec<PyTensor>,
@@ -92,7 +92,7 @@ pub struct DataTask {
 
 pub fn spawn(
     runtime: &tokio::runtime::Runtime,
-    mut client: GiveMeDataClient<tonic::transport::Channel>,
+    mut client: TensorLaneClient<tonic::transport::Channel>,
     run_id: String,
     validation: bool,
     prefetch: usize,

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::proto::give_me_data_client::GiveMeDataClient;
+use crate::proto::tensor_lane_client::TensorLaneClient;
 use crate::proto::{
     ArtifactChunk, ArtifactMetric, MetricsRequest, MetricsStreamMetadata, ScalarMetric,
     metrics_request,
@@ -98,7 +98,7 @@ impl NativeMetrics {
 impl NativeMetrics {
     pub fn spawn(
         runtime: Arc<tokio::runtime::Runtime>,
-        client: GiveMeDataClient<tonic::transport::Channel>,
+        client: TensorLaneClient<tonic::transport::Channel>,
         training_id: String,
     ) -> Self {
         let (sender, receiver) = flume::unbounded();
@@ -148,7 +148,7 @@ impl MetricsInner {
 }
 
 async fn worker(
-    mut client: GiveMeDataClient<tonic::transport::Channel>,
+    mut client: TensorLaneClient<tonic::transport::Channel>,
     training_id: String,
     commands: Receiver<MetricCommand>,
 ) -> anyhow::Result<()> {

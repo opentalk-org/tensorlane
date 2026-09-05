@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::audio::AudioProcessor;
 use crate::data::{NativeBatch, process_response};
-use crate::proto::give_me_data_client::GiveMeDataClient;
+use crate::proto::tensor_lane_client::TensorLaneClient;
 use crate::proto::{DataRequest, Split};
 
 pub struct Pipeline {
@@ -23,7 +23,7 @@ pub struct Pipeline {
 impl Pipeline {
     pub async fn run(
         self,
-        client: &mut GiveMeDataClient<tonic::transport::Channel>,
+        client: &mut TensorLaneClient<tonic::transport::Channel>,
     ) -> anyhow::Result<()> {
         let Self {
             run_id,

@@ -8,9 +8,9 @@ from .metrics import MetricsStream
 DEFAULT_ADDR = "localhost:8181"
 
 
-class GiveMeDataClient:
+class TensorLaneClient:
     def __init__(self, training_id: str, addr: str | None = None) -> None:
-        address = addr or os.environ.get("GIVEMEDATA_ADDR", DEFAULT_ADDR)
+        address = addr or os.environ.get("TENSORLANE_ADDR", DEFAULT_ADDR)
         self._native = _native.Client(training_id, address)
         self.training_id: str = self._native.training_id
         self.train_config: str = self._native.train_config
@@ -26,7 +26,7 @@ class GiveMeDataClient:
 
     def metrics(self) -> MetricsStream:
         if self._closed:
-            raise RuntimeError("givemedata client is closed")
+            raise RuntimeError("tensorlane client is closed")
         if self._metrics is None:
             self._metrics = MetricsStream(self._native.metrics())
         return self._metrics

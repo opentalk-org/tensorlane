@@ -1,10 +1,10 @@
 [package]
-name = "givemedata-client"
+name = "tensorlane-client"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "gmd_client_native"
+name = "tensorlane_native"
 crate-type = ["cdylib"]
 
 [dependencies]

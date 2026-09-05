@@ -1,5 +1,5 @@
 {
-  description = "The service of no name.";
+  description = "TensorLane";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-26.05";
@@ -75,14 +75,14 @@
               SYNTHETIC = "true";
 
               AWS_ENDPOINT_URL = "http://127.0.0.1:9001";
-              AWS_ACCESS_KEY_ID = "givemedata";
-              AWS_SECRET_ACCESS_KEY = "givemedata";
-              S3_BUCKET = "givemedata";
+              AWS_ACCESS_KEY_ID = "tensorlane";
+              AWS_SECRET_ACCESS_KEY = "tensorlane";
+              S3_BUCKET = "tensorlane";
 
-              CACHE_DIR = "$DNVR_ROOT/.givemedata/cache";
-              ASSETS_DIR = "$DNVR_ROOT/.givemedata/assets";
-              CHECKPOINT_DIR = "$DNVR_ROOT/.givemedata/checkpoints";
-              METRICS_DIR = "$DNVR_ROOT/.givemedata/artifacts";
+              CACHE_DIR = "$DNVR_ROOT/.tensorlane/cache";
+              ASSETS_DIR = "$DNVR_ROOT/.tensorlane/assets";
+              CHECKPOINT_DIR = "$DNVR_ROOT/.tensorlane/checkpoints";
+              METRICS_DIR = "$DNVR_ROOT/.tensorlane/artifacts";
 
               UV_PYTHON_PREFERENCE = "only-system";
               UV_PYTHON_DOWNLOADS = "never";
@@ -106,7 +106,7 @@
               description = "The main server.";
               runtimeInputs = [ pkgs.cargo ];
               text = ''
-                cargo run --bin givemedata
+                cargo run --bin tensorlane
               '';
             };
           };

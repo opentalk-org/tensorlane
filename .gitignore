@@ -3,4 +3,8 @@ target/
 .dnvr/
 .envrc
 .cache/
-.givemedata/
+.tensorlane/
+__pycache__/
+*.pyc
+/client/tensorlane/_native*.so
+/client/tensorlane/_native*.pyd

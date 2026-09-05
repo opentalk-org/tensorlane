@@ -10,7 +10,7 @@ use crate::proto::{
     AssetRequest, AssetResponse, CheckpointRequest, CheckpointResponse, DataRequest, DataResponse,
     EndRequest, EndResponse, InitRequest, InitResponse, MetricsRequest, MetricsResponse,
     checkpoint_request,
-    give_me_data_server::{GiveMeData as GiveMeDataService, GiveMeDataServer},
+    tensor_lane_server::{TensorLane as TensorLaneService, TensorLaneServer},
     metrics_request,
 };
 use crate::run_manager::{RunManager, RunStatus};
@@ -23,7 +23,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
 
-struct GiveMeData {
+struct TensorLane {
     database: Client,
     run_manager: RunManager,
     loader: Arc<dyn Loader>,
@@ -35,7 +35,7 @@ struct GiveMeData {
     active_runs: ActiveRuns,
 }
 
-impl GiveMeData {
+impl TensorLane {
     fn new(
         s3_client: aws_sdk_s3::Client,
         database: Client,
@@ -52,7 +52,7 @@ impl GiveMeData {
         } else {
             Arc::new(S3Loader::new(s3_client.clone(), bucket))
         };
-        GiveMeData {
+        TensorLane {
             active_runs: Default::default(),
             loader,
             assets: AssetStore::new(s3_client, bucket, assets_dir, synthetic),
@@ -67,7 +67,7 @@ impl GiveMeData {
 }
 
 #[tonic::async_trait]
-impl GiveMeDataService for GiveMeData {
+impl TensorLaneService for TensorLane {
     async fn init(&self, request: Request<InitRequest>) -> Result<Response<InitResponse>, Status> {
         let run_id = grpc_support::parse_run_id(&request.into_inner().run_id)?;
         debug!(run = %run_id, "init request");
@@ -279,7 +279,7 @@ pub async fn serve(
     info!("listening on 0.0.0.0:{port}");
 
     Server::builder()
-        .add_service(GiveMeDataServer::new(GiveMeData::new(
+        .add_service(TensorLaneServer::new(TensorLane::new(
             s3_client,
             database,
             run_manager,

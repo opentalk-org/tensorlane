@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, ensure};
 use tokio::io::AsyncWriteExt;
 
-use crate::proto::give_me_data_client::GiveMeDataClient;
+use crate::proto::tensor_lane_client::TensorLaneClient;
 use crate::proto::{AssetRequest, asset_response};
 
 pub async fn download(
-    mut client: GiveMeDataClient<tonic::transport::Channel>,
+    mut client: TensorLaneClient<tonic::transport::Channel>,
     run_id: String,
     name: String,
     destination: PathBuf,

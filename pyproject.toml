@@ -1,7 +1,7 @@
 [project]
-name = "givemedata"
+name = "tensorlane"
 version = "0.1.0"
-description = "Client for the givemedata gRPC service."
+description = "Client for the TensorLane gRPC service."
 requires-python = ">=3.11"
 dependencies = [
     "maturin>=1.0,<2.0",
@@ -15,7 +15,7 @@ build-backend = "maturin"
 [tool.maturin]
 manifest-path = "client/Cargo.toml"
 python-source = "client"
-module-name = "gmd_client._native"
+module-name = "tensorlane._native"
 
 [tool.uv]
-no-build-isolation-package = ["givemedata"]
+no-build-isolation-package = ["tensorlane"]

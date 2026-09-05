@@ -1465,63 +1465,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "givemedata"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "axum",
- "blake2",
- "bytes",
- "clap",
- "clap_complete",
- "clickhouse",
- "futures",
- "hound",
- "prost",
- "protox",
- "rand 0.10.2",
- "rubato",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-build",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "givemedata-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "flume",
- "mime_guess",
- "prost",
- "protox",
- "pyo3",
- "pyo3-build-config 0.29.2",
- "pyo3-tch",
- "tar",
- "tch",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-build",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3355,6 +3298,63 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tensorlane"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "axum",
+ "blake2",
+ "bytes",
+ "clap",
+ "clap_complete",
+ "clickhouse",
+ "futures",
+ "hound",
+ "prost",
+ "protox",
+ "rand 0.10.2",
+ "rubato",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "tensorlane-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "flume",
+ "mime_guess",
+ "prost",
+ "protox",
+ "pyo3",
+ "pyo3-build-config 0.29.2",
+ "pyo3-tch",
+ "tar",
+ "tch",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]

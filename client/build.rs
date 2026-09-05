@@ -1,4 +1,4 @@
-const PROTO: &str = "../proto/givemedata.proto";
+const PROTO: &str = "../proto/tensorlane.proto";
 const INCLUDE: &str = "../proto";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

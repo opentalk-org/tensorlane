@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-service GiveMeData {
+service TensorLane {
   rpc Init (InitRequest) returns (InitResponse);
   rpc Data (stream DataRequest) returns (stream DataResponse);
   rpc Asset (AssetRequest) returns (stream AssetResponse);

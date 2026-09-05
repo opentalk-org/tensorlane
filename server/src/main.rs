@@ -43,12 +43,12 @@ const STYLES: Styles = Styles::styled()
 
 #[derive(Parser)]
 #[command(
-    name = "givemedata",
+    name = "tensorlane",
     styles = STYLES,
     args_conflicts_with_subcommands = true,
     subcommand_negates_reqs = true
 )]
-#[command(about = "GIVE ME DATA!", long_about = None)]
+#[command(about = "TensorLane", long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
@@ -143,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
             .get_one::<Shell>("shell")
             .copied()
             .context("shell is required by clap")?;
-        generate(shell, &mut Args::command(), "givemedata", &mut io::stdout());
+        generate(shell, &mut Args::command(), "tensorlane", &mut io::stdout());
         return Ok(());
     }
     let args = Args::from_arg_matches(&matches)?;

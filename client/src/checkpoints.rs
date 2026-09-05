@@ -7,7 +7,7 @@ use flume::Receiver;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::proto::give_me_data_client::GiveMeDataClient;
+use crate::proto::tensor_lane_client::TensorLaneClient;
 use crate::proto::{CheckpointMetadata, CheckpointRequest, checkpoint_request};
 
 const CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -18,7 +18,7 @@ pub struct CheckpointJob {
 }
 
 pub async fn worker(
-    mut client: GiveMeDataClient<tonic::transport::Channel>,
+    mut client: TensorLaneClient<tonic::transport::Channel>,
     training_id: String,
     jobs: Receiver<CheckpointJob>,
 ) -> anyhow::Result<()> {
@@ -29,7 +29,7 @@ pub async fn worker(
 }
 
 async fn upload(
-    client: &mut GiveMeDataClient<tonic::transport::Channel>,
+    client: &mut TensorLaneClient<tonic::transport::Channel>,
     run_id: &str,
     job: CheckpointJob,
 ) -> anyhow::Result<()> {

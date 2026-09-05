@@ -11,7 +11,7 @@ use crate::assets;
 use crate::checkpoints::{self, CheckpointJob};
 use crate::data::{self, DataTask, NativeDataStream};
 use crate::metrics::NativeMetrics;
-use crate::proto::give_me_data_client::GiveMeDataClient;
+use crate::proto::tensor_lane_client::TensorLaneClient;
 use crate::proto::{EndRequest, InitRequest};
 
 const MAX_MESSAGE_BYTES: usize = 67_136_000;
@@ -27,7 +27,7 @@ struct ClientState {
 #[pyclass(name = "Client")]
 pub struct NativeClient {
     runtime: Arc<tokio::runtime::Runtime>,
-    grpc: GiveMeDataClient<Channel>,
+    grpc: TensorLaneClient<Channel>,
     run_id: String,
     train_config: String,
     state: Mutex<ClientState>,
@@ -61,7 +61,7 @@ impl NativeClient {
     ) -> anyhow::Result<NativeDataStream> {
         let mut state = self.lock_state()?;
         if state.closed {
-            bail!("givemedata client is closed");
+            bail!("tensorlane client is closed");
         }
         let (stream, task) = data::spawn(
             &self.runtime,
@@ -90,7 +90,7 @@ impl NativeClient {
     fn upload_checkpoint(&self, step: u64, source: PathBuf) -> anyhow::Result<()> {
         let state = self.lock_state()?;
         if state.closed {
-            bail!("givemedata client is closed");
+            bail!("tensorlane client is closed");
         }
         let sender = state
             .checkpoint_sender
@@ -104,7 +104,7 @@ impl NativeClient {
     fn metrics(&self) -> anyhow::Result<NativeMetrics> {
         let mut state = self.lock_state()?;
         if state.closed {
-            bail!("givemedata client is closed");
+            bail!("tensorlane client is closed");
         }
         if let Some(metrics) = &state.metrics {
             return Ok(metrics.clone());
@@ -125,12 +125,12 @@ impl NativeClient {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .thread_name("givemedata-client")
+                .thread_name("tensorlane-client")
                 .build()?,
         );
         let endpoint = Endpoint::from_shared(format!("http://{addr}"))?;
         let channel = runtime.block_on(endpoint.connect())?;
-        let mut grpc = GiveMeDataClient::new(channel)
+        let mut grpc = TensorLaneClient::new(channel)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let initialized = runtime
@@ -218,7 +218,7 @@ impl NativeClient {
     fn ensure_open(&self) -> anyhow::Result<()> {
         let state = self.lock_state()?;
         if state.closed {
-            bail!("givemedata client is closed")
+            bail!("tensorlane client is closed")
         } else {
             Ok(())
         }
