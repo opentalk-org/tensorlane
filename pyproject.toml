@@ -16,6 +16,7 @@ build-backend = "maturin"
 manifest-path = "client/Cargo.toml"
 python-source = "client"
 module-name = "tensorlane._native"
+config = ['env.LIBTORCH_USE_PYTORCH="1"']
 
 [tool.uv]
 no-build-isolation-package = ["tensorlane"]
