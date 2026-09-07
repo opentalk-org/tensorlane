@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import _native
 
 
 class MetricsStream:
-    def __init__(self, native) -> None:
+    def __init__(self, native: _native.Metrics) -> None:
         self._native = native
 
     def log_metric(

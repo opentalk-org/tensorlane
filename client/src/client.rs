@@ -1,232 +1,189 @@
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use anyhow::{anyhow, bail};
-use flume::Sender;
+use anyhow::{Context, anyhow, ensure};
 use pyo3::prelude::*;
-use tokio::task::JoinHandle;
-use tonic::transport::{Channel, Endpoint};
+use pyo3_tch::PyTensor;
+use tch::Tensor;
+use tokio::sync::oneshot;
 
-use crate::assets;
-use crate::checkpoints::{self, CheckpointJob};
-use crate::data::{self, DataTask, NativeDataStream};
-use crate::metrics::NativeMetrics;
-use crate::proto::tensor_lane_client::TensorLaneClient;
-use crate::proto::{EndRequest, InitRequest};
+use crate::proto::Sample;
+use crate::worker::{Command, Worker};
 
-const MAX_MESSAGE_BYTES: usize = 67_136_000;
+type SampleParts = (PyTensor, f64, i64, i32, PyTensor);
 
-struct ClientState {
-    checkpoint_sender: Option<Sender<CheckpointJob>>,
-    checkpoint_join: Option<JoinHandle<anyhow::Result<()>>>,
-    data_tasks: Vec<DataTask>,
-    metrics: Option<NativeMetrics>,
-    closed: bool,
+fn sample_parts(sample: Sample) -> anyhow::Result<SampleParts> {
+    ensure!(
+        sample.wave.len() % 2 == 0,
+        "wave byte length must be a multiple of 2 (int16 PCM)"
+    );
+    ensure!(
+        sample.text.len() % 8 == 0,
+        "text byte length must be a multiple of 8 (int64 token IDs)"
+    );
+    // Decode explicitly instead of assuming host endianness or byte alignment.
+    let wave: Vec<i16> = sample
+        .wave
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let text: Vec<i64> = sample
+        .text
+        .chunks_exact(8)
+        .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    Ok((
+        PyTensor(Tensor::f_from_slice(&wave)?),
+        sample.duration,
+        sample.speaker_id,
+        sample.language_id,
+        PyTensor(Tensor::f_from_slice(&text)?),
+    ))
 }
 
-#[pyclass(name = "Client")]
-pub struct NativeClient {
-    runtime: Arc<tokio::runtime::Runtime>,
-    grpc: TensorLaneClient<Channel>,
+#[pyclass]
+pub struct Client {
+    worker: Mutex<Option<Worker>>,
+    #[pyo3(get)]
     run_id: String,
+    #[pyo3(get)]
     train_config: String,
-    state: Mutex<ClientState>,
 }
 
-#[pymethods]
-impl NativeClient {
-    #[new]
-    #[pyo3(signature = (run_id, addr="localhost:8181"))]
-    fn new(py: Python<'_>, run_id: String, addr: &str) -> anyhow::Result<Self> {
-        py.allow_threads(|| Self::connect(run_id, addr))
-    }
-
-    #[getter]
-    fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    #[getter]
-    fn train_config(&self) -> &str {
-        &self.train_config
-    }
-
-    #[pyo3(signature = (validation=false, prefetch=4, modality_id=0, pin_memory=false))]
-    fn batches(
-        &self,
-        validation: bool,
-        prefetch: usize,
-        modality_id: i64,
-        pin_memory: bool,
-    ) -> anyhow::Result<NativeDataStream> {
-        let mut state = self.lock_state()?;
-        if state.closed {
-            bail!("tensorlane client is closed");
-        }
-        let (stream, task) = data::spawn(
-            &self.runtime,
-            self.grpc.clone(),
-            self.run_id.clone(),
-            validation,
-            prefetch,
-            modality_id,
-            pin_memory,
-        )?;
-        state.data_tasks.push(task);
-        Ok(stream)
-    }
-
-    fn download_asset(
-        &self,
-        py: Python<'_>,
-        name: String,
-        destination: PathBuf,
-    ) -> anyhow::Result<PathBuf> {
-        self.ensure_open()?;
-        let future = assets::download(self.grpc.clone(), self.run_id.clone(), name, destination);
-        py.allow_threads(|| self.runtime.block_on(future))
-    }
-
-    fn upload_checkpoint(&self, step: u64, source: PathBuf) -> anyhow::Result<()> {
-        let state = self.lock_state()?;
-        if state.closed {
-            bail!("tensorlane client is closed");
-        }
-        let sender = state
-            .checkpoint_sender
-            .as_ref()
-            .ok_or_else(|| anyhow!("checkpoint worker is closed"))?;
-        sender
-            .send(CheckpointJob { step, source })
-            .map_err(Into::into)
-    }
-
-    fn metrics(&self) -> anyhow::Result<NativeMetrics> {
-        let mut state = self.lock_state()?;
-        if state.closed {
-            bail!("tensorlane client is closed");
-        }
-        if let Some(metrics) = &state.metrics {
-            return Ok(metrics.clone());
-        }
-        let metrics =
-            NativeMetrics::spawn(self.runtime.clone(), self.grpc.clone(), self.run_id.clone());
-        state.metrics = Some(metrics.clone());
-        Ok(metrics)
-    }
-
-    fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
-        py.allow_threads(|| self.close_native())
-    }
-}
-
-impl NativeClient {
-    fn connect(run_id: String, addr: &str) -> anyhow::Result<Self> {
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("tensorlane-client")
-                .build()?,
-        );
-        let endpoint = Endpoint::from_shared(format!("http://{addr}"))?;
-        let channel = runtime.block_on(endpoint.connect())?;
-        let mut grpc = TensorLaneClient::new(channel)
-            .max_decoding_message_size(MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(MAX_MESSAGE_BYTES);
-        let initialized = runtime
-            .block_on(grpc.init(InitRequest { run_id }))?
-            .into_inner();
-        let (checkpoint_sender, checkpoint_receiver) = flume::unbounded();
-        let checkpoint_join = runtime.spawn(checkpoints::worker(
-            grpc.clone(),
-            initialized.run_id.clone(),
-            checkpoint_receiver,
-        ));
+impl Client {
+    fn start(run_id: String, addr: String) -> anyhow::Result<Self> {
+        let (worker, initialized) = Worker::start(run_id, addr)?;
         Ok(Self {
-            runtime,
-            grpc,
+            worker: Mutex::new(Some(worker)),
             run_id: initialized.run_id,
             train_config: initialized.train_config,
-            state: Mutex::new(ClientState {
-                checkpoint_sender: Some(checkpoint_sender),
-                checkpoint_join: Some(checkpoint_join),
-                data_tasks: Vec::new(),
-                metrics: None,
-                closed: false,
-            }),
         })
     }
 
-    fn close_native(&self) -> anyhow::Result<()> {
-        let (checkpoint_sender, checkpoint_join, data_tasks, metrics) = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("client lock is poisoned"))?;
-            if state.closed {
-                return Ok(());
-            }
-            state.closed = true;
-            (
-                state.checkpoint_sender.take(),
-                state.checkpoint_join.take(),
-                std::mem::take(&mut state.data_tasks),
-                state.metrics.take(),
-            )
-        };
-        for task in &data_tasks {
-            task.cancellation.cancel();
-        }
-        drop(checkpoint_sender);
-        let mut errors = Vec::new();
-        if let Some(metrics) = metrics
-            && let Err(error) = metrics.close_native()
-        {
-            errors.push(format!("closing metrics stream: {error:#}"));
-        }
-        self.runtime.block_on(async {
-            for task in data_tasks {
-                match task.join.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => errors.push(format!("data stream failed: {error:#}")),
-                    Err(error) => errors.push(format!("joining data stream: {error:#}")),
-                }
-            }
-            if let Some(join) = checkpoint_join {
-                match join.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        errors.push(format!("checkpoint upload failed: {error:#}"));
-                    }
-                    Err(error) => errors.push(format!("joining checkpoint worker: {error:#}")),
-                }
-            }
-        });
-        let mut grpc = self.grpc.clone();
-        if let Err(error) = self.runtime.block_on(grpc.end(EndRequest {
-            run_id: self.run_id.clone(),
-        })) {
-            errors.push(format!("ending training: {error:#}"));
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            anyhow::bail!(errors.join("; "))
-        }
-    }
-
-    fn ensure_open(&self) -> anyhow::Result<()> {
-        let state = self.lock_state()?;
-        if state.closed {
-            bail!("tensorlane client is closed")
-        } else {
-            Ok(())
-        }
-    }
-
-    fn lock_state(&self) -> anyhow::Result<std::sync::MutexGuard<'_, ClientState>> {
-        self.state
+    fn enqueue(&self, command: Command) -> anyhow::Result<()> {
+        let guard = self
+            .worker
             .lock()
-            .map_err(|_| anyhow::anyhow!("client lock is poisoned"))
+            .map_err(|_| anyhow!("worker lock poisoned"))?;
+        let worker = guard.as_ref().context("TensorLane client is closed")?;
+        worker.send(command)
+    }
+
+    fn stop(&self) -> anyhow::Result<()> {
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|_| anyhow!("worker lock poisoned"))?
+            .take();
+        if let Some(mut worker) = worker {
+            worker.shutdown()?;
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl Client {
+    #[new]
+    #[pyo3(signature = (run_id, addr="localhost:8181"))]
+    fn new(py: Python<'_>, run_id: String, addr: &str) -> anyhow::Result<Self> {
+        py.allow_threads(|| Self::start(run_id, addr.to_owned()))
+    }
+
+    #[pyo3(signature = (validation=false))]
+    fn next_batch(
+        &self,
+        py: Python<'_>,
+        validation: bool,
+    ) -> anyhow::Result<Option<Vec<SampleParts>>> {
+        py.allow_threads(|| {
+            let (reply, response) = oneshot::channel();
+            self.enqueue(Command::NextBatch { validation, reply })?;
+            let batch = response
+                .blocking_recv()
+                .context("worker dropped the batch reply")??;
+            batch
+                .map(|response| response.batch.into_iter().map(sample_parts).collect())
+                .transpose()
+        })
+    }
+
+    fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
+        py.allow_threads(|| self.stop())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tch::{Device, Kind};
+
+    #[test]
+    fn pytensor_exposes_a_torch_tensor_without_copying_its_storage() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            py.import("torch").unwrap();
+            let tensor = Tensor::from_slice(&[1_i64, 2, 3]);
+            let pointer = tensor.data_ptr() as usize;
+            let object = PyTensor(tensor).into_pyobject(py).unwrap();
+            assert_eq!(
+                object
+                    .call_method0("data_ptr")
+                    .unwrap()
+                    .extract::<usize>()
+                    .unwrap(),
+                pointer
+            );
+            assert_eq!(
+                object
+                    .call_method0("tolist")
+                    .unwrap()
+                    .extract::<Vec<i64>>()
+                    .unwrap(),
+                [1, 2, 3]
+            );
+        });
+    }
+
+    #[test]
+    fn decodes_owned_tensors_with_wire_dtypes_and_values() {
+        let waves = [i16::MIN, -1, 0, i16::MAX];
+        let tokens = [0_i64, 123, i64::MAX];
+        let (wave, duration, speaker, language, text) = sample_parts(Sample {
+            wave: waves.into_iter().flat_map(i16::to_le_bytes).collect(),
+            text: tokens.into_iter().flat_map(i64::to_le_bytes).collect(),
+            duration: 0.5,
+            speaker_id: 42,
+            language_id: 7,
+        })
+        .unwrap();
+        assert_eq!(wave.kind(), Kind::Int16);
+        assert_eq!(text.kind(), Kind::Int64);
+        assert_eq!(wave.device(), Device::Cpu);
+        assert_eq!(wave.size(), [4]);
+        assert_eq!(text.size(), [3]);
+        assert_eq!(Vec::<i16>::try_from(&wave.0).unwrap(), waves);
+        assert_eq!(Vec::<i64>::try_from(&text.0).unwrap(), tokens);
+        assert_eq!((duration, speaker, language), (0.5, 42, 7));
+    }
+
+    #[test]
+    fn handles_empty_buffers_and_rejects_truncated_values() {
+        let (wave, _, _, _, text) = sample_parts(Sample::default()).unwrap();
+        assert_eq!(wave.size(), [0]);
+        assert_eq!(text.size(), [0]);
+        assert!(
+            sample_parts(Sample {
+                wave: vec![0],
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            sample_parts(Sample {
+                text: vec![0; 7],
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 }
