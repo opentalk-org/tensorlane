@@ -4,8 +4,10 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-26.05";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    dnvrNixpkgs.url = "github:NixOS/nixpkgs/56c02bc00adcf003215cc4bd996d6efaf4cff188";
     dnvr.url = "github:dialohq/dnvr";
-    dnvr.inputs.nixpkgs.follows = "nixpkgs";
+    dnvr.inputs.nixpkgs.follows = "dnvrNixpkgs";
+    dialo-overlays.url = "github:dialohq/nix-overlays";
   };
 
   outputs =
@@ -14,6 +16,7 @@
       nixpkgs,
       flake-parts,
       dnvr,
+      ...
     }@inputs:
     flake-parts.lib.mkFlake { inherit inputs; } {
       imports = [ dnvr.flakeModule ];
@@ -28,8 +31,12 @@
         {
           self',
           pkgs,
+          system,
           ...
         }:
+        let
+          atlas = inputs.dialo-overlays.packages.${system}.atlas;
+        in
         {
           formatter = pkgs.nixfmt;
 
@@ -50,12 +57,15 @@
               };
           };
 
+          dnvr.specialArgs = { inherit inputs system; };
           dnvr.shells.default = { ... }: {
+            imports = [ ./nix/clickhouse.nix ];
+
             packages = [
               pkgs.python312
               pkgs.uv
               pkgs.ruff
-              pkgs.pyright
+              pkgs.ty
 
               pkgs.cargo
               pkgs.clippy
@@ -64,6 +74,8 @@
               pkgs.rustfmt
 
               pkgs.protobuf
+
+              atlas
             ];
 
             env = {
