@@ -64,21 +64,12 @@ in
       set -euo pipefail
       cd "$DNVR_ROOT"
 
-      migration_name="''${1:-}"
-      if [ -z "$migration_name" ]; then
-        read -r -p "Migration name: " migration_name
-      fi
-      if [ -z "$migration_name" ]; then
-        echo "Migration name is required" >&2
-        exit 2
-      fi
-
       dev_host="$(dnvr-state get clickhouse-atlas-dev.host)"
       dev_port="$(dnvr-state get clickhouse-atlas-dev.tcpPort)"
       dev_database="$(dnvr-state get clickhouse-atlas-dev.database)"
       export CLICKHOUSE_DEV_URL="clickhouse://$dev_host:$dev_port/$dev_database"
 
-      exec atlas migrate diff "$migration_name" --env migration
+      exec atlas migrate diff --env migration
     '';
   };
 
