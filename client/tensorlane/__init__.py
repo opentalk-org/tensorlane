@@ -1,7 +1,6 @@
 """Public Python API for TensorLane."""
 
 from .client import Client
-from .data import dataloader
-from .metrics import MetricsStream
+from .data import Batch, BatchLoader, Sample, dataloader
 
-__all__ = ["Client", "MetricsStream", "dataloader"]
+__all__ = ["Client", "Sample", "Batch", "BatchLoader", "dataloader"]

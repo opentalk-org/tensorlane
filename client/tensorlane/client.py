@@ -1,38 +1,48 @@
 import os
-from pathlib import Path
+from types import TracebackType
+from typing import Self
 
-import torch as _torch
+# Load libtorch's shared libraries before the extension.
+import torch as _torch  # noqa: F401
+
 from . import _native
-from .metrics import MetricsStream
-
-DEFAULT_ADDR = "localhost:8181"
+from .data import Batch, Sample
 
 
 class Client:
+    """Handle to a dedicated Rust thread running a Tokio command loop."""
+
     def __init__(self, run_id: str, addr: str | None = None) -> None:
-        address = addr or os.environ.get("TENSORLANE_ADDR", DEFAULT_ADDR)
+        """Connect and call Init on the worker, releasing the GIL while waiting."""
+        address = addr or os.environ.get("TENSORLANE_ADDR", "localhost:8181")
         self._native = _native.Client(run_id, address)
-        self.run_id: str = self._native.run_id
-        self.train_config: str = self._native.train_config
-        self._metrics: MetricsStream | None = None
-        self._closed = False
 
-    def download_asset(self, name: str, dest_dir: Path) -> Path:
-        return Path(self._native.download_asset(name, Path(dest_dir)))
+    @property
+    def run_id(self) -> str:
+        return self._native.run_id
 
-    def upload_checkpoint(self, step: int, source_dir: Path) -> None:
-        """Queue a checkpoint directory for background archiving and upload."""
-        self._native.upload_checkpoint(step, Path(source_dir))
+    @property
+    def train_config(self) -> str:
+        return self._native.train_config
 
-    def metrics(self) -> MetricsStream:
-        if self._closed:
-            raise RuntimeError("tensorlane client is closed")
-        if self._metrics is None:
-            self._metrics = MetricsStream(self._native.metrics())
-        return self._metrics
+    def next_batch(self, validation: bool = False) -> Batch | None:
+        """Request one batch, or return None when the selected split is exhausted."""
+        parts = self._native.next_batch(validation)
+        if parts is None:
+            return None
+        return Batch(tuple(Sample(*sample) for sample in parts))
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        """Finish queued requests and join the worker thread. Idempotent."""
         self._native.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.close()
