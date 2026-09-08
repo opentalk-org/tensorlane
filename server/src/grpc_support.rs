@@ -7,6 +7,7 @@ use anyhow::Context;
 use bytes::BytesMut;
 use clickhouse::Client;
 use futures::Stream;
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
@@ -212,21 +213,18 @@ pub fn asset_stream(
 }
 
 pub async fn receive_checkpoint(
-    root: &Path,
-    run_id: Uuid,
-    step: u64,
+    path: &Path,
     stream: &mut Streaming<CheckpointRequest>,
-) -> anyhow::Result<(PathBuf, u64)> {
-    let dir = root.join(run_id.to_string());
-    fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("step_{step:09}.tar"));
-    let part = dir.join(format!("step_{step:09}.tar.part"));
+) -> anyhow::Result<(u64, String)> {
+    let part = path.with_extension("part");
     let mut file = fs::File::create(&part).await?;
     let mut bytes = 0;
+    let mut hasher = Sha256::new();
     while let Some(request) = stream.message().await? {
         match request.payload {
             Some(checkpoint_request::Payload::Chunk(chunk)) => {
                 bytes += chunk.len() as u64;
+                hasher.update(&chunk);
                 file.write_all(&chunk).await?;
             }
             _ => anyhow::bail!("expected checkpoint chunks after the metadata"),
@@ -234,5 +232,5 @@ pub async fn receive_checkpoint(
     }
     file.sync_all().await?;
     fs::rename(&part, &path).await?;
-    Ok((path, bytes))
+    Ok((bytes, format!("{:x}", hasher.finalize())))
 }

@@ -23,6 +23,7 @@ const SYNTHETIC_TRAINING_SAMPLES: usize = 256;
 #[derive(Clone, Deserialize, Serialize)]
 pub struct DataConfig {
     pub dataset_id: Uuid,
+    pub asset_type: String,
     pub seed: u64,
     pub max_text_tokens: i32,
     #[serde(default)]

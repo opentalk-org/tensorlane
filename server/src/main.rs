@@ -27,6 +27,7 @@ mod run;
 mod run_manager;
 mod sampling;
 mod symbols;
+mod uploads;
 
 mod proto {
     tonic::include_proto!("_");
@@ -96,7 +97,7 @@ struct Args {
     #[arg(
         long,
         env = "CACHE_DIR",
-        help = "Directory for spilling prefetched audio to disk; omit to keep it in memory."
+        help = "Directory for prefetched data, downloaded assets, and staged uploads."
     )]
     cache_dir: PathBuf,
     #[arg(
@@ -107,22 +108,16 @@ struct Args {
     synthetic: bool,
     #[arg(
         long,
-        env = "ASSETS_DIR",
-        help = "Directory caching training assets downloaded from the bucket."
+        env = "CHECKPOINT_PREFIX",
+        help = "S3 object-key prefix for uploaded checkpoints."
     )]
-    assets_dir: PathBuf,
+    checkpoint_prefix: String,
     #[arg(
         long,
-        env = "CHECKPOINT_DIR",
-        help = "Directory storing checkpoints uploaded by trainings."
+        env = "METRICS_PREFIX",
+        help = "S3 object-key prefix for uploaded metric artifacts."
     )]
-    checkpoint_dir: PathBuf,
-    #[arg(
-        long,
-        env = "METRICS_DIR",
-        help = "Directory storing streamed metric artifacts."
-    )]
-    metrics_dir: PathBuf,
+    metrics_prefix: String,
 }
 
 #[derive(Subcommand)]
@@ -173,10 +168,15 @@ async fn main() -> anyhow::Result<()> {
             .build(),
     );
 
-    fs::create_dir_all(&args.cache_dir).await?;
-    fs::create_dir_all(&args.assets_dir).await?;
-    fs::create_dir_all(&args.checkpoint_dir).await?;
-    fs::create_dir_all(&args.metrics_dir).await?;
+    let data_cache_dir: &'static std::path::Path =
+        Box::leak(args.cache_dir.join("data").into_boxed_path());
+    let assets_cache_dir: &'static std::path::Path =
+        Box::leak(args.cache_dir.join("assets").into_boxed_path());
+    let uploads_cache_dir: &'static std::path::Path =
+        Box::leak(args.cache_dir.join("uploads").into_boxed_path());
+    fs::create_dir_all(&data_cache_dir).await?;
+    fs::create_dir_all(&assets_cache_dir).await?;
+    fs::create_dir_all(&uploads_cache_dir).await?;
 
     let run_manager = run_manager::RunManager::new(database.clone());
     let shutdown = CancellationToken::new();
@@ -192,10 +192,11 @@ async fn main() -> anyhow::Result<()> {
         database,
         run_manager,
         args.bucket.leak(),
-        Box::leak(args.cache_dir.into_boxed_path()),
-        Box::leak(args.assets_dir.into_boxed_path()),
-        Box::leak(args.checkpoint_dir.into_boxed_path()),
-        Box::leak(args.metrics_dir.into_boxed_path()),
+        data_cache_dir,
+        assets_cache_dir,
+        uploads_cache_dir,
+        args.checkpoint_prefix.leak(),
+        args.metrics_prefix.leak(),
         args.synthetic,
         shutdown.clone(),
     ));

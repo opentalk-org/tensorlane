@@ -9,11 +9,11 @@ use crate::metrics;
 use crate::proto::{
     AssetRequest, AssetResponse, CheckpointRequest, CheckpointResponse, DataRequest, DataResponse,
     EndRequest, EndResponse, InitRequest, InitResponse, MetricsRequest, MetricsResponse,
-    checkpoint_request,
+    checkpoint_request, metrics_request,
     tensor_lane_server::{TensorLane as TensorLaneService, TensorLaneServer},
-    metrics_request,
 };
 use crate::run_manager::{RunManager, RunStatus};
+use crate::uploads::UploadStore;
 use clickhouse::Client;
 use futures::Stream;
 use tokio::sync::mpsc;
@@ -29,8 +29,7 @@ struct TensorLane {
     loader: Arc<dyn Loader>,
     assets: AssetStore,
     cache_dir: &'static Path,
-    checkpoint_dir: &'static Path,
-    metrics_dir: &'static Path,
+    uploads: UploadStore,
     synthetic: bool,
     active_runs: ActiveRuns,
 }
@@ -42,9 +41,8 @@ impl TensorLane {
         run_manager: RunManager,
         bucket: &'static str,
         cache_dir: &'static Path,
-        assets_dir: &'static Path,
-        checkpoint_dir: &'static Path,
-        metrics_dir: &'static Path,
+        assets_cache_dir: &'static Path,
+        uploads: UploadStore,
         synthetic: bool,
     ) -> Self {
         let loader: Arc<dyn Loader> = if synthetic {
@@ -52,13 +50,12 @@ impl TensorLane {
         } else {
             Arc::new(S3Loader::new(s3_client.clone(), bucket))
         };
-        TensorLane {
+        Self {
             active_runs: Default::default(),
             loader,
-            assets: AssetStore::new(s3_client, bucket, assets_dir, synthetic),
+            assets: AssetStore::new(s3_client, bucket, assets_cache_dir, synthetic),
             cache_dir,
-            checkpoint_dir,
-            metrics_dir,
+            uploads,
             synthetic,
             database,
             run_manager,
@@ -166,32 +163,43 @@ impl TensorLaneService for TensorLane {
             }
         };
         let run_id = grpc_support::parse_run_id(&metadata.run_id)?;
-        if !self.active_runs.read().await.contains_key(&run_id) {
-            return Err(Status::not_found("unknown run"));
-        }
+        let asset_type = self
+            .active_runs
+            .read()
+            .await
+            .get(&run_id)
+            .ok_or_else(|| Status::not_found("unknown run"))?
+            .config
+            .asset_type
+            .clone();
         info!(run = %run_id, step = metadata.step, "receiving checkpoint");
 
-        let result = grpc_support::receive_checkpoint(
-            self.checkpoint_dir,
-            run_id,
-            metadata.step,
-            &mut stream,
-        )
-        .await;
+        let checkpoint_id = uuid::Uuid::new_v4();
+        let path = self.uploads.staging_path(checkpoint_id);
+        let result = grpc_support::receive_checkpoint(&path, &mut stream).await;
 
         match result {
-            Ok((path, bytes)) => {
+            Ok((bytes, content_hash)) => {
+                self.uploads.checkpoint(
+                    checkpoint_id,
+                    run_id,
+                    metadata.step,
+                    bytes,
+                    content_hash,
+                    asset_type,
+                );
                 info!(
+                    checkpoint = %checkpoint_id,
                     run = %run_id,
                     step = metadata.step,
                     bytes,
                     path = %path.display(),
-                    "checkpoint stored"
+                    "checkpoint staged"
                 );
                 Ok(Response::new(CheckpointResponse {}))
             }
             Err(err) => {
-                error!(error = format!("{err:#}"), "storing checkpoint failed");
+                error!(error = format!("{err:#}"), "staging checkpoint failed");
                 Err(Status::internal(format!("{err:#}")))
             }
         }
@@ -216,7 +224,7 @@ impl TensorLaneService for TensorLane {
         }
         info!(run = %run_id, "receiving metrics");
 
-        match metrics::receive(&self.database, self.metrics_dir, run_id, stream).await {
+        match metrics::receive(&self.database, &self.uploads, run_id, stream).await {
             Ok(response) => {
                 info!(
                     run = %run_id,
@@ -224,7 +232,7 @@ impl TensorLaneService for TensorLane {
                     array_metrics = response.array_metrics_received,
                     artifacts = response.artifacts_received,
                     artifact_bytes = response.artifact_bytes_received,
-                    "metrics stored"
+                    "metrics stream accepted"
                 );
                 Ok(Response::new(response))
             }
@@ -232,7 +240,7 @@ impl TensorLaneService for TensorLane {
                 error!(
                     run = %run_id,
                     error = %status,
-                    "storing metrics failed"
+                    "receiving metrics failed"
                 );
                 Err(status)
             }
@@ -267,9 +275,10 @@ pub async fn serve(
     run_manager: RunManager,
     bucket: &'static str,
     cache_dir: &'static Path,
-    assets_dir: &'static Path,
-    checkpoint_dir: &'static Path,
-    metrics_dir: &'static Path,
+    assets_cache_dir: &'static Path,
+    uploads_dir: &'static Path,
+    checkpoint_prefix: &'static str,
+    metrics_prefix: &'static str,
     synthetic: bool,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -278,23 +287,33 @@ pub async fn serve(
     }
     info!("listening on 0.0.0.0:{port}");
 
-    Server::builder()
+    let uploads = UploadStore::new(
+        s3_client.clone(),
+        database.clone(),
+        bucket,
+        checkpoint_prefix,
+        metrics_prefix,
+        uploads_dir,
+    )?;
+    let result = Server::builder()
         .add_service(TensorLaneServer::new(TensorLane::new(
             s3_client,
             database,
             run_manager,
             bucket,
             cache_dir,
-            assets_dir,
-            checkpoint_dir,
-            metrics_dir,
+            assets_cache_dir,
+            uploads.clone(),
             synthetic,
         )))
         .serve_with_shutdown(
             SocketAddr::from((Ipv4Addr::new(0, 0, 0, 0), port)),
             shutdown.cancelled_owned(),
         )
-        .await?;
+        .await;
+
+    uploads.finish().await;
+    result?;
 
     Ok(())
 }
