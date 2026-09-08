@@ -8,153 +8,127 @@ pub const VALIDATION_SEED_SALT: u64 = 0x76616c;
 pub const TRAINING_SEED_SALT: u64 = 0x747261;
 
 const VALIDATION_SAMPLES_QUERY: &str = "
-with latest_segments as (
-    select id, audio_file_id, start_seconds, end_seconds, phon, speaker_id
-    from audio_segments
-    qualify row_number() over (
-        partition by audio_file_id, id order by updated_at desc
-    ) = 1
+WITH
+dataset_ids AS (
+    SELECT audio_file_id FROM dataset_audio_files
+    WHERE dataset_id = {dataset_id:UUID}
 ),
-segments as (
-    select audio_file_id,
-           if(count() = 1, nullIf(min(speaker_id), ''),
-              cast(null as Nullable(String))) as speaker_id,
-           arrayStringConcat(
-               arrayMap(segment -> segment.4,
-                   arraySort(segment -> (segment.1, segment.2, segment.3),
-                       groupArray((start_seconds, end_seconds, id, phon)))),
-               ' '
-           ) as text
-    from latest_segments
-    where notEmpty(trimBoth(phon))
-      and start_seconds < end_seconds
-    group by audio_file_id
+segments AS (
+    SELECT * FROM (
+        SELECT id, audio_file_id, start_seconds, end_seconds, phon, metadata
+        FROM audio_segments
+        WHERE audio_file_id IN (SELECT audio_file_id FROM dataset_ids)
+        ORDER BY audio_file_id, id, updated_at DESC
+        LIMIT 1 BY audio_file_id, id
+    )
+    WHERE trim(BOTH ' ' FROM phon) != '' AND start_seconds < end_seconds
 ),
-base as (
-    select audio.id as audio_id,
-           toFloat64(audio.latest.3) as duration,
-           nullIf(audio.latest.6, '') as language,
-           segments.speaker_id,
-           segments.text,
-           bucket.path as object_path,
-           toInt64(audio.latest.2) as byte_offset,
-           toInt64(audio.latest.4) as byte_length
-    from (
-        select id,
-               argMax(tuple(bucket_file_id, byte_offset, duration, byte_length,
-                            virtual, language), updated_at) as latest
-        from audio_files
-        group by id
-    ) as audio
-    inner join dataset_audio_files as membership final
-        on membership.audio_file_id = audio.id
-    inner join segments on segments.audio_file_id = audio.id
-    inner join bucket_files as bucket on bucket.id = audio.latest.1
-    where membership.dataset_id = toUUID(?)
-      and not audio.latest.5
-      and audio.latest.3 > 0
+eligible AS (
+    SELECT * FROM (
+        SELECT id, duration, language, bucket_file_id, byte_offset, byte_length, virtual
+        FROM audio_files
+        WHERE id IN (SELECT audio_file_id FROM dataset_ids)
+        ORDER BY id, updated_at DESC
+        LIMIT 1 BY id
+    )
+    WHERE NOT virtual AND duration > 0
+      AND id IN (SELECT audio_file_id FROM segments)
+    QUALIFY rank() OVER (ORDER BY duration DESC) <= intDiv(count() OVER (), 10) + 1
+    ORDER BY toString(id)
+    LIMIT {sample_size:UInt64}
 ),
-eligible as (
-    select *
-    from base
-    where duration >= (select quantileExact(0.9)(duration) from base)
-    order by audio_id
-    limit ?
+selected AS (
+    SELECT *, max(duration) OVER () AS max_duration FROM eligible
+    QUALIFY duration < {max_duration:Float64}
 ),
-binned as (
-    select *, max(duration) over () as max_duration
-    from eligible
+agg AS (
+    SELECT
+        a.id AS audio_id, a.duration, a.byte_offset, a.byte_length,
+        a.bucket_file_id, a.language, a.max_duration,
+        if(count() = 1, min(if(
+            JSONType(s.metadata, '_source', 'annotations', 'speaker_id') = 'Null',
+            NULL, JSON_VALUE(s.metadata, '$._source.annotations.speaker_id')
+        )), NULL) AS speaker_id,
+        arrayStringConcat(arrayMap(x -> x.4, arraySort(groupArray((
+            s.start_seconds, s.end_seconds, toString(s.id), s.phon
+        )))), ' ') AS text
+    FROM selected AS a
+    ALL INNER JOIN segments AS s ON s.audio_file_id = a.id
+    GROUP BY ALL
 )
-select audio_id,
-       duration,
-       language,
-       speaker_id,
-       toNullable(text) as text,
-       toNullable(if(duration < 1, 0,
-                     pow(2, floor(log2(duration))))) as lower_bound,
-       toNullable(least(
-           pow(2, if(duration < 1, 0, floor(log2(duration)) + 1)),
-           max_duration
-       )) as upper_bound,
-       object_path,
-       byte_offset,
-       byte_length
-from binned
-where duration < ?
-  and lengthUTF8(text) <= ?
-order by duration, audio_id
+SELECT
+    a.audio_id, toFloat64(a.duration) AS duration,
+    toNullable(a.language) AS language, a.speaker_id, toNullable(a.text) AS text,
+    toNullable(if(a.duration < 1, 0., pow(2, floor(log2(toFloat64(a.duration)))))) AS lower_bound,
+    toNullable(least(if(a.duration < 1, 1., 2 * lower_bound), toFloat64(a.max_duration))) AS upper_bound,
+    b.path AS object_path,
+    toInt64(a.byte_offset) AS byte_offset, toInt64(a.byte_length) AS byte_length
+FROM agg AS a
+ALL INNER JOIN bucket_files AS b ON b.id = a.bucket_file_id
+WHERE lengthUTF8(a.text) <= {max_text:UInt64}
+ORDER BY a.duration, toString(a.audio_id)
+SETTINGS function_json_value_return_type_allow_complex = 1
 ";
 
 const TRAINING_SAMPLES_QUERY: &str = "
-with latest_segments as (
-    select id, audio_file_id, start_seconds, end_seconds, phon, speaker_id
-    from audio_segments
-    qualify row_number() over (
-        partition by audio_file_id, id order by updated_at desc
-    ) = 1
+WITH
+dataset_ids AS (
+    SELECT audio_file_id FROM dataset_audio_files
+    WHERE dataset_id = {dataset_id:UUID}
 ),
-segments as (
-    select audio_file_id,
-           if(count() = 1, nullIf(min(speaker_id), ''),
-              cast(null as Nullable(String))) as speaker_id,
-           arrayStringConcat(
-               arrayMap(segment -> segment.4,
-                   arraySort(segment -> (segment.1, segment.2, segment.3),
-                       groupArray((start_seconds, end_seconds, id, phon)))),
-               ' '
-           ) as text
-    from latest_segments
-    where notEmpty(trimBoth(phon))
-      and start_seconds < end_seconds
-    group by audio_file_id
+segments AS (
+    SELECT * FROM (
+        SELECT id, audio_file_id, start_seconds, end_seconds, phon, metadata
+        FROM audio_segments
+        WHERE audio_file_id IN (SELECT audio_file_id FROM dataset_ids)
+        ORDER BY audio_file_id, id, updated_at DESC
+        LIMIT 1 BY audio_file_id, id
+    )
+    WHERE trim(BOTH ' ' FROM phon) != '' AND start_seconds < end_seconds
 ),
-base as (
-    select audio.id as audio_id,
-           toFloat64(audio.latest.3) as duration,
-           nullIf(audio.latest.6, '') as language,
-           segments.speaker_id,
-           segments.text,
-           bucket.path as object_path,
-           toInt64(audio.latest.2) as byte_offset,
-           toInt64(audio.latest.4) as byte_length
-    from (
-        select id,
-               argMax(tuple(bucket_file_id, byte_offset, duration, byte_length,
-                            virtual, language), updated_at) as latest
-        from audio_files
-        group by id
-    ) as audio
-    inner join dataset_audio_files as membership final
-        on membership.audio_file_id = audio.id
-    inner join segments on segments.audio_file_id = audio.id
-    inner join bucket_files as bucket on bucket.id = audio.latest.1
-    where membership.dataset_id = toUUID(?)
-      and not audio.latest.5
-      and audio.latest.3 > 0
+eligible AS (
+    SELECT * FROM (
+        SELECT id, duration, language, bucket_file_id, byte_offset, byte_length, virtual
+        FROM audio_files
+        WHERE id IN (SELECT audio_file_id FROM dataset_ids)
+        ORDER BY id, updated_at DESC
+        LIMIT 1 BY id
+    )
+    WHERE NOT virtual AND duration > 0
+      AND id IN (SELECT audio_file_id FROM segments)
+      AND id NOT IN {validation_ids:Array(UUID)}
 ),
-eligible as (
-    select *, max(duration) over () as max_duration
-    from base
-    where not has(?, toString(audio_id))
+selected AS (
+    SELECT *, max(duration) OVER () AS max_duration FROM eligible
+    QUALIFY duration < {max_duration:Float64}
+),
+agg AS (
+    SELECT
+        a.id AS audio_id, a.duration, a.byte_offset, a.byte_length,
+        a.bucket_file_id, a.language, a.max_duration,
+        if(count() = 1, min(if(
+            JSONType(s.metadata, '_source', 'annotations', 'speaker_id') = 'Null',
+            NULL, JSON_VALUE(s.metadata, '$._source.annotations.speaker_id')
+        )), NULL) AS speaker_id,
+        arrayStringConcat(arrayMap(x -> x.4, arraySort(groupArray((
+            s.start_seconds, s.end_seconds, toString(s.id), s.phon
+        )))), ' ') AS text
+    FROM selected AS a
+    ALL INNER JOIN segments AS s ON s.audio_file_id = a.id
+    GROUP BY ALL
 )
-select audio_id,
-       duration,
-       language,
-       speaker_id,
-       toNullable(text) as text,
-       toNullable(if(duration < 1, 0,
-                     pow(2, floor(log2(duration))))) as lower_bound,
-       toNullable(least(
-           pow(2, if(duration < 1, 0, floor(log2(duration)) + 1)),
-           max_duration
-       )) as upper_bound,
-       object_path,
-       byte_offset,
-       byte_length
-from eligible
-where duration < ?
-  and lengthUTF8(text) <= ?
-order by duration, audio_id
+SELECT
+    a.audio_id, toFloat64(a.duration) AS duration,
+    toNullable(a.language) AS language, a.speaker_id, toNullable(a.text) AS text,
+    toNullable(if(a.duration < 1, 0., pow(2, floor(log2(toFloat64(a.duration)))))) AS lower_bound,
+    toNullable(least(if(a.duration < 1, 1., 2 * lower_bound), toFloat64(a.max_duration))) AS upper_bound,
+    b.path AS object_path,
+    toInt64(a.byte_offset) AS byte_offset, toInt64(a.byte_length) AS byte_length
+FROM agg AS a
+ALL INNER JOIN bucket_files AS b ON b.id = a.bucket_file_id
+WHERE lengthUTF8(a.text) <= {max_text:UInt64}
+ORDER BY a.duration, toString(a.audio_id)
+SETTINGS function_json_value_return_type_allow_complex = 1
 ";
 
 #[derive(clickhouse::Row, Deserialize)]
@@ -180,10 +154,10 @@ pub async fn fetch_validation_samples(
 ) -> anyhow::Result<Vec<SampleRow>> {
     client
         .query(VALIDATION_SAMPLES_QUERY)
-        .bind(config.dataset_id.to_string())
-        .bind(config.validation.samples)
-        .bind(config.validation.max_seconds as f64)
-        .bind(config.max_text_tokens)
+        .param("dataset_id", config.dataset_id.to_string())
+        .param("sample_size", u64::try_from(config.validation.samples)?)
+        .param("max_duration", config.validation.max_seconds as f64)
+        .param("max_text", u64::try_from(config.max_text_tokens)?)
         .fetch_all::<SampleRow>()
         .await
         .map_err(Into::into)
@@ -197,10 +171,10 @@ pub async fn fetch_training_samples(
     let excluded_ids: Vec<String> = excluded_ids.iter().map(Uuid::to_string).collect();
     client
         .query(TRAINING_SAMPLES_QUERY)
-        .bind(config.dataset_id.to_string())
-        .bind(excluded_ids)
-        .bind(config.training_max_seconds() as f64)
-        .bind(config.max_text_tokens)
+        .param("dataset_id", config.dataset_id.to_string())
+        .param("validation_ids", excluded_ids)
+        .param("max_duration", config.training_max_seconds() as f64)
+        .param("max_text", u64::try_from(config.max_text_tokens)?)
         .fetch_all::<SampleRow>()
         .await
         .map_err(Into::into)
