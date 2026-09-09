@@ -1,189 +1,188 @@
-use std::sync::Mutex;
-
-use anyhow::{Context, anyhow, ensure};
-use pyo3::prelude::*;
-use pyo3_tch::PyTensor;
-use tch::Tensor;
-use tokio::sync::oneshot;
-
-use crate::proto::Sample;
-use crate::worker::{Command, Worker};
-
-type SampleParts = (PyTensor, f64, i64, i32, PyTensor);
-
-fn sample_parts(sample: Sample) -> anyhow::Result<SampleParts> {
-    ensure!(
-        sample.wave.len() % 2 == 0,
-        "wave byte length must be a multiple of 2 (int16 PCM)"
-    );
-    ensure!(
-        sample.text.len() % 8 == 0,
-        "text byte length must be a multiple of 8 (int64 token IDs)"
-    );
-    // Decode explicitly instead of assuming host endianness or byte alignment.
-    let wave: Vec<i16> = sample
-        .wave
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
-        .collect();
-    let text: Vec<i64> = sample
-        .text
-        .chunks_exact(8)
-        .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap()))
-        .collect();
-    Ok((
-        PyTensor(Tensor::f_from_slice(&wave)?),
-        sample.duration,
-        sample.speaker_id,
-        sample.language_id,
-        PyTensor(Tensor::f_from_slice(&text)?),
-    ))
-}
+use crate::{
+    data::Work,
+    ipc::Receiver,
+    semaphore::PosixSemaphore,
+    worker::{Options, Worker},
+};
+use anyhow::anyhow;
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyDict},
+};
+use std::{os::unix::net::UnixStream, path::PathBuf, sync::Mutex};
 
 #[pyclass]
-pub struct Client {
+pub struct Daemon {
     worker: Mutex<Option<Worker>>,
     #[pyo3(get)]
     run_id: String,
     #[pyo3(get)]
     train_config: String,
 }
-
-impl Client {
-    fn start(run_id: String, addr: String) -> anyhow::Result<Self> {
-        let (worker, initialized) = Worker::start(run_id, addr)?;
-        Ok(Self {
-            worker: Mutex::new(Some(worker)),
-            run_id: initialized.run_id,
-            train_config: initialized.train_config,
+#[pymethods]
+impl Daemon {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        run_id: String,
+        addr: String,
+        root: PathBuf,
+        ranks: usize,
+        prefetch_factor: usize,
+        num_workers: usize,
+    ) -> anyhow::Result<Self> {
+        py.allow_threads(|| {
+            let (worker, initialized) = Worker::start(Options {
+                run_id,
+                addr,
+                root,
+                ranks,
+                factor: prefetch_factor,
+                num_workers,
+            })?;
+            Ok(Self {
+                worker: Mutex::new(Some(worker)),
+                run_id: initialized.run_id,
+                train_config: initialized.train_config,
+            })
         })
     }
-
-    fn enqueue(&self, command: Command) -> anyhow::Result<()> {
-        let guard = self
+    #[pyo3(signature = (error=None))]
+    fn stop(&self, error: Option<String>) -> anyhow::Result<()> {
+        if let Some(worker) = self
             .worker
             .lock()
-            .map_err(|_| anyhow!("worker lock poisoned"))?;
-        let worker = guard.as_ref().context("TensorLane client is closed")?;
-        worker.send(command)
-    }
-
-    fn stop(&self) -> anyhow::Result<()> {
-        let worker = self
-            .worker
-            .lock()
-            .map_err(|_| anyhow!("worker lock poisoned"))?
-            .take();
-        if let Some(mut worker) = worker {
-            worker.shutdown()?;
+            .map_err(|_| anyhow!("daemon lock poisoned"))?
+            .as_mut()
+        {
+            worker.stop(error);
         }
         Ok(())
     }
+    fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
+        py.allow_threads(|| {
+            if let Some(mut worker) = self
+                .worker
+                .lock()
+                .map_err(|_| anyhow!("daemon lock poisoned"))?
+                .take()
+            {
+                worker.shutdown()?;
+            }
+            Ok(())
+        })
+    }
+}
+#[pyclass]
+pub struct Listener {
+    receiver: Mutex<tokio::sync::mpsc::UnboundedReceiver<anyhow::Result<Work>>>,
+    socket: UnixStream,
+    runtime: tokio::runtime::Runtime,
+}
+#[pymethods]
+impl Listener {
+    #[new]
+    fn new(py: Python<'_>, socket: &Bound<'_, PyAny>) -> anyhow::Result<Self> {
+        let duplicate = socket.call_method0("dup")?;
+        let descriptor = duplicate
+            .call_method0("detach")?
+            .extract::<std::os::fd::RawFd>()?;
+        use std::os::fd::FromRawFd;
+        let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+        py.allow_threads(|| {
+            stream.set_nonblocking(true)?;
+            let socket = stream.try_clone()?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()?;
+            let stream = {
+                let _entered = runtime.enter();
+                tokio::net::UnixStream::from_std(stream)?
+            };
+            let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
+            runtime.spawn(async move {
+                let mut reader = Receiver::<Work, _>::new(stream);
+                loop {
+                    match reader.recv().await {
+                        Ok(Some(message)) => {
+                            if messages.send(Ok(message)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            let _ = messages.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            });
+            Ok(Self {
+                receiver: Mutex::new(receiver),
+                socket,
+                runtime,
+            })
+        })
+    }
+    fn recv(&self, py: Python<'_>) -> anyhow::Result<Option<Py<PyAny>>> {
+        let message = py.allow_threads(|| {
+            let mut receiver = self
+                .receiver
+                .lock()
+                .map_err(|_| anyhow!("listener lock poisoned"))?;
+            self.runtime.block_on(receiver.recv()).transpose()
+        })?;
+        let Some(message) = message else {
+            return Ok(None);
+        };
+        let object = PyDict::new(py);
+        match message {
+            Work::Sample {
+                batch,
+                index,
+                wave,
+                text,
+                duration,
+                speaker_id,
+                language_id,
+            } => {
+                object.set_item("kind", "sample")?;
+                object.set_item("batch", batch)?;
+                object.set_item("index", index)?;
+                object.set_item("wave", PyBytes::new(py, &wave))?;
+                object.set_item("text", PyBytes::new(py, &text))?;
+                object.set_item("duration", duration)?;
+                object.set_item("speaker_id", speaker_id)?;
+                object.set_item("language_id", language_id)?;
+            }
+            Work::End => {
+                object.set_item("kind", "end")?;
+            }
+        }
+        Ok(Some(object.into_any().unbind()))
+    }
+
+    fn close(&self) {
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+#[pyclass]
+pub struct Semaphore {
+    inner: PosixSemaphore,
 }
 
 #[pymethods]
-impl Client {
+impl Semaphore {
     #[new]
-    #[pyo3(signature = (run_id, addr="localhost:8181"))]
-    fn new(py: Python<'_>, run_id: String, addr: &str) -> anyhow::Result<Self> {
-        py.allow_threads(|| Self::start(run_id, addr.to_owned()))
-    }
-
-    #[pyo3(signature = (validation=false))]
-    fn next_batch(
-        &self,
-        py: Python<'_>,
-        validation: bool,
-    ) -> anyhow::Result<Option<Vec<SampleParts>>> {
-        py.allow_threads(|| {
-            let (reply, response) = oneshot::channel();
-            self.enqueue(Command::NextBatch { validation, reply })?;
-            let batch = response
-                .blocking_recv()
-                .context("worker dropped the batch reply")??;
-            batch
-                .map(|response| response.batch.into_iter().map(sample_parts).collect())
-                .transpose()
+    fn new(name: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: PosixSemaphore::open(name)?,
         })
     }
 
-    fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
-        py.allow_threads(|| self.stop())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tch::{Device, Kind};
-
-    #[test]
-    fn pytensor_exposes_a_torch_tensor_without_copying_its_storage() {
-        pyo3::prepare_freethreaded_python();
-        Python::with_gil(|py| {
-            py.import("torch").unwrap();
-            let tensor = Tensor::from_slice(&[1_i64, 2, 3]);
-            let pointer = tensor.data_ptr() as usize;
-            let object = PyTensor(tensor).into_pyobject(py).unwrap();
-            assert_eq!(
-                object
-                    .call_method0("data_ptr")
-                    .unwrap()
-                    .extract::<usize>()
-                    .unwrap(),
-                pointer
-            );
-            assert_eq!(
-                object
-                    .call_method0("tolist")
-                    .unwrap()
-                    .extract::<Vec<i64>>()
-                    .unwrap(),
-                [1, 2, 3]
-            );
-        });
-    }
-
-    #[test]
-    fn decodes_owned_tensors_with_wire_dtypes_and_values() {
-        let waves = [i16::MIN, -1, 0, i16::MAX];
-        let tokens = [0_i64, 123, i64::MAX];
-        let (wave, duration, speaker, language, text) = sample_parts(Sample {
-            wave: waves.into_iter().flat_map(i16::to_le_bytes).collect(),
-            text: tokens.into_iter().flat_map(i64::to_le_bytes).collect(),
-            duration: 0.5,
-            speaker_id: 42,
-            language_id: 7,
-        })
-        .unwrap();
-        assert_eq!(wave.kind(), Kind::Int16);
-        assert_eq!(text.kind(), Kind::Int64);
-        assert_eq!(wave.device(), Device::Cpu);
-        assert_eq!(wave.size(), [4]);
-        assert_eq!(text.size(), [3]);
-        assert_eq!(Vec::<i16>::try_from(&wave.0).unwrap(), waves);
-        assert_eq!(Vec::<i64>::try_from(&text.0).unwrap(), tokens);
-        assert_eq!((duration, speaker, language), (0.5, 42, 7));
-    }
-
-    #[test]
-    fn handles_empty_buffers_and_rejects_truncated_values() {
-        let (wave, _, _, _, text) = sample_parts(Sample::default()).unwrap();
-        assert_eq!(wave.size(), [0]);
-        assert_eq!(text.size(), [0]);
-        assert!(
-            sample_parts(Sample {
-                wave: vec![0],
-                ..Default::default()
-            })
-            .is_err()
-        );
-        assert!(
-            sample_parts(Sample {
-                text: vec![0; 7],
-                ..Default::default()
-            })
-            .is_err()
-        );
+    fn post(&self, py: Python<'_>) -> anyhow::Result<()> {
+        py.allow_threads(|| self.inner.post())
     }
 }
