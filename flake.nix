@@ -92,8 +92,8 @@
 
               CACHE_DIR = "$DNVR_ROOT/.tensorlane/cache";
               ASSETS_DIR = "$DNVR_ROOT/.tensorlane/assets";
-              CHECKPOINT_DIR = "$DNVR_ROOT/.tensorlane/checkpoints";
-              METRICS_DIR = "$DNVR_ROOT/.tensorlane/artifacts";
+              CHECKPOINT_PREFIX = "/checkpoints";
+              METRICS_PREFIX = "/artifacts";
 
               UV_PYTHON_PREFERENCE = "only-system";
               UV_PYTHON_DOWNLOADS = "never";

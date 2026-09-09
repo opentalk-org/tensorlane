@@ -2,18 +2,15 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypeVar, cast
-
-from torch import Tensor
-from torch.utils.data import DataLoader, IterableDataset
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .client import Client
+    from torch import Tensor
 
 
 @dataclass(frozen=True)
 class Sample:
-    """CPU tensors: int16 PCM waveform and int64 text token IDs."""
+    """Transformed CPU waveform, original metadata, and int64 text tokens."""
 
     wave: Tensor
     duration: float
@@ -31,40 +28,3 @@ class Batch:
 
     def __iter__(self) -> Iterator[Sample]:
         return iter(self.samples)
-
-
-class _Dataset(IterableDataset[Batch]):
-    def __init__(self, client: Client, validation: bool) -> None:
-        self.client = client
-        self.validation = validation
-
-    def __iter__(self) -> Iterator[Batch]:
-        while True:
-            batch = self.client.next_batch(validation=self.validation)
-            if batch is None:
-                return
-            yield batch
-
-
-class BatchLoader(DataLoader[Batch]):
-    def __iter__(self) -> Iterator[Batch]:  # pyright: ignore[reportIncompatibleMethodOverride]
-        return cast(Iterator[Batch], super().__iter__())
-
-
-_T = TypeVar("_T")
-
-
-def _identity(value: _T) -> _T:
-    return value
-
-
-def dataloader(client: Client, validation: bool = False) -> BatchLoader:
-    return BatchLoader(
-        _Dataset(client, validation),
-        batch_size=None,
-        num_workers=0,
-        prefetch_factor=None,
-        persistent_workers=False,
-        pin_memory=False,
-        collate_fn=_identity,
-    )
