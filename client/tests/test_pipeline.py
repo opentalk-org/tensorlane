@@ -8,6 +8,7 @@ import fcntl
 import json
 import multiprocessing
 import os
+import re
 from pathlib import Path
 import struct
 import subprocess
@@ -56,8 +57,17 @@ class Fixture(rpc.TensorLaneServicer):
         self.validation_count = 0
         self.validation_requests = []
         self.fail_validation = False
+        self.metrics = []
+        self.artifacts = []
+        self.checkpoints = []
+        self.metric_streams = 0
+        self.fail_metrics = False
+        self.fail_checkpoint = False
+        self.upload_started = threading.Event()
+        self.upload_gate = threading.Event()
+        self.upload_gate.set()
         self.lock = threading.Lock()
-        self.server = grpc.server(ThreadPoolExecutor(max_workers=4))
+        self.server = grpc.server(ThreadPoolExecutor(max_workers=8))
         rpc.add_TensorLaneServicer_to_server(self, self.server)
         self.port = self.server.add_insecure_port("127.0.0.1:0")
         self.server.start()
@@ -110,7 +120,78 @@ class Fixture(rpc.TensorLaneServicer):
             yield pb.DataResponse(batch=samples)
 
     def close(self):
+        self.upload_gate.set()
         self.server.stop(0).wait()
+
+    def Metrics(self, requests, context):
+        first = next(requests)
+        if first.WhichOneof("payload") != "metadata":
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "missing metrics metadata")
+        run_id = first.metadata.run_id
+        with self.lock:
+            self.metric_streams += 1
+        self.upload_started.set()
+        self.upload_gate.wait(20)
+        if self.fail_metrics:
+            context.abort(grpc.StatusCode.INTERNAL, "fixture metrics failure")
+        pending = None
+        data = bytearray()
+        response = pb.MetricsResponse()
+        for request in requests:
+            kind = request.WhichOneof("payload")
+            if kind == "metric":
+                self.metrics.append((run_id, request.metric))
+                response.metrics_received += 1
+            elif kind == "artifact":
+                pending = request.artifact
+                data = bytearray()
+            elif kind == "artifact_chunk":
+                data.extend(request.artifact_chunk.data)
+            else:
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT, "unexpected metrics payload"
+                )
+            if pending is not None and len(data) == pending.size_bytes:
+                self.artifacts.append((run_id, pending, bytes(data)))
+                response.artifacts_received += 1
+                response.artifact_bytes_received += len(data)
+                pending = None
+        if pending is not None:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "incomplete artifact")
+        return response
+
+    def Checkpoint(self, requests, context):
+        first = next(requests)
+        if first.WhichOneof("payload") != "metadata":
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "missing checkpoint metadata"
+            )
+        self.upload_started.set()
+        self.upload_gate.wait(20)
+        if self.fail_checkpoint:
+            context.abort(grpc.StatusCode.INTERNAL, "fixture checkpoint failure")
+        chunks = []
+        for request in requests:
+            if request.WhichOneof("payload") != "chunk":
+                context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT, "expected checkpoint chunk"
+                )
+            chunks.append(request.chunk)
+        self.checkpoints.append((first.metadata, b"".join(chunks)))
+        return pb.CheckpointResponse()
+
+
+def upload_rank(run_id, root, rank, path, output):
+    try:
+        with tensorlane.init(
+            run_id, double, 2, rank=rank, start_daemon=False, ipc_dir=root
+        ) as lane:
+            lane.metric(rank, f"rank/{rank}", rank + 0.5)
+            lane.metric_artifact(rank, path, f"artifact/{rank}")
+            lane.checkpoint(rank, path)
+        output.put(None)
+    except Exception as error:
+        output.put(repr(error))
 
 
 def read_rank(run_id, rank, root, output, validation=False):
@@ -173,7 +254,7 @@ def initialize_rank(run_id, rank, addr, root, output, finished):
             num_workers=1,
             timeout=20,
         ) as lane:
-            output.put((lane.rank, lane.run_id, lane.train_config, None))
+            output.put((rank, lane.run_id, lane.train_config, None))
             if not finished.wait(20):
                 raise TimeoutError("test did not release ranks")
     except Exception as error:
@@ -181,6 +262,158 @@ def initialize_rank(run_id, rank, addr, root, output, finished):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_metrics_and_files_are_uploaded_and_flushed(self):
+        self.service.returned_run_id = str(uuid.uuid4())
+        self.start()
+        path = Path(self.temp.name) / "raw.dat"
+        data = bytes(range(256)) * 9000
+        path.write_bytes(data)
+        empty = Path(self.temp.name) / "empty"
+        empty.touch()
+        before = time.time_ns() // 1_000_000
+        self.daemon.metric(2, "loss", 0.25)
+        self.daemon.metric_artifact(2, path, "audio", content_type="audio/wav")
+        self.daemon.metric(3, "accuracy", 0.5)
+        self.daemon.metric_artifact(3, empty, "empty")
+        self.daemon.checkpoint(3, path)
+        self.daemon.flush()
+        after = time.time_ns() // 1_000_000
+        self.assertEqual(self.service.metric_streams, 1)
+        self.assertEqual(
+            [
+                (metric.step, metric.name, metric.value)
+                for _, metric in self.service.metrics
+            ],
+            [(2, "loss", 0.25), (3, "accuracy", 0.5)],
+        )
+        for run_id, metric in self.service.metrics:
+            self.assertEqual(run_id, self.service.returned_run_id)
+            self.assertTrue(before <= metric.timestamp_unix_ms <= after)
+        self.assertEqual([item[2] for item in self.service.artifacts], [data, b""])
+        self.assertEqual(self.service.artifacts[0][1].content_type, "audio/wav")
+        self.assertEqual(
+            self.service.artifacts[1][1].content_type, "application/octet-stream"
+        )
+        metadata, received = self.service.checkpoints[0]
+        self.assertEqual(
+            (metadata.run_id, metadata.step, received),
+            (self.service.returned_run_id, 3, data),
+        )
+        self.daemon.metric(4, "next", 1)
+        self.daemon.close()
+        self.assertEqual(self.service.metrics[-1][1].name, "next")
+        self.assertEqual(self.service.metric_streams, 2)
+
+    def test_slow_uploads_do_not_block_rank_or_data(self):
+        self.start(ranks=1)
+        path = Path(self.temp.name) / "checkpoint"
+        path.write_bytes(b"checkpoint bytes" * 700_000)
+        self.service.upload_gate.clear()
+        try:
+            started = time.monotonic()
+            self.daemon.checkpoint(0, path)
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertTrue(self.service.upload_started.wait(5))
+            self.daemon.metric(1, "queued", 1)
+            with self.daemon.batches() as batches:
+                self.assertEqual(len(list(batches)), 5)
+            with ThreadPoolExecutor() as executor:
+                finished = executor.submit(self.daemon.flush)
+                try:
+                    time.sleep(0.1)
+                    self.assertFalse(finished.done())
+                finally:
+                    self.service.upload_gate.set()
+                finished.result(timeout=10)
+        finally:
+            self.service.upload_gate.set()
+        self.assertEqual(self.service.checkpoints[0][1], path.read_bytes())
+
+    def test_each_rank_process_can_upload(self):
+        self.start()
+        path = Path(self.temp.name) / "weights"
+        path.write_bytes(b"opaque weights")
+        context = multiprocessing.get_context("spawn")
+        output = context.Queue()
+        processes = [
+            context.Process(
+                target=upload_rank,
+                args=(self.run_id, self.temp.name, rank, path, output),
+            )
+            for rank in range(2)
+        ]
+        try:
+            for process in processes:
+                process.start()
+            for _ in processes:
+                self.assertIsNone(output.get(timeout=30))
+            for process in processes:
+                process.join(10)
+                self.assertEqual(process.exitcode, 0)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.kill()
+                process.join()
+                process.close()
+            output.close()
+            output.join_thread()
+        self.assertEqual(
+            {metric.name for _, metric in self.service.metrics}, {"rank/0", "rank/1"}
+        )
+        self.assertEqual(len(self.service.artifacts), 2)
+        self.assertEqual(len(self.service.checkpoints), 2)
+
+    def test_upload_errors_reach_flush(self):
+        self.start()
+        with self.attach(0) as lane:
+            lane.metric_artifact(0, Path(self.temp.name) / "missing", "missing")
+            with self.assertRaisesRegex(RuntimeError, "opening artifact"):
+                lane.flush()
+        self.service.fail_metrics = True
+        with self.attach(0) as lane:
+            lane.metric(0, "error", 1)
+            with self.assertRaisesRegex(RuntimeError, "fixture metrics failure"):
+                lane.flush()
+        self.service.fail_metrics = False
+        self.service.fail_checkpoint = True
+        path = Path(self.temp.name) / "checkpoint"
+        path.write_bytes(b"weights")
+        with self.attach(0) as lane:
+            lane.checkpoint(0, path)
+            with self.assertRaisesRegex(RuntimeError, "fixture checkpoint failure"):
+                lane.flush()
+
+    def test_close_reports_upload_failure_and_still_cleans_up(self):
+        self.start()
+        self.daemon.checkpoint(0, Path(self.temp.name) / "missing")
+        with self.assertRaisesRegex(RuntimeError, "opening checkpoint"):
+            self.daemon.close()
+        self.assertFalse(list(self.daemon._root.glob("*.sock")))
+        self.daemon.close()
+
+    def test_flush_timeout_closes_the_upload_connection(self):
+        self.start()
+        self.service.upload_gate.clear()
+        try:
+            self.daemon.metric(0, "slow", 1)
+            self.assertTrue(self.service.upload_started.wait(5))
+            with self.assertRaisesRegex(RuntimeError, "upload flush timed out"):
+                self.daemon.flush(timeout=0.05)
+            with self.assertRaisesRegex(RuntimeError, "upload client is closed"):
+                self.daemon.metric(1, "after timeout", 1)
+        finally:
+            self.service.upload_gate.set()
+
+    def test_flushed_follower_can_close_after_owner(self):
+        self.start()
+        follower = self.attach(1)
+        follower.metric(0, "flushed", 1)
+        follower.flush()
+        self.daemon.close()
+        follower.close()
+        self.assertEqual(self.service.metrics[0][1].name, "flushed")
+
     @staticmethod
     def archive(files):
         output = io.BytesIO()
@@ -503,6 +736,7 @@ class PipelineTests(unittest.TestCase):
                 "semaphore",
                 "validation-semaphore",
                 "work.sock",
+                "uploads.sock",
             },
         )
         self.daemon.close()
@@ -535,6 +769,7 @@ class PipelineTests(unittest.TestCase):
     @unittest.skipUnless(importlib.util.find_spec("accelerate"), "requires accelerate")
     def test_accelerate_cpu_example_initializes_once_for_two_ranks(self):
         self.service.validation_count = self.service.count
+        self.service.assets = {"asr": (None, b"synthetic asset asr")}
         example = Path(__file__).resolve().parents[1] / "examples" / "accelerate_cpu.py"
         result = subprocess.run(
             [
@@ -563,12 +798,11 @@ class PipelineTests(unittest.TestCase):
                 f"rank={rank} run_id={self.run_id} train_config='opaque config'",
                 result.stdout,
             )
-        lines = [
-            line
-            for line in result.stdout.splitlines()
-            if line.startswith("rank=") and "split=" in line
-        ]
-        self.assertEqual(len(lines), self.service.count * 2)
+        lines = re.findall(
+            r"rank=\d+ device=cpu(?::\d+)? split=(?:training|validation) batch=\d+ samples=\d+",
+            result.stdout,
+        )
+        self.assertEqual(len(lines), self.service.count * 2, result.stdout)
         for split in ("training", "validation"):
             for rank, count in ((0, 3), (1, 2)):
                 self.assertEqual(
@@ -780,8 +1014,8 @@ class PipelineTests(unittest.TestCase):
         self.service.validation_count = 5
         self.start(factor=3)
         with self.attach(1) as lane:
-            self.assertEqual(lane.rank, 1)
-            self.assertEqual(self.daemon.rank, 0)
+            self.assertEqual(lane._rank, 1)
+            self.assertEqual(self.daemon._rank, 0)
             with (
                 lane.batches() as training,
                 lane.batches(validation=True) as validation,
@@ -954,7 +1188,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(workers), 5)
         self.assertEqual(
             {path.name for path in Path(self.temp.name).rglob("*.sock")},
-            {"work.sock"},
+            {"work.sock", "uploads.sock"},
         )
         with self.daemon.batches() as reader:
             batches = list(reader)

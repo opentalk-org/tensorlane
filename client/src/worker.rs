@@ -23,6 +23,7 @@ use tokio::{
     net::UnixListener,
     sync::{mpsc, oneshot},
 };
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 
 pub struct Options {
@@ -231,6 +232,7 @@ async fn supervise(
     connected: &AtomicBool,
 ) -> anyhow::Result<()> {
     let work_listener = UnixListener::bind(options.root.join("work.sock"))?;
+    let upload_listener = UnixListener::bind(options.root.join("uploads.sock"))?;
     let url = if options.addr.contains("://") {
         options.addr.clone()
     } else {
@@ -269,6 +271,14 @@ async fn supervise(
         result = tokio::time::timeout(Duration::from_secs(120), startup) => result.context("daemon startup timed out")??,
         result = &mut stop => return result.unwrap_or(Ok(())),
     };
+    let uploads_stopping = CancellationToken::new();
+    let mut uploads = tokio::spawn(crate::uploads::serve(
+        upload_listener,
+        grpc.clone(),
+        initialized.run_id.clone(),
+        uploads_stopping.clone(),
+    ));
+    let mut uploads_complete = false;
     let (send_work, mut receive_work) = mpsc::unbounded_channel::<Work>();
     let mut sender = tokio::spawn(async move {
         let mut senders = work;
@@ -306,6 +316,11 @@ async fn supervise(
         loop {
             tokio::select! {
                 result = &mut stop => return result.unwrap_or(Ok(())),
+                result = &mut uploads => {
+                    uploads_complete = true;
+                    result.context("upload task panicked")??;
+                    return Err(anyhow!("upload listener stopped unexpectedly"));
+                },
                 Some(result) = pumps.join_next(), if !pumps.is_empty() => {
                     result.context("prefetch task panicked")??;
                 },
@@ -327,6 +342,11 @@ async fn supervise(
     if !sender_complete {
         sender.abort();
         let _ = sender.await;
+    }
+    uploads_stopping.cancel();
+    if !uploads_complete {
+        let uploaded = uploads.await.context("upload task panicked")?;
+        return result.and(uploaded);
     }
     result
 }
