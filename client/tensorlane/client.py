@@ -200,7 +200,12 @@ def init(
 
 class BatchReader(Iterator[Batch]):
     def __init__(
-        self, run_id: str, rank: int, ipc_dir: str | Path | None, timeout: float
+        self,
+        run_id: str,
+        rank: int,
+        ipc_dir: str | Path | None,
+        timeout: float,
+        validation: bool = False,
     ) -> None:
         if rank < 0 or timeout <= 0:
             raise ValueError("rank must be nonnegative and timeout must be positive")
@@ -224,10 +229,15 @@ class BatchReader(Iterator[Batch]):
                 raise RuntimeError("invalid rank")
             key = (self._root / "auth").read_bytes()
             multiprocessing.current_process().authkey = key
-            self._semaphore = _native.Semaphore((self._root / "semaphore").read_text())
+            prefix = "validation-" if validation else ""
+            self._semaphore = _native.Semaphore(
+                (self._root / f"{prefix}semaphore").read_text()
+            )
             try:
                 self._listener = Listener(
-                    str(self._root / f"rank-{rank}.sock"), family="AF_UNIX", authkey=key
+                    str(self._root / f"{prefix}rank-{rank}.sock"),
+                    family="AF_UNIX",
+                    authkey=key,
                 )
             except OSError as error:
                 if error.errno == errno.EADDRINUSE:
@@ -301,7 +311,12 @@ class BatchReader(Iterator[Batch]):
 
 
 def batches(
-    run_id: str, rank: int, *, ipc_dir: str | Path | None = None, timeout: float = 120
+    run_id: str,
+    rank: int,
+    validation: bool = False,
+    *,
+    ipc_dir: str | Path | None = None,
+    timeout: float = 120,
 ) -> BatchReader:
-    """Attach a training rank to an existing daemon, waiting for init if necessary."""
-    return BatchReader(run_id, rank, ipc_dir, timeout)
+    """Read training or validation batches from an existing daemon."""
+    return BatchReader(run_id, rank, ipc_dir, timeout, validation)

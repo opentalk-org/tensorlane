@@ -14,6 +14,7 @@ use tonic::transport::Channel;
 #[derive(Serialize, Deserialize)]
 pub enum Work {
     Sample {
+        validation: bool,
         batch: (u64, usize),
         index: usize,
         wave: Vec<u8>,
@@ -22,7 +23,9 @@ pub enum Work {
         speaker_id: i64,
         language_id: i32,
     },
-    End,
+    End {
+        validation: bool,
+    },
 }
 
 struct Requests {
@@ -51,6 +54,7 @@ impl Drop for Requests {
 pub async fn prefetch(
     mut grpc: TensorLaneClient<Channel>,
     run_id: String,
+    validation: bool,
     budget: Arc<BatchBudget>,
     work: mpsc::UnboundedSender<Work>,
 ) -> anyhow::Result<()> {
@@ -66,7 +70,11 @@ pub async fn prefetch(
                         if requests
                             .send(DataRequest {
                                 run_id: run_id.clone(),
-                                split: Split::Training as i32,
+                                split: if validation {
+                                    Split::Validation
+                                } else {
+                                    Split::Training
+                                } as i32,
                             })
                             .is_err()
                         {
@@ -86,7 +94,7 @@ pub async fn prefetch(
     .into_inner();
     let mut batch_id = 0u64;
     loop {
-        let Some(response) = stream.message().await.context("receiving training batch")? else {
+        let Some(response) = stream.message().await.context("receiving data batch")? else {
             break;
         };
         let batch_size = response.batch.len();
@@ -104,6 +112,7 @@ pub async fn prefetch(
                 "batch {batch_id} sample {index}: invalid int64 tokens"
             );
             work.send(Work::Sample {
+                validation,
                 batch: (batch_id, batch_size),
                 index,
                 wave: sample.wave,
@@ -116,6 +125,6 @@ pub async fn prefetch(
         batch_id += 1;
     }
     request_task.finish()?;
-    work.send(Work::End)?;
+    work.send(Work::End { validation })?;
     Ok(())
 }

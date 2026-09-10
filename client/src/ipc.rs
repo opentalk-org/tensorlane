@@ -75,6 +75,7 @@ mod tests {
         let mut data = Sender::new(daemon);
         let mut batches = Receiver::<Work>::new(worker);
         data.send(&Work::Sample {
+            validation: true,
             batch: (0, 1),
             index: 0,
             wave: vec![0, 0],
@@ -92,8 +93,11 @@ mod tests {
                 ..
             })
         ));
-        data.send(&Work::End).await?;
-        assert!(matches!(batches.recv().await?, Some(Work::End)));
+        data.send(&Work::End { validation: true }).await?;
+        assert!(matches!(
+            batches.recv().await?,
+            Some(Work::End { validation: true })
+        ));
         drop(data);
         assert!(batches.recv().await?.is_none());
         Ok(())

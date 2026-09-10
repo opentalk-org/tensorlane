@@ -46,7 +46,7 @@ pub fn status(root: &Path, state: &str, error: Option<&str>) -> anyhow::Result<(
 }
 struct Resources {
     root: PathBuf,
-    budget: Arc<BatchBudget>,
+    budgets: [Arc<BatchBudget>; 2],
     _lock: File,
 }
 impl Resources {
@@ -70,13 +70,21 @@ impl Resources {
         let mut auth = File::create(root.join("auth"))?;
         auth.write_all(uuid::Uuid::new_v4().as_bytes())?;
         auth.write_all(uuid::Uuid::new_v4().as_bytes())?;
-        let budget = Arc::new(BatchBudget::new(capacity)?);
-        std::fs::write(root.join("semaphore"), budget.semaphore.name()?)?;
+        let budgets = [
+            Arc::new(BatchBudget::new(capacity)?),
+            Arc::new(BatchBudget::new(capacity)?),
+        ];
+        for (name, budget) in ["semaphore", "validation-semaphore"]
+            .into_iter()
+            .zip(&budgets)
+        {
+            std::fs::write(root.join(name), budget.semaphore.name()?)?;
+        }
         std::fs::write(root.join("ranks"), ranks.to_string())?;
         status(root, "starting", None)?;
         Ok(Self {
             root: root.to_owned(),
-            budget,
+            budgets,
             _lock: lock,
         })
     }
@@ -104,7 +112,7 @@ impl Worker {
             .checked_mul(options.factor)
             .context("prefetch capacity overflow")?;
         let resources = Resources::new(&options.root, capacity, options.ranks)?;
-        let budget = resources.budget.clone();
+        let budgets = resources.budgets.clone();
         let root = options.root.clone();
         let (stop, stopped) = oneshot::channel();
         let (ready, initialized) = std::sync::mpsc::sync_channel(1);
@@ -116,7 +124,7 @@ impl Worker {
                         .worker_threads(2)
                         .enable_all()
                         .build()?;
-                    runtime.block_on(supervise(options, budget, stopped, &ready))
+                    runtime.block_on(supervise(options, budgets, stopped, &ready))
                 })();
                 if let Err(error) = result {
                     let message = format!("{error:#}");
@@ -143,7 +151,9 @@ impl Worker {
         }
     }
     pub fn stop(&mut self, error: Option<String>) {
-        self._resources.budget.cancel();
+        for budget in &self._resources.budgets {
+            budget.cancel();
+        }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(error.map_or(Ok(()), |message| Err(anyhow!(message))));
         }
@@ -165,7 +175,7 @@ impl Drop for Worker {
 }
 async fn supervise(
     options: Options,
-    budget: Arc<BatchBudget>,
+    budgets: [Arc<BatchBudget>; 2],
     mut stop: oneshot::Receiver<anyhow::Result<()>>,
     ready: &std::sync::mpsc::SyncSender<anyhow::Result<InitResponse>>,
 ) -> anyhow::Result<()> {
@@ -210,7 +220,7 @@ async fn supervise(
         let mut next_worker = 0;
         while let Some(message) = receive_work.recv().await {
             match &message {
-                Work::End => {
+                Work::End { .. } => {
                     for sender in &mut senders {
                         sender.send(&message).await?;
                     }
@@ -223,22 +233,25 @@ async fn supervise(
         }
         anyhow::Ok(senders)
     });
-    let mut pump = tokio::spawn(prefetch(
-        grpc,
-        initialized.run_id.clone(),
-        budget.clone(),
-        send_work,
-    ));
+    let mut pumps = tokio::task::JoinSet::new();
+    for (validation, budget) in [false, true].into_iter().zip(&budgets) {
+        pumps.spawn(prefetch(
+            grpc.clone(),
+            initialized.run_id.clone(),
+            validation,
+            budget.clone(),
+            send_work.clone(),
+        ));
+    }
+    drop(send_work);
     let mut idle_senders = None;
-    let mut complete = false;
     let mut sender_complete = false;
     let result = async {
         status(&options.root, "ready", None)?;
         loop {
             tokio::select! {
                 result = &mut stop => return result.unwrap_or(Ok(())),
-                result = &mut pump, if !complete => {
-                    complete = true;
+                Some(result) = pumps.join_next(), if !pumps.is_empty() => {
                     result.context("prefetch task panicked")??;
                 },
                 result = &mut sender, if !sender_complete => {
@@ -253,11 +266,11 @@ async fn supervise(
         Ok(()) => status(&options.root, "stopping", None),
         Err(error) => status(&options.root, "failed", Some(&format!("{error:#}"))),
     };
-    budget.cancel();
-    pump.abort();
-    if !complete {
-        let _ = pump.await;
+    for budget in &budgets {
+        budget.cancel();
     }
+    pumps.abort_all();
+    while pumps.join_next().await.is_some() {}
     drop(idle_senders);
     if !sender_complete {
         sender.abort();
