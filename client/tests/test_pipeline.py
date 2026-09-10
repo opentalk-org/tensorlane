@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import importlib
+import io
 import fcntl
 import json
 import multiprocessing
@@ -11,6 +12,7 @@ from pathlib import Path
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -48,6 +50,9 @@ class Fixture(rpc.TensorLaneServicer):
         self.init_requests = []
         self.returned_run_id = None
         self.train_config = "opaque config"
+        self.assets = {}
+        self.asset_requests = []
+        self.fail_asset = False
         self.validation_count = 0
         self.validation_requests = []
         self.fail_validation = False
@@ -63,7 +68,18 @@ class Fixture(rpc.TensorLaneServicer):
         return pb.InitResponse(
             run_id=self.returned_run_id or request.run_id,
             train_config=self.train_config,
+            assets=list(self.assets),
         )
+
+    def Asset(self, request, context):
+        with self.lock:
+            self.asset_requests.append(request)
+        entrypoint, data = self.assets[request.name]
+        yield pb.AssetResponse(metadata=pb.AssetMetadata(entrypoint=entrypoint))
+        for offset in range(0, len(data), 127):
+            if self.fail_asset and offset > 0:
+                context.abort(grpc.StatusCode.INTERNAL, "fixture asset failure")
+            yield pb.AssetResponse(chunk=data[offset : offset + 127])
 
     def Data(self, requests, context):
         for index, request in enumerate(requests):
@@ -165,6 +181,72 @@ def initialize_rank(run_id, rank, addr, root, output, finished):
 
 
 class PipelineTests(unittest.TestCase):
+    @staticmethod
+    def archive(files):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            for name, content in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+        return output.getvalue()
+
+    def test_assets_are_prefetched_once_and_shared_with_followers(self):
+        self.service.returned_run_id = str(uuid.uuid4())
+        self.service.assets = {
+            "asr": (
+                "../ignored-entrypoint.pth",
+                b"synthetic asset asr\n" * 1024,
+            ),
+            "checkpoint": (
+                None,
+                self.archive({"config.yml": b"config", "model.pth": b"model"}),
+            ),
+            "binary": (None, bytes(range(256)) * 5),
+            "empty": (None, b""),
+        }
+        original = multiprocessing.process.BaseProcess.start
+
+        def start(process):
+            self.assertEqual(len(self.service.asset_requests), 4)
+            self.assertEqual(len(list(Path(self.temp.name).rglob("assets/*/data"))), 4)
+            original(process)
+
+        with patch.object(multiprocessing.process.BaseProcess, "start", start):
+            self.start()
+        with self.attach(1) as follower:
+            for lane in (self.daemon, follower):
+                for name, (_, data) in self.service.assets.items():
+                    self.assertIsInstance(lane.asset(name), Path)
+                    self.assertTrue(lane.asset(name).is_file())
+                    self.assertEqual(lane.asset(name).read_bytes(), data)
+                    self.assertEqual(lane.asset(name), self.daemon.asset(name))
+                with self.assertRaises(KeyError):
+                    lane.asset("missing")
+        self.assertEqual(len(self.service.asset_requests), 4)
+        self.assertTrue(
+            all(
+                request.run_id == self.service.returned_run_id
+                for request in self.service.asset_requests
+            )
+        )
+        self.assertFalse(list(self.daemon._root.rglob("*.part")))
+        self.assertFalse(list(self.daemon._root.rglob("model.pth")))
+        self.daemon.close()
+        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
+
+    def test_asset_failure_does_not_publish_readiness_and_cleans_downloads(self):
+        data = b"weights" * 128
+        self.service.assets = {"model": (None, data)}
+        self.service.fail_asset = True
+        with self.assertRaisesRegex(RuntimeError, "fixture asset failure"):
+            self.start()
+        self.assertFalse(list(Path(self.temp.name).rglob("init.json")))
+        self.assertFalse(list(Path(self.temp.name).rglob("*.part")))
+        self.service.fail_asset = False
+        self.start()
+        self.assertEqual(self.daemon.asset("model").read_bytes(), data)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tlt-", dir="/tmp")
         self.run_id = str(uuid.uuid4())
@@ -293,7 +375,11 @@ class PipelineTests(unittest.TestCase):
 
         root = _root(self.run_id, self.temp.name)
         root.mkdir()
-        metadata = {"run_id": "returned-run-id", "train_config": 'opaque\n"config"'}
+        metadata = {
+            "run_id": "returned-run-id",
+            "train_config": 'opaque\n"config"',
+            "assets": {},
+        }
         (root / "init.json").write_text(json.dumps(metadata))
         (root / "ranks").write_text("2")
         with (root / "lock").open("w") as lock:
@@ -360,6 +446,7 @@ class PipelineTests(unittest.TestCase):
             {
                 "run_id": self.run_id,
                 "train_config": self.service.train_config,
+                "assets": {},
             },
         )
 

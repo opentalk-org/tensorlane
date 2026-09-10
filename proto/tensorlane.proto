@@ -16,6 +16,7 @@ message InitRequest {
 message InitResponse {
   string run_id = 1;
   string train_config = 2;
+  repeated string assets = 3;
 }
 
 enum Split {

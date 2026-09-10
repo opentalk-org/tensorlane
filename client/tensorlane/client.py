@@ -46,11 +46,13 @@ class TensorLane:
         train_config: str,
         rank: int,
         native: _native.Daemon | None = None,
+        assets: dict[str, Path] | None = None,
     ) -> None:
         self._root = root
         self.run_id = run_id
         self.train_config = train_config
-        self.rank = rank
+        self._rank = rank
+        self._assets = assets if assets is not None else {}
         self._closed = False
         self._native = native
         self._processes = []
@@ -85,7 +87,13 @@ class TensorLane:
     def batches(self, validation: bool = False, *, timeout: float = 120) -> BatchReader:
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
-        return BatchReader(self._root, self.rank, timeout, self._check, validation)
+        return BatchReader(self._root, self._rank, timeout, self._check, validation)
+
+    def asset(self, name: str) -> Path:
+        """Return the downloaded file unchanged; decoding or unpacking is up to the caller."""
+        if self._closed:
+            raise RuntimeError("TensorLane handle is closed")
+        return self._assets[name]
 
     def close(self) -> None:
         if self._closed:
@@ -156,7 +164,13 @@ def init(
         _check_alive(root)
         if rank >= int((root / "ranks").read_text()):
             raise ValueError("invalid rank")
-        return TensorLane(root, metadata["run_id"], metadata["train_config"], rank)
+        return TensorLane(
+            root,
+            metadata["run_id"],
+            metadata["train_config"],
+            rank,
+            assets={name: Path(path) for name, path in metadata["assets"].items()},
+        )
 
     if ranks <= 0 or prefetch_factor <= 0:
         raise ValueError("ranks and prefetch_factor must be positive")
@@ -179,7 +193,14 @@ def init(
         prefetch_factor,
         num_workers,
     )
-    daemon = TensorLane(root, native.run_id, native.train_config, rank, native)
+    daemon = TensorLane(
+        root,
+        native.run_id,
+        native.train_config,
+        rank,
+        native,
+        assets={name: Path(path) for name, path in native.assets.items()},
+    )
 
     from ._process import collate_worker, transform_worker
 
@@ -229,7 +250,15 @@ def init(
             time.sleep(0.02)
         temporary = root / "init.tmp"
         temporary.write_text(
-            json.dumps({"run_id": daemon.run_id, "train_config": daemon.train_config})
+            json.dumps(
+                {
+                    "run_id": daemon.run_id,
+                    "train_config": daemon.train_config,
+                    "assets": {
+                        name: str(path) for name, path in daemon._assets.items()
+                    },
+                }
+            )
         )
         temporary.replace(root / "init.json")
         native.check()
