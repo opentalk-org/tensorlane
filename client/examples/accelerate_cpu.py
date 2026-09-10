@@ -35,6 +35,7 @@ def main():
                 lane.batches(validation=True) as validation,
             ):
                 for index, batch in enumerate(training):
+                    lane.metric(index, f"rank/{rank}/batch_samples", len(batch))
                     print(
                         f"rank={rank} device={accelerator.device} split=training "
                         f"batch={index} samples={len(batch)}",
@@ -48,6 +49,12 @@ def main():
                             flush=True,
                         )
 
+            lane.metric_artifact(
+                10000,
+                "/Users/adam/tensorlane/new-client/client/examples/accelerate_cpu.py",
+                "dupa",
+            )
+            lane.flush()
             if accelerator.num_processes > 1:
                 distributed.barrier()
     finally:

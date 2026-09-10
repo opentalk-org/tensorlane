@@ -5,6 +5,7 @@ mod client;
 mod data;
 mod ipc;
 mod semaphore;
+mod uploads;
 mod worker;
 
 mod proto {
@@ -15,4 +16,6 @@ mod proto {
 mod _native {
     #[pymodule_export]
     use crate::client::{Daemon, Listener, Semaphore};
+    #[pymodule_export]
+    use crate::uploads::UploadClient;
 }

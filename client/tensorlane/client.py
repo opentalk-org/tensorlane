@@ -59,6 +59,7 @@ class TensorLane:
         self._queue = None
         self._stopped = None
         self._monitor = None
+        self._uploads = None
 
     def _supervise_processes(self, root: Path) -> None:
         while not self._stopped.wait(0.05):
@@ -99,6 +100,14 @@ class TensorLane:
         if self._closed:
             return
         self._closed = True
+        try:
+            if self._uploads is not None:
+                self._uploads.close()
+        finally:
+            self._uploads = None
+            self._close_daemon()
+
+    def _close_daemon(self) -> None:
         if self._native is None:
             return
         (self._root / "init.json").unlink(missing_ok=True)
@@ -124,6 +133,41 @@ class TensorLane:
                 self._queue.join_thread()
                 self._queue = None
             self._native.close()
+
+    def _upload_client(self):
+        if self._closed:
+            raise RuntimeError("TensorLane handle is closed")
+        if self._uploads is None:
+            self._check()
+            self._uploads = _native.UploadClient(self._root / "uploads.sock")
+        return self._uploads
+
+    def metric(self, step: int, name: str, value: float) -> None:
+        """Queue a scalar metric; the daemon supplies its timestamp."""
+        self._upload_client().metric(step, name, value)
+
+    def metric_artifact(
+        self,
+        step: int,
+        path: str | Path,
+        name: str,
+        content_type: str = "application/octet-stream",
+    ) -> None:
+        """Queue a file unchanged. Keep it available and unchanged until flush completes."""
+        self._upload_client().metric_artifact(
+            step, Path(path).absolute(), name, content_type
+        )
+
+    def checkpoint(self, step: int, path: str | Path) -> None:
+        """Queue a file unchanged. Keep it available and unchanged until flush completes."""
+        self._upload_client().checkpoint(step, Path(path).absolute())
+
+    def flush(self, *, timeout: float = 300) -> None:
+        """Wait for this rank's uploads and surface errors. Flush all ranks before the shutdown barrier."""
+        if self._closed:
+            raise RuntimeError("TensorLane handle is closed")
+        if self._uploads is not None:
+            self._uploads.flush(timeout)
 
     def __enter__(self) -> TensorLane:
         return self
