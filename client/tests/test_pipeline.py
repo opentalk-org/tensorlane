@@ -49,6 +49,9 @@ class Fixture(rpc.TensorLaneServicer):
         self.fail_data = False
         self.requests = []
         self.init_requests = []
+        self.end_requests = []
+        self.uploads_at_end = []
+        self.fail_init = False
         self.returned_run_id = None
         self.train_config = "opaque config"
         self.assets = {}
@@ -75,11 +78,20 @@ class Fixture(rpc.TensorLaneServicer):
     def Init(self, request, context):
         with self.lock:
             self.init_requests.append(request)
+        if self.fail_init:
+            context.abort(grpc.StatusCode.INTERNAL, "fixture init failure")
         return pb.InitResponse(
             run_id=self.returned_run_id or request.run_id,
             train_config=self.train_config,
             assets=list(self.assets),
         )
+
+    def End(self, request, context):
+        self.end_requests.append(request)
+        self.uploads_at_end.append(
+            (len(self.metrics), len(self.artifacts), len(self.checkpoints))
+        )
+        return pb.EndResponse()
 
     def Asset(self, request, context):
         with self.lock:
@@ -262,6 +274,61 @@ def initialize_rank(run_id, rank, addr, root, output, finished):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_owner_sends_end_once_using_returned_run_id(self):
+        self.service.returned_run_id = str(uuid.uuid4())
+        self.start()
+        follower = self.attach(1)
+        follower.close()
+        self.assertEqual(self.service.end_requests, [])
+        self.daemon.close()
+        self.daemon.close()
+        self.assertEqual(
+            [request.run_id for request in self.service.end_requests],
+            [self.service.returned_run_id],
+        )
+
+    def test_end_waits_for_daemon_to_drain_rank_uploads(self):
+        from tensorlane import _native
+
+        self.start()
+        rank = _native.UploadClient(self.daemon._root / "uploads.sock")
+        path = Path(self.temp.name) / "checkpoint"
+        path.write_bytes(b"raw data" * 200_000)
+        self.service.upload_gate.clear()
+        try:
+            rank.checkpoint(1, path)
+            rank.metric(1, "loss", 0.5)
+            rank.metric_artifact(1, path, "artifact", "application/octet-stream")
+            self.assertTrue(self.service.upload_started.wait(5))
+            with ThreadPoolExecutor() as executor:
+                closed = executor.submit(self.daemon.close)
+                try:
+                    time.sleep(0.1)
+                    self.assertFalse(closed.done())
+                    self.assertEqual(self.service.end_requests, [])
+                finally:
+                    self.service.upload_gate.set()
+                closed.result(timeout=15)
+        finally:
+            self.service.upload_gate.set()
+        self.assertEqual(self.service.uploads_at_end, [(1, 1, 1)])
+        self.assertEqual(self.service.checkpoints[0][1], path.read_bytes())
+
+    def test_failed_asset_startup_still_ends_initialized_run(self):
+        self.service.assets = {"asset": (None, b"data" * 128)}
+        self.service.fail_asset = True
+        with self.assertRaisesRegex(RuntimeError, "fixture asset failure"):
+            self.start()
+        self.assertEqual(
+            [request.run_id for request in self.service.end_requests], [self.run_id]
+        )
+
+    def test_failed_init_does_not_send_end(self):
+        self.service.fail_init = True
+        with self.assertRaisesRegex(RuntimeError, "fixture init failure"):
+            self.start()
+        self.assertEqual(self.service.end_requests, [])
+
     def test_metrics_and_files_are_uploaded_and_flushed(self):
         self.service.returned_run_id = str(uuid.uuid4())
         self.start()
