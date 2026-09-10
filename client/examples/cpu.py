@@ -6,9 +6,23 @@ from audio_transforms import transform_audio
 
 
 def consume(run_id, rank, ipc_dir):
-    with tensorlane.batches(run_id, rank, ipc_dir=ipc_dir) as reader:
-        for index, batch in enumerate(reader):
-            print(f"rank={rank} batch={index} samples={len(batch)}", flush=True)
+    with (
+        tensorlane.batches(run_id, rank, ipc_dir=ipc_dir) as training,
+        tensorlane.batches(
+            run_id, rank, validation=True, ipc_dir=ipc_dir
+        ) as validation,
+    ):
+        for index, batch in enumerate(training):
+            print(
+                f"rank={rank} split=training batch={index} samples={len(batch)}",
+                flush=True,
+            )
+            validation_batch = next(validation, None)
+            if validation_batch is not None:
+                print(
+                    f"rank={rank} split=validation batch={index} samples={len(validation_batch)}",
+                    flush=True,
+                )
 
 
 def main():

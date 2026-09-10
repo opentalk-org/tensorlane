@@ -127,6 +127,7 @@ impl Listener {
         let object = PyDict::new(py);
         match message {
             Work::Sample {
+                validation,
                 batch,
                 index,
                 wave,
@@ -136,6 +137,7 @@ impl Listener {
                 language_id,
             } => {
                 object.set_item("kind", "sample")?;
+                object.set_item("validation", validation)?;
                 object.set_item("batch", batch)?;
                 object.set_item("index", index)?;
                 object.set_item("wave", PyBytes::new(py, &wave))?;
@@ -144,8 +146,9 @@ impl Listener {
                 object.set_item("speaker_id", speaker_id)?;
                 object.set_item("language_id", language_id)?;
             }
-            Work::End => {
+            Work::End { validation } => {
                 object.set_item("kind", "end")?;
+                object.set_item("validation", validation)?;
             }
         }
         Ok(Some(object.into_any().unbind()))

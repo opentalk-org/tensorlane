@@ -3,6 +3,7 @@ target/
 .dnvr/
 .envrc
 .cache/
+.client-cache/
 .tensorlane/
 __pycache__/
 *.pyc

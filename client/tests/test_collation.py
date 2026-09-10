@@ -19,11 +19,14 @@ class CollationTests(unittest.TestCase):
             for value in range(3)
         ]
         incoming = queue.Queue()
-        incoming.put(("sample", ((1, 2), 1, samples[2])))
-        incoming.put(("sample", ((0, 1), 0, samples[0])))
-        incoming.put(("sample", ((1, 999), 0, samples[1])))
-        incoming.put(("end", None))
+        incoming.put(("sample", False, ((1, 2), 1, samples[2])))
+        incoming.put(("sample", True, ((0, 1), 0, samples[2])))
+        incoming.put(("sample", False, ((0, 1), 0, samples[0])))
+        incoming.put(("end", True, None))
+        incoming.put(("sample", False, ((1, 999), 0, samples[1])))
+        incoming.put(("end", False, None))
         outgoing = queue.Queue()
+        validation = queue.Queue()
         errors = queue.Queue()
         stopped = threading.Event()
         ready = threading.Event()
@@ -33,7 +36,8 @@ class CollationTests(unittest.TestCase):
             with (
                 patch("tensorlane._process.threading.Thread"),
                 patch(
-                    "tensorlane._process.queue.Queue", side_effect=[outgoing, errors]
+                    "tensorlane._process.queue.Queue",
+                    side_effect=[outgoing, validation, errors],
                 ),
                 patch.object(stopped, "wait", side_effect=lambda _: stopped.set()),
             ):
@@ -48,3 +52,8 @@ class CollationTests(unittest.TestCase):
                 self.assertIs(received, sample)
         self.assertEqual(outgoing.get_nowait(), ("end", None))
         self.assertTrue(outgoing.empty())
+        kind, (batch_id, batch) = validation.get_nowait()
+        self.assertEqual((kind, batch_id), ("batch", 0))
+        self.assertIs(batch.samples[0], samples[2])
+        self.assertEqual(validation.get_nowait(), ("end", None))
+        self.assertTrue(validation.empty())

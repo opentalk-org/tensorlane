@@ -41,6 +41,7 @@ def transform_worker(
             errors.put(error)
 
         output._on_queue_feeder_error = feeder_error
+        ended = set()
         with torch.no_grad():
             while not stopped.is_set():
                 message = receiver.recv()
@@ -88,15 +89,20 @@ def transform_worker(
                             text.share_memory_(),
                         )
                         output.put(
-                            ("sample", (message["batch"], message["index"], sample))
+                            (
+                                "sample",
+                                message["validation"],
+                                (message["batch"], message["index"], sample),
+                            )
                         )
                     except Exception as error:
                         raise RuntimeError(
                             f"batch {message['batch']} sample {message['index']}: {error}"
                         ) from error
                 else:
-                    output.put(("end", None))
-                if message["kind"] == "end":
+                    output.put(("end", message["validation"], None))
+                    ended.add(message["validation"])
+                if len(ended) == 2:
                     while not stopped.wait(0.1):
                         if not errors.empty():
                             raise RuntimeError(
@@ -120,17 +126,18 @@ def collate_worker(
 
     key = (root / "auth").read_bytes()
     multiprocessing.current_process().authkey = key
-    outputs = [queue.Queue() for _ in range(ranks)]
+    outputs = [[queue.Queue() for _ in range(ranks)] for _ in range(2)]
     errors = queue.Queue()
 
-    def deliver(rank: int) -> None:
+    def deliver(rank: int, validation: bool) -> None:
         connection = None
         try:
-            connection = _connect(root / f"rank-{rank}.sock", key, stopped)
+            prefix = "validation-" if validation else ""
+            connection = _connect(root / f"{prefix}rank-{rank}.sock", key, stopped)
             connection.send(("ready", None))
             while not stopped.is_set():
                 try:
-                    message = outputs[rank].get(timeout=0.1)
+                    message = outputs[validation][rank].get(timeout=0.1)
                 except queue.Empty:
                     if connection.poll():
                         raise RuntimeError(f"rank {rank} disconnected")
@@ -146,13 +153,16 @@ def collate_worker(
             if connection is not None:
                 connection.close()
 
-    for rank in range(ranks):
-        threading.Thread(target=deliver, args=(rank,), daemon=True).start()
+    for validation in (False, True):
+        for rank in range(ranks):
+            threading.Thread(
+                target=deliver, args=(rank, validation), daemon=True
+            ).start()
     ready.set()
-    pending = {}
-    completed = {}
-    next_batch = 0
-    ended = 0
+    pending = [{}, {}]
+    completed = [{}, {}]
+    next_batch = [0, 0]
+    ended = [0, 0]
     while not stopped.is_set():
         try:
             error = errors.get_nowait()
@@ -160,37 +170,40 @@ def collate_worker(
             pass
         else:
             raise RuntimeError(error)
-        if ended == num_workers:
+        if all(count == num_workers for count in ended):
             stopped.wait(0.1)
             continue
         try:
-            kind, value = incoming.get(timeout=0.1)
+            kind, validation, value = incoming.get(timeout=0.1)
         except queue.Empty:
             continue
         if kind == "error":
             raise RuntimeError(value)
         if kind == "end":
-            ended += 1
-            if ended == num_workers:
-                if pending or completed:
+            ended[validation] += 1
+            if ended[validation] == num_workers:
+                if pending[validation] or completed[validation]:
                     raise RuntimeError(
                         "stream ended with incomplete or missing batches"
                     )
-                for output in outputs:
+                for output in outputs[validation]:
                     output.put(("end", None))
             continue
         if kind != "sample":
             raise RuntimeError(f"unexpected transformation message: {kind}")
         (batch_id, batch_size), index, sample = value
-        if batch_id < next_batch or batch_id in completed:
+        if batch_id < next_batch[validation] or batch_id in completed[validation]:
             raise RuntimeError("message for an already completed batch")
-        size, parts = pending.setdefault(batch_id, (batch_size, {}))
+        size, parts = pending[validation].setdefault(batch_id, (batch_size, {}))
         parts[index] = sample
         if len(parts) == size:
-            completed[batch_id] = Batch(tuple(parts[index] for index in range(size)))
-            del pending[batch_id]
-        while next_batch in completed:
-            outputs[next_batch % ranks].put(
-                ("batch", (next_batch, completed.pop(next_batch)))
+            completed[validation][batch_id] = Batch(
+                tuple(parts[index] for index in range(size))
             )
-            next_batch += 1
+            del pending[validation][batch_id]
+        while next_batch[validation] in completed[validation]:
+            batch_id = next_batch[validation]
+            outputs[validation][batch_id % ranks].put(
+                ("batch", (batch_id, completed[validation].pop(batch_id)))
+            )
+            next_batch[validation] += 1

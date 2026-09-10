@@ -43,6 +43,10 @@ class Fixture(rpc.TensorLaneServicer):
         self.empty = empty
         self.fail_data = False
         self.requests = []
+        self.init_requests = []
+        self.validation_count = 0
+        self.validation_requests = []
+        self.fail_validation = False
         self.lock = threading.Lock()
         self.server = grpc.server(ThreadPoolExecutor(max_workers=4))
         rpc.add_TensorLaneServicer_to_server(self, self.server)
@@ -50,25 +54,31 @@ class Fixture(rpc.TensorLaneServicer):
         self.server.start()
 
     def Init(self, request, context):
+        with self.lock:
+            self.init_requests.append(request)
         return pb.InitResponse(run_id=request.run_id, train_config="opaque config")
 
     def Data(self, requests, context):
         for index, request in enumerate(requests):
+            validation = request.split == pb.VALIDATION
             with self.lock:
-                self.requests.append(request)
-            if self.fail_data:
+                (self.validation_requests if validation else self.requests).append(
+                    request
+                )
+            if self.fail_validation if validation else self.fail_data:
                 context.abort(grpc.StatusCode.INTERNAL, "fixture gRPC failure")
-            if index >= self.count:
+            if index >= (self.validation_count if validation else self.count):
                 return
+            value = index + (1000 if validation else 0)
             samples = (
                 []
                 if self.empty and index == 1
                 else [
                     pb.Sample(
-                        wave=struct.pack("<hh", index, -index),
+                        wave=struct.pack("<hh", value, -value),
                         text=struct.pack("<q", sample),
                         duration=0.5,
-                        speaker_id=index,
+                        speaker_id=value,
                         language_id=3,
                     )
                     for sample in range(index % 3 + 1)
@@ -80,9 +90,11 @@ class Fixture(rpc.TensorLaneServicer):
         self.server.stop(0).wait()
 
 
-def read_rank(run_id, rank, root, output):
+def read_rank(run_id, rank, root, output, validation=False):
     try:
-        with tensorlane.batches(run_id, rank, ipc_dir=root, timeout=20) as reader:
+        with tensorlane.batches(
+            run_id, rank, validation=validation, ipc_dir=root, timeout=20
+        ) as reader:
             result = []
             for batch in reader:
                 if any(
@@ -185,6 +197,7 @@ class PipelineTests(unittest.TestCase):
             output.close()
 
     def test_cpu_example_uses_custom_ipc_dir_for_every_rank(self):
+        self.service.validation_count = self.service.count
         example = Path(__file__).resolve().parents[1] / "examples" / "cpu.py"
         result = subprocess.run(
             [sys.executable, str(example), self.run_id, "--ipc-dir", "custom-ipc"],
@@ -195,11 +208,57 @@ class PipelineTests(unittest.TestCase):
             timeout=45,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        lines = [line for line in result.stdout.splitlines() if line.startswith("rank=")]
-        self.assertEqual(len(lines), self.service.count)
-        self.assertEqual(sum(line.startswith("rank=0 ") for line in lines), 3)
-        self.assertEqual(sum(line.startswith("rank=1 ") for line in lines), 2)
+        lines = [
+            line for line in result.stdout.splitlines() if line.startswith("rank=")
+        ]
+        self.assertEqual(len(lines), self.service.count * 2)
+        for split in ("training", "validation"):
+            split_lines = [line for line in lines if f"split={split} " in line]
+            self.assertEqual(len(split_lines), self.service.count)
+            self.assertEqual(sum(line.startswith("rank=0 ") for line in split_lines), 3)
+            self.assertEqual(sum(line.startswith("rank=1 ") for line in split_lines), 2)
         self.assertTrue((Path(self.temp.name) / "custom-ipc").is_dir())
+        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
+
+    @unittest.skipUnless(importlib.util.find_spec("accelerate"), "requires accelerate")
+    def test_accelerate_cpu_example_initializes_once_for_two_ranks(self):
+        self.service.validation_count = self.service.count
+        example = Path(__file__).resolve().parents[1] / "examples" / "accelerate_cpu.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--rdzv-backend=c10d",
+                "--rdzv-endpoint=127.0.0.1:0",
+                "--local-addr=127.0.0.1",
+                "--nproc_per_node=2",
+                str(example),
+                self.run_id,
+                "--ipc-dir",
+                "custom-ipc",
+            ],
+            cwd=self.temp.name,
+            env={**os.environ, "TENSORLANE_ADDR": f"localhost:{self.service.port}"},
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.service.init_requests), 1)
+        lines = [
+            line for line in result.stdout.splitlines() if line.startswith("rank=")
+        ]
+        self.assertEqual(len(lines), self.service.count * 2)
+        for split in ("training", "validation"):
+            for rank, count in ((0, 3), (1, 2)):
+                self.assertEqual(
+                    sum(
+                        f"rank={rank} device=cpu" in line and f"split={split} " in line
+                        for line in lines
+                    ),
+                    count,
+                )
         self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
 
     def test_prefetch_credits_cover_unconsumed_batches(self):
@@ -213,6 +272,99 @@ class PipelineTests(unittest.TestCase):
             time.sleep(0.2)
             self.assertEqual(len(self.service.requests), 3)
             self.daemon.close()
+
+    def test_validation_drains_while_training_buffer_is_full(self):
+        self.service.validation_count = 4
+        self.start(ranks=1, factor=1, workers=3)
+        wait_for(lambda: len(self.service.requests) == 1)
+        with tensorlane.batches(
+            self.run_id, 0, validation=True, ipc_dir=self.temp.name
+        ) as reader:
+            batches = list(reader)
+        self.assertEqual(
+            [batch.samples[0].speaker_id for batch in batches], list(range(1000, 1004))
+        )
+        self.assertEqual(
+            [batch.samples[0].wave.tolist() for batch in batches],
+            [[value * 2, -value * 2] for value in range(1000, 1004)],
+        )
+        self.assertEqual(len(self.service.requests), 1)
+        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            self.assertEqual(
+                [batch.samples[0].speaker_id for batch in reader], list(range(5))
+            )
+
+    def test_training_drains_while_validation_buffer_is_full(self):
+        self.service.validation_count = 4
+        self.start(ranks=1, factor=1, workers=3)
+        wait_for(lambda: len(self.service.validation_requests) == 1)
+        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            self.assertEqual(
+                [batch.samples[0].speaker_id for batch in reader], list(range(5))
+            )
+        self.assertEqual(len(self.service.validation_requests), 1)
+        with tensorlane.batches(self.run_id, 0, True, ipc_dir=self.temp.name) as reader:
+            self.assertEqual(
+                [batch.samples[0].speaker_id for batch in reader],
+                list(range(1000, 1004)),
+            )
+
+    def test_training_and_validation_readers_can_alternate(self):
+        self.service.validation_count = 3
+        self.start(ranks=1, factor=2, workers=3)
+        with (
+            tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as training,
+            tensorlane.batches(
+                self.run_id, 0, validation=True, ipc_dir=self.temp.name
+            ) as validation,
+        ):
+            for index in range(3):
+                self.assertEqual(next(training).samples[0].speaker_id, index)
+                self.assertEqual(next(validation).samples[0].speaker_id, 1000 + index)
+            self.assertEqual(list(validation), [])
+            self.assertEqual(
+                [batch.samples[0].speaker_id for batch in training], [3, 4]
+            )
+
+    def test_validation_is_distributed_between_independent_ranks(self):
+        self.service.validation_count = 5
+        self.start(workers=3)
+        context = multiprocessing.get_context("spawn")
+        output = context.Queue()
+        ranks = [
+            context.Process(
+                target=read_rank, args=(self.run_id, rank, self.temp.name, output, True)
+            )
+            for rank in range(2)
+        ]
+        try:
+            for rank in ranks:
+                rank.start()
+            for _ in ranks:
+                rank, batches, error = output.get(timeout=30)
+                self.assertIsNone(error, error)
+                self.assertEqual(
+                    [batch[0][2] for batch in batches],
+                    list(range(1000 + rank, 1005, 2)),
+                )
+            for rank in ranks:
+                rank.join(5)
+                self.assertEqual(rank.exitcode, 0)
+        finally:
+            for rank in ranks:
+                if rank.is_alive():
+                    rank.kill()
+                rank.join(5)
+            output.close()
+
+    def test_validation_rpc_failure_reaches_reader(self):
+        self.service.fail_validation = True
+        with self.assertRaisesRegex(RuntimeError, "fixture gRPC failure"):
+            self.start(ranks=1)
+            with tensorlane.batches(
+                self.run_id, 0, validation=True, ipc_dir=self.temp.name
+            ) as reader:
+                next(reader)
 
     def test_global_budget_allows_one_rank_to_release_any_slot(self):
         self.service.count = 20
@@ -231,12 +383,14 @@ class PipelineTests(unittest.TestCase):
         self.service.count = 20
         self.start(ranks=1, factor=1)
         wait_for(lambda: len(self.service.requests) == 1)
-        name = next(Path(self.temp.name).rglob("semaphore")).read_text()
+        names = [path.read_text() for path in Path(self.temp.name).rglob("*semaphore")]
+        self.assertEqual(len(names), 2)
         started = time.monotonic()
         self.daemon.close()
         self.assertLess(time.monotonic() - started, 8)
-        with self.assertRaises(RuntimeError):
-            tensorlane._native.Semaphore(name)
+        for name in names:
+            with self.assertRaises(RuntimeError):
+                tensorlane._native.Semaphore(name)
 
     def test_duplicate_init_and_rank_are_rejected(self):
         self.start()
@@ -361,14 +515,18 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(hasattr(receiver, "ready"))
             self.assertFalse(hasattr(receiver, "error"))
             message = receiver.recv()
+            if message["kind"] == "end":
+                self.assertTrue(message["validation"])
+                message = receiver.recv()
             self.assertEqual(message["kind"], "sample")
+            self.assertFalse(message["validation"])
             self.assertEqual(message["batch"], (0, 1))
             self.assertEqual(message["index"], 0)
         finally:
-            receiver.close()
+            del receiver
 
     def test_native_listener_reports_connection_failure(self):
-        with self.assertRaisesRegex(RuntimeError, "connecting to worker socket"):
+        with self.assertRaisesRegex(RuntimeError, "No such file or directory"):
             tensorlane._native.Listener(Path(self.temp.name) / "missing.sock")
 
     def test_transform_from_callers_search_path(self):
