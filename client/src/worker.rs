@@ -1,7 +1,7 @@
 use crate::{
     data::{Work, prefetch},
     ipc::Sender,
-    proto::{InitRequest, InitResponse, tensor_lane_client::TensorLaneClient},
+    proto::{EndRequest, InitRequest, InitResponse, tensor_lane_client::TensorLaneClient},
     semaphore::BatchBudget,
 };
 use anyhow::{Context, anyhow, ensure};
@@ -24,7 +24,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 
 pub struct Options {
     pub run_id: String,
@@ -238,6 +238,7 @@ async fn supervise(
     } else {
         format!("http://{}", options.addr)
     };
+    let mut remote = None;
     let startup = async {
         let channel = Endpoint::from_shared(url)?
             .connect_timeout(Duration::from_secs(10))
@@ -250,6 +251,7 @@ async fn supervise(
             })
             .await?
             .into_inner();
+        remote = Some((grpc.clone(), initialized.run_id.clone()));
         let assets = crate::assets::prefetch(&grpc, &initialized, &options.root).await?;
         ready
             .send(Ok(Initialized {
@@ -267,9 +269,19 @@ async fn supervise(
         }
         anyhow::Ok((grpc, initialized, work))
     };
-    let (grpc, initialized, work) = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(120), startup) => result.context("daemon startup timed out")??,
-        result = &mut stop => return result.unwrap_or(Ok(())),
+    let started = tokio::select! {
+        result = tokio::time::timeout(Duration::from_secs(120), startup) => result.context("daemon startup timed out").and_then(|result| result).map(Some),
+        result = &mut stop => result.unwrap_or(Ok(())).map(|()| None),
+    };
+    let (grpc, initialized, work) = match started {
+        Ok(Some(started)) => started,
+        result => {
+            let ended = match remote {
+                Some((grpc, run_id)) => end_run(grpc, run_id).await,
+                None => Ok(()),
+            };
+            return result.map(|_| ()).and(ended);
+        }
     };
     let uploads_stopping = CancellationToken::new();
     let mut uploads = tokio::spawn(crate::uploads::serve(
@@ -344,9 +356,23 @@ async fn supervise(
         let _ = sender.await;
     }
     uploads_stopping.cancel();
-    if !uploads_complete {
-        let uploaded = uploads.await.context("upload task panicked")?;
-        return result.and(uploaded);
-    }
-    result
+    let result = if !uploads_complete {
+        let uploaded = uploads
+            .await
+            .context("upload task panicked")
+            .and_then(|result| result);
+        result.and(uploaded)
+    } else {
+        result
+    };
+    let ended = end_run(grpc, initialized.run_id).await;
+    result.and(ended)
+}
+
+async fn end_run(mut grpc: TensorLaneClient<Channel>, run_id: String) -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), grpc.end(EndRequest { run_id }))
+        .await
+        .context("End RPC timed out")?
+        .context("End RPC failed")?;
+    Ok(())
 }
