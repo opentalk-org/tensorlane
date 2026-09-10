@@ -14,15 +14,18 @@ def main():
     args = parser.parse_args()
     accelerator = Accelerator(cpu=True)
     try:
+        rank = accelerator.process_index
         with tensorlane.init(
             args.run_id,
             transform_audio,
             accelerator.num_processes,
-            rank=accelerator.process_index,
+            rank=rank,
             start_daemon=accelerator.is_main_process,
             ipc_dir=args.ipc_dir,
         ) as lane:
-            rank = lane.rank
+            asset = lane.asset("asr")
+            print(f"asr asset path: {asset}")
+
             print(
                 f"rank={rank} run_id={lane.run_id} train_config={lane.train_config!r}",
                 flush=True,

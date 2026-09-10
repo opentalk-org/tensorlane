@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{Context, anyhow, ensure};
 use fs2::FileExt;
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::Write,
     os::unix::fs::PermissionsExt,
@@ -31,6 +32,10 @@ pub struct Options {
     pub ranks: usize,
     pub factor: usize,
     pub num_workers: usize,
+}
+pub struct Initialized {
+    pub response: InitResponse,
+    pub assets: HashMap<String, PathBuf>,
 }
 pub struct Worker {
     stop: Option<oneshot::Sender<anyhow::Result<()>>>,
@@ -60,7 +65,11 @@ impl Resources {
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
             if entry.file_name() != "lock" {
-                std::fs::remove_file(entry.path())?;
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(entry.path())?;
+                } else {
+                    std::fs::remove_file(entry.path())?;
+                }
             }
         }
         let mut auth = File::create(root.join("auth"))?;
@@ -89,14 +98,18 @@ impl Drop for Resources {
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten() {
                 if entry.file_name() != "lock" {
-                    let _ = std::fs::remove_file(entry.path());
+                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        let _ = std::fs::remove_dir_all(entry.path());
+                    } else {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
                 }
             }
         }
     }
 }
 impl Worker {
-    pub fn start(options: Options) -> anyhow::Result<(Self, InitResponse)> {
+    pub fn start(options: Options) -> anyhow::Result<(Self, Initialized)> {
         ensure!(
             options.ranks > 0 && options.factor > 0,
             "ranks and prefetch_factor must be positive"
@@ -214,7 +227,7 @@ async fn supervise(
     options: Options,
     budgets: [Arc<BatchBudget>; 2],
     mut stop: oneshot::Receiver<anyhow::Result<()>>,
-    ready: &std::sync::mpsc::SyncSender<anyhow::Result<InitResponse>>,
+    ready: &std::sync::mpsc::SyncSender<anyhow::Result<Initialized>>,
     connected: &AtomicBool,
 ) -> anyhow::Result<()> {
     let work_listener = UnixListener::bind(options.root.join("work.sock"))?;
@@ -235,8 +248,12 @@ async fn supervise(
             })
             .await?
             .into_inner();
+        let assets = crate::assets::prefetch(&grpc, &initialized, &options.root).await?;
         ready
-            .send(Ok(initialized.clone()))
+            .send(Ok(Initialized {
+                response: initialized.clone(),
+                assets,
+            }))
             .map_err(|_| anyhow!("initializer disconnected"))?;
         let mut sockets = Vec::new();
         for _ in 0..options.num_workers {

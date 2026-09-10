@@ -70,6 +70,8 @@ impl TensorLaneService for TensorLane {
             self.cache_dir,
         )
         .await?;
+        let mut assets: Vec<_> = initialized.active.config.assets.keys().cloned().collect();
+        assets.sort();
         self.active_runs
             .write()
             .await
@@ -79,6 +81,7 @@ impl TensorLaneService for TensorLane {
         Ok(Response::new(InitResponse {
             run_id: run_id.to_string(),
             train_config: initialized.train_config,
+            assets,
         }))
     }
 

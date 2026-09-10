@@ -9,7 +9,7 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict},
 };
-use std::{path::PathBuf, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
 #[pyclass]
 pub struct Daemon {
@@ -18,6 +18,8 @@ pub struct Daemon {
     run_id: String,
     #[pyo3(get)]
     train_config: String,
+    #[pyo3(get)]
+    assets: HashMap<String, PathBuf>,
 }
 #[pymethods]
 impl Daemon {
@@ -42,8 +44,9 @@ impl Daemon {
             })?;
             Ok(Self {
                 worker: Mutex::new(Some(worker)),
-                run_id: initialized.run_id,
-                train_config: initialized.train_config,
+                run_id: initialized.response.run_id,
+                train_config: initialized.response.train_config,
+                assets: initialized.assets,
             })
         })
     }

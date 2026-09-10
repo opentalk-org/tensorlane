@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod assets;
 mod client;
 mod data;
 mod ipc;
