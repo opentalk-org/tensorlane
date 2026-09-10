@@ -13,7 +13,6 @@ import time
 from collections.abc import Callable, Iterator
 from multiprocessing.connection import Listener
 from torch import Tensor
-from typing import Any
 
 import torch.multiprocessing as multiprocessing
 
@@ -27,31 +26,32 @@ def _root(run_id: str, ipc_dir: str | Path | None) -> Path:
     return base / f"tl-{os.getuid()}-{identifier}"
 
 
-def _status(root: Path) -> dict[str, Any]:
+def _check_alive(root: Path) -> None:
     try:
-        return json.loads((root / "status.json").read_text())
-    except FileNotFoundError:
-        return {"state": "starting"}
+        with (root / "lock").open("rb") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            raise RuntimeError("TensorLane daemon stopped unexpectedly")
+    except FileNotFoundError as error:
+        raise RuntimeError("TensorLane daemon disappeared") from error
 
 
-def _failure(root: Path) -> None:
-    status = _status(root)
-    if status["state"] in ("failed", "closed", "stopping"):
-        raise RuntimeError(status.get("error") or "TensorLane daemon is closed")
-    if status["state"] == "ready":
-        try:
-            with (root / "lock").open("rb") as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return
-                raise RuntimeError("TensorLane daemon stopped unexpectedly")
-        except FileNotFoundError as error:
-            raise RuntimeError("TensorLane daemon disappeared") from error
-
-
-class Daemon:
-    def __init__(self, native: _native.Daemon) -> None:
+class TensorLane:
+    def __init__(
+        self,
+        root: Path,
+        run_id: str,
+        train_config: str,
+        rank: int,
+        native: _native.Daemon | None = None,
+    ) -> None:
+        self._root = root
+        self.run_id = run_id
+        self.train_config = train_config
+        self.rank = rank
+        self._closed = False
         self._native = native
         self._processes = []
         self._queue = None
@@ -60,7 +60,10 @@ class Daemon:
 
     def _supervise_processes(self, root: Path) -> None:
         while not self._stopped.wait(0.05):
-            if _status(root)["state"] in ("stopping", "closed", "failed"):
+            try:
+                self._native.check()
+            except RuntimeError:
+                (root / "init.json").unlink(missing_ok=True)
                 self._stopped.set()
                 return
             for process in self._processes:
@@ -71,15 +74,26 @@ class Daemon:
                     self._stopped.set()
                     return
 
-    @property
-    def run_id(self) -> str:
-        return self._native.run_id
+    def _check(self) -> None:
+        if self._native is not None:
+            self._native.check()
+        else:
+            if not (self._root / "init.json").exists():
+                raise RuntimeError("TensorLane daemon is closed")
+            _check_alive(self._root)
 
-    @property
-    def train_config(self) -> str:
-        return self._native.train_config
+    def batches(self, validation: bool = False, *, timeout: float = 120) -> BatchReader:
+        if self._closed:
+            raise RuntimeError("TensorLane handle is closed")
+        return BatchReader(self._root, self.rank, timeout, self._check, validation)
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._native is None:
+            return
+        (self._root / "init.json").unlink(missing_ok=True)
         if self._stopped is not None:
             self._stopped.set()
         if self._monitor is not None:
@@ -103,7 +117,7 @@ class Daemon:
                 self._queue = None
             self._native.close()
 
-    def __enter__(self) -> Daemon:
+    def __enter__(self) -> TensorLane:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -116,13 +130,38 @@ def init(
     ranks: int,
     prefetch_factor: int = 2,
     *,
+    rank: int,
+    start_daemon: bool,
     num_workers: int = 5,
     addr: str | None = None,
     ipc_dir: str | Path | None = None,
-) -> Daemon:
-    """Start once, in the main rank. Transform must accept and return a CPU tensor."""
+    timeout: float = 120,
+) -> TensorLane:
+    """Initialize on every rank; exactly one caller must start the daemon."""
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
+        raise ValueError("rank must be a nonnegative integer")
+    if timeout <= 0:
+        raise ValueError("timeout must be positive")
+    root = _root(run_id, ipc_dir)
+    if not start_daemon:
+        deadline = time.monotonic() + timeout
+        metadata_path = root / "init.json"
+        while not metadata_path.exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"TensorLane init did not become ready for run {run_id!r}"
+                )
+            time.sleep(0.02)
+        metadata = json.loads(metadata_path.read_text())
+        _check_alive(root)
+        if rank >= int((root / "ranks").read_text()):
+            raise ValueError("invalid rank")
+        return TensorLane(root, metadata["run_id"], metadata["train_config"], rank)
+
     if ranks <= 0 or prefetch_factor <= 0:
         raise ValueError("ranks and prefetch_factor must be positive")
+    if rank >= ranks:
+        raise ValueError("invalid rank")
     if not callable(transform):
         raise TypeError("transform must be callable")
     if (
@@ -132,18 +171,15 @@ def init(
     ):
         raise ValueError("num_workers must be a positive integer")
 
-    root = _root(run_id, ipc_dir)
-
-    daemon = Daemon(
-        _native.Daemon(
-            run_id,
-            addr or os.environ.get("TENSORLANE_ADDR", "localhost:8181"),
-            root,
-            ranks,
-            prefetch_factor,
-            num_workers,
-        )
+    native = _native.Daemon(
+        run_id,
+        addr or os.environ.get("TENSORLANE_ADDR", "localhost:8181"),
+        root,
+        ranks,
+        prefetch_factor,
+        num_workers,
     )
+    daemon = TensorLane(root, native.run_id, native.train_config, rank, native)
 
     from ._process import collate_worker, transform_worker
 
@@ -181,9 +217,8 @@ def init(
             daemon=True,
         )
         daemon._monitor.start()
-        deadline = time.monotonic() + 120
-        while _status(root)["state"] != "ready" or not collator_ready.is_set():
-            _failure(root)
+        deadline = time.monotonic() + timeout
+        while not native.ready() or not collator_ready.is_set():
             for process in daemon._processes:
                 if process.exitcode is not None:
                     raise RuntimeError(
@@ -192,6 +227,12 @@ def init(
             if time.monotonic() >= deadline:
                 raise TimeoutError("TensorLane workers did not become ready")
             time.sleep(0.02)
+        temporary = root / "init.tmp"
+        temporary.write_text(
+            json.dumps({"run_id": daemon.run_id, "train_config": daemon.train_config})
+        )
+        temporary.replace(root / "init.json")
+        native.check()
         return daemon
     except BaseException:
         daemon.close()
@@ -201,15 +242,16 @@ def init(
 class BatchReader(Iterator[Batch]):
     def __init__(
         self,
-        run_id: str,
+        root: Path,
         rank: int,
-        ipc_dir: str | Path | None,
         timeout: float,
+        check: Callable[[], None],
         validation: bool = False,
     ) -> None:
         if rank < 0 or timeout <= 0:
             raise ValueError("rank must be nonnegative and timeout must be positive")
-        self._root = _root(run_id, ipc_dir)
+        self._root = root
+        self._check = check
         self._rank = rank
         self._closed = False
         self._connection = None
@@ -217,14 +259,7 @@ class BatchReader(Iterator[Batch]):
         self._semaphore = None
         deadline = time.monotonic() + timeout
         try:
-            while _status(self._root)["state"] != "ready":
-                _failure(self._root)
-                if time.monotonic() >= deadline:
-                    raise TimeoutError(
-                        f"TensorLane init did not become ready for run {run_id!r}"
-                    )
-                time.sleep(0.02)
-            _failure(self._root)
+            self._check()
             if rank >= int((self._root / "ranks").read_text()):
                 raise RuntimeError("invalid rank")
             key = (self._root / "auth").read_bytes()
@@ -245,7 +280,7 @@ class BatchReader(Iterator[Batch]):
                 raise
             self._listener._listener._socket.settimeout(0.1)
             while self._connection is None:
-                _failure(self._root)
+                self._check()
                 if time.monotonic() >= deadline:
                     raise TimeoutError("collator did not connect to rank")
                 try:
@@ -253,7 +288,7 @@ class BatchReader(Iterator[Batch]):
                 except socket.timeout:
                     pass
             while not self._connection.poll(0.1):
-                _failure(self._root)
+                self._check()
                 if time.monotonic() >= deadline:
                     raise TimeoutError("rank handshake timed out")
             kind, value = self._connection.recv()
@@ -274,7 +309,7 @@ class BatchReader(Iterator[Batch]):
             raise RuntimeError("rank reader is not connected")
         try:
             while not connection.poll(0.1):
-                _failure(self._root)
+                self._check()
             kind, value = connection.recv()
             if kind == "end":
                 self.close()
@@ -287,7 +322,7 @@ class BatchReader(Iterator[Batch]):
             self._semaphore.post()
             return batch
         except (EOFError, OSError) as error:
-            _failure(self._root)
+            self._check()
             raise RuntimeError("TensorLane collater disconnected") from error
 
     def close(self) -> None:
@@ -308,15 +343,3 @@ class BatchReader(Iterator[Batch]):
 
     def __exit__(self, *_: object) -> None:
         self.close()
-
-
-def batches(
-    run_id: str,
-    rank: int,
-    validation: bool = False,
-    *,
-    ipc_dir: str | Path | None = None,
-    timeout: float = 120,
-) -> BatchReader:
-    """Read training or validation batches from an existing daemon."""
-    return BatchReader(run_id, rank, ipc_dir, timeout, validation)

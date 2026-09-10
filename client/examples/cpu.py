@@ -5,12 +5,18 @@ import tensorlane
 from audio_transforms import transform_audio
 
 
-def consume(run_id, rank, ipc_dir):
+def consume(run_id, rank, ranks, ipc_dir):
     with (
-        tensorlane.batches(run_id, rank, ipc_dir=ipc_dir) as training,
-        tensorlane.batches(
-            run_id, rank, validation=True, ipc_dir=ipc_dir
-        ) as validation,
+        tensorlane.init(
+            run_id,
+            transform_audio,
+            ranks,
+            rank=rank,
+            start_daemon=False,
+            ipc_dir=ipc_dir,
+        ) as lane,
+        lane.batches() as training,
+        lane.batches(validation=True) as validation,
     ):
         for index, batch in enumerate(training):
             print(
@@ -33,10 +39,17 @@ def main():
     args = parser.parse_args()
     context = multiprocessing.get_context("spawn")
     with tensorlane.init(
-        args.run_id, transform_audio, args.ranks, ipc_dir=args.ipc_dir
+        args.run_id,
+        transform_audio,
+        args.ranks,
+        rank=0,
+        start_daemon=True,
+        ipc_dir=args.ipc_dir,
     ):
         processes = [
-            context.Process(target=consume, args=(args.run_id, rank, args.ipc_dir))
+            context.Process(
+                target=consume, args=(args.run_id, rank, args.ranks, args.ipc_dir)
+            )
             for rank in range(args.ranks)
         ]
         try:

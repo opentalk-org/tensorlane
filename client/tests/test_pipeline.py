@@ -3,6 +3,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import importlib
+import fcntl
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -44,6 +46,8 @@ class Fixture(rpc.TensorLaneServicer):
         self.fail_data = False
         self.requests = []
         self.init_requests = []
+        self.returned_run_id = None
+        self.train_config = "opaque config"
         self.validation_count = 0
         self.validation_requests = []
         self.fail_validation = False
@@ -56,7 +60,10 @@ class Fixture(rpc.TensorLaneServicer):
     def Init(self, request, context):
         with self.lock:
             self.init_requests.append(request)
-        return pb.InitResponse(run_id=request.run_id, train_config="opaque config")
+        return pb.InitResponse(
+            run_id=self.returned_run_id or request.run_id,
+            train_config=self.train_config,
+        )
 
     def Data(self, requests, context):
         for index, request in enumerate(requests):
@@ -92,9 +99,18 @@ class Fixture(rpc.TensorLaneServicer):
 
 def read_rank(run_id, rank, root, output, validation=False):
     try:
-        with tensorlane.batches(
-            run_id, rank, validation=validation, ipc_dir=root, timeout=20
-        ) as reader:
+        with (
+            tensorlane.init(
+                run_id,
+                double,
+                2,
+                rank=rank,
+                start_daemon=False,
+                ipc_dir=root,
+                timeout=20,
+            ) as lane,
+            lane.batches(validation=validation, timeout=20) as reader,
+        ):
             result = []
             for batch in reader:
                 if any(
@@ -128,6 +144,26 @@ def wait_for(predicate, timeout=10):
     raise AssertionError("condition timed out")
 
 
+def initialize_rank(run_id, rank, addr, root, output, finished):
+    try:
+        with tensorlane.init(
+            run_id,
+            double,
+            2,
+            rank=rank,
+            start_daemon=rank == 1,
+            addr=addr,
+            ipc_dir=root,
+            num_workers=1,
+            timeout=20,
+        ) as lane:
+            output.put((lane.rank, lane.run_id, lane.train_config, None))
+            if not finished.wait(20):
+                raise TimeoutError("test did not release ranks")
+    except Exception as error:
+        output.put((rank, None, None, repr(error)))
+
+
 class PipelineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tlt-", dir="/tmp")
@@ -148,11 +184,23 @@ class PipelineTests(unittest.TestCase):
             transform,
             ranks,
             factor,
+            rank=0,
+            start_daemon=True,
             addr=f"localhost:{self.service.port}",
             ipc_dir=self.temp.name,
             **({"num_workers": workers} if workers is not None else {}),
         )
         return self.daemon
+
+    def attach(self, rank):
+        return tensorlane.init(
+            self.run_id,
+            double,
+            2,
+            rank=rank,
+            start_daemon=False,
+            ipc_dir=self.temp.name,
+        )
 
     def test_independent_ranks_attach_before_init(self):
         context = multiprocessing.get_context("spawn")
@@ -195,6 +243,183 @@ class PipelineTests(unittest.TestCase):
                     rank.kill()
                 rank.join(5)
             output.close()
+
+    def test_nonzero_rank_owns_daemon_and_publishes_config(self):
+        self.service.returned_run_id = str(uuid.uuid4())
+        self.service.train_config = 'name: "hello 🦀"\nsteps: 5\n'
+        context = multiprocessing.get_context("spawn")
+        output = context.Queue()
+        finished = context.Event()
+        ranks = [
+            context.Process(
+                target=initialize_rank,
+                args=(
+                    self.run_id,
+                    rank,
+                    f"localhost:{self.service.port}",
+                    self.temp.name,
+                    output,
+                    finished,
+                ),
+            )
+            for rank in (0, 1)
+        ]
+        try:
+            ranks[0].start()
+            time.sleep(0.2)
+            self.assertEqual(self.service.init_requests, [])
+            ranks[1].start()
+            for _ in ranks:
+                rank, run_id, config, error = output.get(timeout=30)
+                self.assertIsNone(error, error)
+                self.assertEqual(run_id, self.service.returned_run_id)
+                self.assertEqual(config, self.service.train_config)
+            self.assertEqual(len(self.service.init_requests), 1)
+            finished.set()
+            for rank in ranks:
+                rank.join(10)
+                self.assertEqual(rank.exitcode, 0)
+            self.assertEqual(list(Path(self.temp.name).rglob("init.json")), [])
+        finally:
+            finished.set()
+            for rank in ranks:
+                if rank.is_alive():
+                    rank.kill()
+                rank.join(5)
+            output.close()
+
+    def test_follower_reads_metadata_once_without_starting_anything(self):
+        from tensorlane.client import _root
+
+        root = _root(self.run_id, self.temp.name)
+        root.mkdir()
+        metadata = {"run_id": "returned-run-id", "train_config": 'opaque\n"config"'}
+        (root / "init.json").write_text(json.dumps(metadata))
+        (root / "ranks").write_text("2")
+        with (root / "lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with (
+                patch("tensorlane.client.json.loads", wraps=json.loads) as decode,
+                patch(
+                    "tensorlane._native.Daemon",
+                    side_effect=AssertionError("daemon was started"),
+                ),
+                tensorlane.init(
+                    self.run_id,
+                    None,
+                    0,
+                    rank=0,
+                    start_daemon=False,
+                    ipc_dir=self.temp.name,
+                ) as lane,
+            ):
+                self.assertIsInstance(lane, tensorlane.TensorLane)
+                decode.assert_called_once_with(json.dumps(metadata))
+                self.assertEqual(lane.run_id, metadata["run_id"])
+                self.assertEqual(lane.train_config, metadata["train_config"])
+        self.assertTrue((root / "init.json").exists())
+
+    def test_nonowner_close_does_not_stop_daemon_and_preserves_directory(self):
+        self.service.returned_run_id = str(uuid.uuid4())
+        self.start(ranks=1)
+        follower = tensorlane.init(
+            self.run_id, double, 1, rank=0, start_daemon=False, ipc_dir=self.temp.name
+        )
+        self.assertEqual(follower.run_id, self.daemon.run_id)
+        self.assertEqual(follower.train_config, self.daemon.train_config)
+        with follower.batches() as reader:
+            follower.close()
+            follower.close()
+            self.assertEqual(len(list(reader)), 5)
+        self.assertTrue((self.daemon._root / "init.json").exists())
+        self.assertEqual(len(self.service.init_requests), 1)
+        self.daemon.close()
+        self.assertFalse((self.daemon._root / "init.json").exists())
+
+    def test_stale_metadata_is_rejected_and_replaced(self):
+        from tensorlane.client import _root
+
+        root = _root(self.run_id, self.temp.name)
+        root.mkdir()
+        (root / "lock").touch()
+        (root / "init.json").write_text(
+            json.dumps({"run_id": "stale", "train_config": "stale"})
+        )
+        with self.assertRaisesRegex(RuntimeError, "stopped unexpectedly"):
+            tensorlane.init(
+                self.run_id,
+                double,
+                2,
+                rank=0,
+                start_daemon=False,
+                ipc_dir=self.temp.name,
+            )
+        self.start()
+        self.assertEqual(
+            json.loads((root / "init.json").read_text()),
+            {
+                "run_id": self.run_id,
+                "train_config": self.service.train_config,
+            },
+        )
+
+    def test_failed_startup_never_publishes_readiness(self):
+        from tensorlane.client import _root
+
+        with patch.object(
+            multiprocessing.process.BaseProcess,
+            "start",
+            side_effect=OSError("spawn failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "spawn failed"):
+                self.start()
+        root = _root(self.run_id, self.temp.name)
+        self.assertFalse((root / "init.json").exists())
+        with patch.object(
+            Path, "read_text", side_effect=AssertionError("waiting read a file")
+        ):
+            with self.assertRaises(TimeoutError):
+                tensorlane.init(
+                    self.run_id,
+                    double,
+                    2,
+                    rank=0,
+                    start_daemon=False,
+                    ipc_dir=self.temp.name,
+                    timeout=0.05,
+                )
+
+    def test_metadata_is_published_only_after_workers_are_ready(self):
+        original = multiprocessing.process.BaseProcess.start
+        observations = []
+
+        def start(process):
+            from tensorlane.client import _root
+
+            observations.append(
+                (_root(self.run_id, self.temp.name) / "init.json").exists()
+            )
+            original(process)
+
+        with patch.object(multiprocessing.process.BaseProcess, "start", start):
+            self.start()
+        self.assertEqual(observations, [False, False])
+        self.assertTrue((self.daemon._root / "init.json").exists())
+        self.assertFalse((self.daemon._root / "init.tmp").exists())
+        self.assertEqual(
+            {path.name for path in self.daemon._root.iterdir()},
+            {
+                "init.json",
+                "auth",
+                "ranks",
+                "lock",
+                "semaphore",
+                "validation-semaphore",
+                "work.sock",
+            },
+        )
+        self.daemon.close()
+        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
 
     def test_cpu_example_uses_custom_ipc_dir_for_every_rank(self):
         self.service.validation_count = self.service.count
@@ -246,8 +471,15 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(self.service.init_requests), 1)
+        for rank in range(2):
+            self.assertIn(
+                f"rank={rank} run_id={self.run_id} train_config='opaque config'",
+                result.stdout,
+            )
         lines = [
-            line for line in result.stdout.splitlines() if line.startswith("rank=")
+            line
+            for line in result.stdout.splitlines()
+            if line.startswith("rank=") and "split=" in line
         ]
         self.assertEqual(len(lines), self.service.count * 2)
         for split in ("training", "validation"):
@@ -266,7 +498,7 @@ class PipelineTests(unittest.TestCase):
         wait_for(lambda: len(self.service.requests) == 2)
         time.sleep(0.2)
         self.assertEqual(len(self.service.requests), 2)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.assertEqual(next(reader).samples[0].speaker_id, 0)
             wait_for(lambda: len(self.service.requests) == 3)
             time.sleep(0.2)
@@ -277,9 +509,7 @@ class PipelineTests(unittest.TestCase):
         self.service.validation_count = 4
         self.start(ranks=1, factor=1, workers=3)
         wait_for(lambda: len(self.service.requests) == 1)
-        with tensorlane.batches(
-            self.run_id, 0, validation=True, ipc_dir=self.temp.name
-        ) as reader:
+        with self.daemon.batches(validation=True) as reader:
             batches = list(reader)
         self.assertEqual(
             [batch.samples[0].speaker_id for batch in batches], list(range(1000, 1004))
@@ -289,7 +519,7 @@ class PipelineTests(unittest.TestCase):
             [[value * 2, -value * 2] for value in range(1000, 1004)],
         )
         self.assertEqual(len(self.service.requests), 1)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.assertEqual(
                 [batch.samples[0].speaker_id for batch in reader], list(range(5))
             )
@@ -298,12 +528,12 @@ class PipelineTests(unittest.TestCase):
         self.service.validation_count = 4
         self.start(ranks=1, factor=1, workers=3)
         wait_for(lambda: len(self.service.validation_requests) == 1)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.assertEqual(
                 [batch.samples[0].speaker_id for batch in reader], list(range(5))
             )
         self.assertEqual(len(self.service.validation_requests), 1)
-        with tensorlane.batches(self.run_id, 0, True, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches(validation=True) as reader:
             self.assertEqual(
                 [batch.samples[0].speaker_id for batch in reader],
                 list(range(1000, 1004)),
@@ -313,10 +543,8 @@ class PipelineTests(unittest.TestCase):
         self.service.validation_count = 3
         self.start(ranks=1, factor=2, workers=3)
         with (
-            tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as training,
-            tensorlane.batches(
-                self.run_id, 0, validation=True, ipc_dir=self.temp.name
-            ) as validation,
+            self.daemon.batches() as training,
+            self.daemon.batches(validation=True) as validation,
         ):
             for index in range(3):
                 self.assertEqual(next(training).samples[0].speaker_id, index)
@@ -361,16 +589,14 @@ class PipelineTests(unittest.TestCase):
         self.service.fail_validation = True
         with self.assertRaisesRegex(RuntimeError, "fixture gRPC failure"):
             self.start(ranks=1)
-            with tensorlane.batches(
-                self.run_id, 0, validation=True, ipc_dir=self.temp.name
-            ) as reader:
+            with self.daemon.batches(validation=True) as reader:
                 next(reader)
 
     def test_global_budget_allows_one_rank_to_release_any_slot(self):
         self.service.count = 20
         self.start(factor=1, workers=3)
         wait_for(lambda: len(self.service.requests) == 2)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.assertEqual(next(reader).samples[0].speaker_id, 0)
             wait_for(lambda: len(self.service.requests) == 3)
             self.assertEqual(next(reader).samples[0].speaker_id, 2)
@@ -395,13 +621,20 @@ class PipelineTests(unittest.TestCase):
     def test_duplicate_init_and_rank_are_rejected(self):
         self.start()
         with self.assertRaisesRegex(Exception, "already active"):
-            tensorlane.init(self.run_id, double, 2, ipc_dir=self.temp.name)
-        reader = tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name)
+            tensorlane.init(
+                self.run_id,
+                double,
+                2,
+                rank=0,
+                start_daemon=True,
+                ipc_dir=self.temp.name,
+            )
+        reader = self.daemon.batches()
         try:
             with self.assertRaisesRegex(RuntimeError, "already connected"):
-                tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name)
-            with self.assertRaisesRegex(RuntimeError, "invalid"):
-                tensorlane.batches(self.run_id, 2, ipc_dir=self.temp.name)
+                self.daemon.batches()
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                self.attach(2)
         finally:
             self.daemon.close()
             reader.close()
@@ -409,20 +642,69 @@ class PipelineTests(unittest.TestCase):
     def test_transform_failure_reaches_rank(self):
         with self.assertRaisesRegex(RuntimeError, "tensorlane-transform-0 exited"):
             self.start(transform=fail)
-            with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            with self.daemon.batches() as reader:
                 next(reader)
 
     def test_invalid_transform_output_reaches_rank(self):
         with self.assertRaisesRegex(RuntimeError, "tensorlane-transform-0 exited"):
             self.start(transform=invalid)
-            with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            with self.daemon.batches() as reader:
                 next(reader)
 
     def test_startup_timeout_and_callable_validation(self):
         with self.assertRaises(TimeoutError):
-            tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name, timeout=0.1)
+            tensorlane.init(
+                self.run_id,
+                double,
+                2,
+                rank=0,
+                start_daemon=False,
+                ipc_dir=self.temp.name,
+                timeout=0.1,
+            )
         with self.assertRaises(AttributeError):
             self.start(transform=lambda wave: wave)
+
+    def test_init_rejects_invalid_rank_before_starting_or_waiting(self):
+        for owner in (False, True):
+            for rank in (-1, True, 1.5):
+                with self.subTest(owner=owner, rank=rank):
+                    with self.assertRaisesRegex(ValueError, "rank"):
+                        tensorlane.init(
+                            self.run_id,
+                            double,
+                            2,
+                            rank=rank,
+                            start_daemon=owner,
+                            ipc_dir=self.temp.name,
+                        )
+        with self.assertRaisesRegex(ValueError, "invalid rank"):
+            tensorlane.init(
+                self.run_id,
+                double,
+                2,
+                rank=2,
+                start_daemon=True,
+                ipc_dir=self.temp.name,
+            )
+        self.assertEqual(self.service.init_requests, [])
+
+    def test_handle_uses_its_initialized_rank_for_both_readers(self):
+        self.service.validation_count = 5
+        self.start(factor=3)
+        with self.attach(1) as lane:
+            self.assertEqual(lane.rank, 1)
+            self.assertEqual(self.daemon.rank, 0)
+            with (
+                lane.batches() as training,
+                lane.batches(validation=True) as validation,
+            ):
+                self.assertEqual(
+                    [batch.samples[0].speaker_id for batch in training], [1, 3]
+                )
+                self.assertEqual(
+                    [batch.samples[0].speaker_id for batch in validation], [1001, 1003]
+                )
 
     def test_close_interrupts_busy_transform_and_is_idempotent(self):
         self.start(transform=slow)
@@ -442,29 +724,27 @@ class PipelineTests(unittest.TestCase):
         self.service.count = 0
         self.start()
         for rank in range(2):
-            with tensorlane.batches(
-                self.run_id, rank, ipc_dir=self.temp.name
-            ) as reader:
+            with self.attach(rank).batches() as reader:
                 self.assertEqual(list(reader), [])
 
     def test_empty_batch_fails_without_leaking_prefetch_slots(self):
         self.service.empty = True
         with self.assertRaisesRegex(RuntimeError, "empty batches are unsupported"):
             self.start(ranks=1, factor=2)
-            with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            with self.daemon.batches() as reader:
                 list(reader)
 
     def test_grpc_error_reaches_rank_without_retry(self):
         self.service.fail_data = True
         with self.assertRaisesRegex(RuntimeError, "fixture gRPC failure"):
             self.start()
-            with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            with self.daemon.batches() as reader:
                 next(reader)
         self.assertEqual(len(self.service.requests), 1)
 
     def test_collater_crash_wakes_reader(self):
         self.start(transform=slow)
-        reader = tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name)
+        reader = self.daemon.batches()
         try:
             collater = next(
                 process
@@ -480,11 +760,12 @@ class PipelineTests(unittest.TestCase):
     def test_rank_disconnect_fails_pipeline(self):
         self.service.count = 100
         self.start()
-        reader = tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name)
-        reader.close()
-        with self.assertRaises(RuntimeError):
-            with tensorlane.batches(self.run_id, 1, ipc_dir=self.temp.name) as other:
-                list(other)
+        reader = self.daemon.batches()
+        with self.attach(1) as lane:
+            reader.close()
+            with self.assertRaises(RuntimeError):
+                with lane.batches() as other:
+                    list(other)
 
     def test_collator_crash_stops_daemon_before_ranks_attach(self):
         self.service.count = 20
@@ -497,19 +778,19 @@ class PipelineTests(unittest.TestCase):
         )
         collator.kill()
         wait_for(self.daemon._stopped.is_set)
+        wait_for(lambda: not (self.daemon._root / "init.json").exists())
         with self.assertRaisesRegex(RuntimeError, "tensorlane-collate exited"):
-            tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name)
+            self.daemon.batches()
         self.assertEqual(len(self.service.requests), 1)
 
     def test_worker_connection_is_ready_without_control_messages(self):
-        from tensorlane.client import Daemon, _root
+        from tensorlane.client import TensorLane, _root
 
         root = _root(self.run_id, self.temp.name)
-        self.daemon = Daemon(
-            tensorlane._native.Daemon(
-                self.run_id, f"localhost:{self.service.port}", root, 1, 1, 1
-            )
+        native = tensorlane._native.Daemon(
+            self.run_id, f"localhost:{self.service.port}", root, 1, 1, 1
         )
+        self.daemon = TensorLane(root, native.run_id, native.train_config, 0, native)
         receiver = tensorlane._native.Listener(root / "work.sock")
         try:
             self.assertFalse(hasattr(receiver, "ready"))
@@ -537,7 +818,7 @@ class PipelineTests(unittest.TestCase):
             transform = importlib.import_module("custom_transform").transform
             self.service.count = 1
             self.start(ranks=1, transform=transform)
-            with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+            with self.daemon.batches() as reader:
                 batch = next(reader)
                 self.assertEqual(batch.samples[0].wave.tolist(), [0, 0])
                 self.assertEqual(list(reader), [])
@@ -553,9 +834,9 @@ class PipelineTests(unittest.TestCase):
             "def transform(wave):\n"
             "    return wave.float() + 7\n"
             "if __name__ == '__main__':\n"
-            f"    with tensorlane.init({self.run_id!r}, transform, 1, "
-            f"addr='localhost:{self.service.port}', ipc_dir={self.temp.name!r}):\n"
-            f"        with tensorlane.batches({self.run_id!r}, 0, ipc_dir={self.temp.name!r}) as reader:\n"
+            f"    with tensorlane.init({self.run_id!r}, transform, 1, rank=0, start_daemon=True, "
+            f"addr='localhost:{self.service.port}', ipc_dir={self.temp.name!r}) as lane:\n"
+            "        with lane.batches() as reader:\n"
             "            batches = list(reader)\n"
             "            assert len(batches) == 1\n"
             "            assert batches[0].samples[0].wave.tolist() == [7, 7]\n"
@@ -565,7 +846,7 @@ class PipelineTests(unittest.TestCase):
     def test_multiple_workers_preserve_order(self):
         self.service.count = 6
         self.start(ranks=1, factor=4, transform=identify_worker, workers=3)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             batches = list(reader)
         self.assertEqual(
             [[int(sample.wave[0]) for sample in batch] for batch in batches],
@@ -588,7 +869,7 @@ class PipelineTests(unittest.TestCase):
             {path.name for path in Path(self.temp.name).rglob("*.sock")},
             {"work.sock"},
         )
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             batches = list(reader)
         self.assertEqual(
             len({int(sample.wave[1]) for batch in batches for sample in batch}), 5
@@ -604,7 +885,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_transformation_worker_crash_wakes_reader(self):
         self.start(transform=slow, workers=3)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.daemon._processes[1].kill()
             with self.assertRaisesRegex(RuntimeError, "disconnected|exited"):
                 next(reader)
@@ -612,13 +893,13 @@ class PipelineTests(unittest.TestCase):
     def test_empty_stream_with_multiple_workers(self):
         self.service.count = 0
         self.start(ranks=1, workers=3)
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.assertEqual(list(reader), [])
 
     def test_partial_transform(self):
         self.service.count = 1
         self.start(ranks=1, transform=partial(double))
-        with tensorlane.batches(self.run_id, 0, ipc_dir=self.temp.name) as reader:
+        with self.daemon.batches() as reader:
             self.assertEqual(len(list(reader)), 1)
 
     def test_second_process_start_failure_cleans_up(self):

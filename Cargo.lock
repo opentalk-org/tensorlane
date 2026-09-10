@@ -3163,7 +3163,6 @@ dependencies = [
  "pyo3-build-config 0.29.2",
  "sem_safe",
  "serde",
- "serde_json",
  "tokio",
  "tokio-stream",
  "tokio-util",
