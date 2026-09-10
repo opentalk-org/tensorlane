@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::grpc_support::{self, ActiveRuns, AssetStore};
-use crate::loader::{Loader, S3Loader, SyntheticLoader};
+use crate::loader::{Loader, S3Loader};
 use crate::metrics;
 use crate::proto::{
     AssetRequest, AssetResponse, CheckpointRequest, CheckpointResponse, DataRequest, DataResponse,
@@ -30,7 +30,6 @@ struct TensorLane {
     assets: AssetStore,
     cache_dir: &'static Path,
     uploads: UploadStore,
-    synthetic: bool,
     active_runs: ActiveRuns,
 }
 
@@ -43,20 +42,14 @@ impl TensorLane {
         cache_dir: &'static Path,
         assets_cache_dir: &'static Path,
         uploads: UploadStore,
-        synthetic: bool,
     ) -> Self {
-        let loader: Arc<dyn Loader> = if synthetic {
-            Arc::new(SyntheticLoader)
-        } else {
-            Arc::new(S3Loader::new(s3_client.clone(), bucket))
-        };
+        let loader = Arc::new(S3Loader::new(s3_client.clone(), bucket));
         Self {
             active_runs: Default::default(),
             loader,
-            assets: AssetStore::new(s3_client, bucket, assets_cache_dir, synthetic),
+            assets: AssetStore::new(s3_client, bucket, assets_cache_dir),
             cache_dir,
             uploads,
-            synthetic,
             database,
             run_manager,
         }
@@ -75,7 +68,6 @@ impl TensorLaneService for TensorLane {
             &self.database,
             self.loader.clone(),
             self.cache_dir,
-            self.synthetic,
         )
         .await?;
         self.active_runs
@@ -279,12 +271,8 @@ pub async fn serve(
     uploads_dir: &'static Path,
     checkpoint_prefix: &'static str,
     metrics_prefix: &'static str,
-    synthetic: bool,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    if synthetic {
-        info!("serving synthetic runs");
-    }
     info!("listening on 0.0.0.0:{port}");
 
     let uploads = UploadStore::new(
@@ -304,7 +292,6 @@ pub async fn serve(
             cache_dir,
             assets_cache_dir,
             uploads.clone(),
-            synthetic,
         )))
         .serve_with_shutdown(
             SocketAddr::from((Ipv4Addr::new(0, 0, 0, 0), port)),

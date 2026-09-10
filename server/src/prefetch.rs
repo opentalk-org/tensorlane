@@ -10,7 +10,7 @@ use tracing::{Instrument, debug, error, warn};
 
 use crate::{
     loader::Loader,
-    sampling::{self, Sample, Sampler},
+    sampling::{Sample, Sampler},
 };
 
 struct PrefetchedSample {
@@ -29,18 +29,6 @@ pub struct LoadedSample {
 }
 
 pub type LoadedBatch = Vec<LoadedSample>;
-
-impl From<(sampling::Sample, Bytes)> for LoadedSample {
-    fn from(value: (sampling::Sample, Bytes)) -> Self {
-        Self {
-            wave: value.1,
-            duration: value.0.duration,
-            speaker_id: value.0.speaker_id as i64,
-            language_id: value.0.language_id,
-            text: value.0.text,
-        }
-    }
-}
 
 impl From<LoadedSample> for crate::proto::Sample {
     fn from(sample: LoadedSample) -> Self {

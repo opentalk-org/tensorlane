@@ -102,12 +102,6 @@ struct Args {
     cache_dir: PathBuf,
     #[arg(
         long,
-        env = "SYNTHETIC",
-        help = "Serve synthetic runs: fabricated samples instead of database rows and bucket audio."
-    )]
-    synthetic: bool,
-    #[arg(
-        long,
         env = "CHECKPOINT_PREFIX",
         help = "S3 object-key prefix for uploaded checkpoints."
     )]
@@ -197,7 +191,6 @@ async fn main() -> anyhow::Result<()> {
         uploads_cache_dir,
         args.checkpoint_prefix.leak(),
         args.metrics_prefix.leak(),
-        args.synthetic,
         shutdown.clone(),
     ));
     tokio::select! {

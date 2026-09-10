@@ -1,7 +1,6 @@
-use std::{path::Path, pin::Pin, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use anyhow::bail;
-use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -9,16 +8,11 @@ use tracing::{Instrument, debug, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    db::{
-        TRAINING_SEED_SALT, VALIDATION_SEED_SALT, fetch_training_samples, fetch_validation_samples,
-        synthetic_rows,
-    },
+    db::{fetch_training_samples, fetch_validation_samples},
     loader::Loader,
-    prefetch::{LoadedBatch, LoadedSample, Prefetcher},
+    prefetch::{LoadedBatch, Prefetcher},
     sampling::{HistogramSampler, Sampler, ScheduledSampler, bins_from_rows},
 };
-
-const SYNTHETIC_TRAINING_SAMPLES: usize = 256;
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct DataConfig {
@@ -62,41 +56,11 @@ impl DataConfig {
     }
 }
 
-enum Batches {
-    Prefetched(Prefetcher),
-    OnDemand(Pin<Box<dyn Stream<Item = anyhow::Result<LoadedBatch>> + Send>>),
-}
-
-fn on_demand_batches(mut sampler: Box<dyn Sampler>, loader: Arc<dyn Loader>) -> Batches {
-    Batches::OnDemand(Box::pin(async_stream::stream! {
-        loop {
-            match sampler.next_batch() {
-                Ok(Some(batch)) => {
-                    let batch = loader
-                        .load_batch(batch)
-                        .await
-                        .map(|batch| batch.into_iter().map(LoadedSample::from).collect());
-                    let failed = batch.is_err();
-                    yield batch;
-                    if failed {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    yield Err(err);
-                    break;
-                }
-            }
-        }
-    }))
-}
-
 pub struct RunState {
     pub id: Uuid,
     cancel_token: CancellationToken,
-    validation_batches: Batches,
-    training_batches: Batches,
+    validation_batches: Prefetcher,
+    training_batches: Prefetcher,
 }
 
 impl RunState {
@@ -106,50 +70,20 @@ impl RunState {
         loader: Arc<dyn Loader>,
         cache_dir: &'static Path,
         config: &DataConfig,
-        synthetic: bool,
     ) -> anyhow::Result<Self> {
-        info!(run = %id, dataset = %config.dataset_id, synthetic, "initializing run");
+        info!(run = %id, dataset = %config.dataset_id, "initializing run");
 
-        let (validation_rows, training_rows) = if synthetic {
-            let language = config
-                .plbert_languages
-                .first()
-                .map(String::as_str)
-                .unwrap_or("en");
-            let validation_rows = synthetic_rows(
-                config.validation.max_seconds as f64,
-                config.seed,
-                language,
-                config.validation.samples as usize,
-                VALIDATION_SEED_SALT,
-            );
-            let training_rows = synthetic_rows(
-                config.training_max_seconds() as f64,
-                config.seed,
-                language,
-                SYNTHETIC_TRAINING_SAMPLES,
-                TRAINING_SEED_SALT,
-            );
-            info!(
-                validation = validation_rows.len(),
-                training = training_rows.len(),
-                "generated synthetic rows"
-            );
-            (validation_rows, training_rows)
-        } else {
-            let validation_rows = fetch_validation_samples(database, config).await?;
-            info!(
-                rows = validation_rows.len(),
-                requested = config.validation.samples,
-                "fetched validation rows"
-            );
+        let validation_rows = fetch_validation_samples(database, config).await?;
+        info!(
+            rows = validation_rows.len(),
+            requested = config.validation.samples,
+            "fetched validation rows"
+        );
 
-            let validation_ids: Vec<Uuid> = validation_rows.iter().map(|r| r.audio_id).collect();
+        let validation_ids: Vec<Uuid> = validation_rows.iter().map(|r| r.audio_id).collect();
 
-            let training_rows = fetch_training_samples(database, &validation_ids, config).await?;
-            info!(rows = training_rows.len(), "fetched training rows");
-            (validation_rows, training_rows)
-        };
+        let training_rows = fetch_training_samples(database, &validation_ids, config).await?;
+        info!(rows = training_rows.len(), "fetched training rows");
 
         let validation_bins = bins_from_rows(validation_rows, &config.plbert_languages)?;
         let training_bins = bins_from_rows(training_rows, &config.plbert_languages)?;
@@ -168,29 +102,20 @@ impl RunState {
         ));
 
         let cancel_token = CancellationToken::new();
-        let (training_batches, validation_batches) = if synthetic {
-            (
-                on_demand_batches(training_sampler, loader.clone()),
-                on_demand_batches(validation_sampler, loader),
-            )
-        } else {
-            (
-                Batches::Prefetched(Prefetcher::spawn(
-                    training_sampler,
-                    loader.clone(),
-                    cache_dir,
-                    cancel_token.clone(),
-                    info_span!("prefetcher", run = %id, split = "training"),
-                )),
-                Batches::Prefetched(Prefetcher::spawn(
-                    validation_sampler,
-                    loader,
-                    cache_dir,
-                    cancel_token.clone(),
-                    info_span!("prefetcher", run = %id, split = "validation"),
-                )),
-            )
-        };
+        let training_batches = Prefetcher::spawn(
+            training_sampler,
+            loader.clone(),
+            cache_dir,
+            cancel_token.clone(),
+            info_span!("prefetcher", run = %id, split = "training"),
+        );
+        let validation_batches = Prefetcher::spawn(
+            validation_sampler,
+            loader,
+            cache_dir,
+            cancel_token.clone(),
+            info_span!("prefetcher", run = %id, split = "validation"),
+        );
 
         Ok(RunState {
             id,
@@ -206,23 +131,15 @@ impl RunState {
         } else {
             &mut self.training_batches
         };
-        match batches {
-            Batches::Prefetched(prefetcher) => prefetcher.next_batch().await,
-            Batches::OnDemand(stream) => match stream.next().await {
-                Some(batch) => batch.map(Some),
-                None => Ok(None),
-            },
-        }
+        batches.next_batch().await
     }
 
     pub async fn finish(self) {
         self.cancel_token.cancel();
-        let prefetchers = match (self.validation_batches, self.training_batches) {
-            (Batches::Prefetched(p1), Batches::Prefetched(p2)) => vec![p1, p2],
-            (Batches::Prefetched(p), _) | (_, Batches::Prefetched(p)) => vec![p],
-            _ => return,
-        };
-        futures::future::join_all(prefetchers.into_iter().map(Prefetcher::drain)).await;
+        tokio::join!(
+            self.validation_batches.drain(),
+            self.training_batches.drain(),
+        );
     }
 }
 

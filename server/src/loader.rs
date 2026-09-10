@@ -67,19 +67,3 @@ impl Loader for S3Loader {
         Ok(wave)
     }
 }
-
-pub struct SyntheticLoader;
-
-#[async_trait]
-impl Loader for SyntheticLoader {
-    async fn load(&self, sample: &sampling::Sample) -> anyhow::Result<Bytes> {
-        let sample_count = (sample.duration * 24_000.0) as usize;
-        let mut wave = BytesMut::with_capacity(2 * sample_count);
-        for t in 0..sample_count {
-            let phase = 2.0 * std::f64::consts::PI * 220.0 * t as f64 / 24_000.0;
-            wave.put_i16_le((0.25 * phase.sin() * 32_767.0) as i16);
-        }
-
-        Ok(wave.freeze())
-    }
-}

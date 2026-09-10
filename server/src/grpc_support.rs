@@ -47,21 +47,14 @@ pub struct AssetStore {
     s3_client: aws_sdk_s3::Client,
     bucket: &'static str,
     root: &'static Path,
-    synthetic: bool,
 }
 
 impl AssetStore {
-    pub fn new(
-        s3_client: aws_sdk_s3::Client,
-        bucket: &'static str,
-        root: &'static Path,
-        synthetic: bool,
-    ) -> Self {
+    pub fn new(s3_client: aws_sdk_s3::Client, bucket: &'static str, root: &'static Path) -> Self {
         Self {
             s3_client,
             bucket,
             root,
-            synthetic,
         }
     }
 
@@ -75,23 +68,19 @@ impl AssetStore {
 
         let part = run_dir.join(format!("{name}.part"));
         info!(run = %run_id, asset = name, key, "downloading asset");
-        if self.synthetic {
-            fs::write(&part, format!("synthetic asset {name}\n").repeat(1024)).await?;
-        } else {
-            let mut object = self
-                .s3_client
-                .get_object()
-                .bucket(self.bucket)
-                .key(key)
-                .send()
-                .await
-                .with_context(|| format!("fetching asset {name} from {key}"))?;
-            let mut file = fs::File::create(&part).await?;
-            while let Some(bytes) = object.body.try_next().await? {
-                file.write_all(&bytes).await?;
-            }
-            file.sync_all().await?;
+        let mut object = self
+            .s3_client
+            .get_object()
+            .bucket(self.bucket)
+            .key(key)
+            .send()
+            .await
+            .with_context(|| format!("fetching asset {name} from {key}"))?;
+        let mut file = fs::File::create(&part).await?;
+        while let Some(bytes) = object.body.try_next().await? {
+            file.write_all(&bytes).await?;
         }
+        file.sync_all().await?;
         fs::rename(&part, &path).await?;
         Ok(path)
     }
@@ -104,7 +93,6 @@ pub async fn initialize(
     database: &Client,
     loader: Arc<dyn Loader>,
     cache_dir: &'static Path,
-    synthetic: bool,
 ) -> Result<InitializedRun, Status> {
     let run = run_manager
         .get(run_id)
@@ -132,7 +120,7 @@ pub async fn initialize(
                 .map(|(name, asset)| assets.ensure(run_id, name, &asset.object)),
         )
         .await?;
-        let run = RunState::new(run_id, database, loader, cache_dir, &config, synthetic).await?;
+        let run = RunState::new(run_id, database, loader, cache_dir, &config).await?;
         Ok(RunHandle::spawn(run))
     }
     .await;
