@@ -133,16 +133,6 @@ def init(
         raise ValueError("num_workers must be a positive integer")
 
     root = _root(run_id, ipc_dir)
-    if (
-        max(
-            len(os.fsencode(root / "work.sock")),
-            len(os.fsencode(root / f"rank-{ranks - 1}.sock")),
-        )
-        >= 104
-    ):
-        raise ValueError(
-            "IPC path is too long for Unix sockets; choose a shorter ipc_dir"
-        )
 
     daemon = Daemon(
         _native.Daemon(
@@ -163,15 +153,13 @@ def init(
         daemon._stopped = context.Event()
         collator_ready = context.Event()
         for worker_index in range(num_workers):
-            with socket.socket(socket.AF_UNIX) as connection:
-                connection.connect(str(root / "work.sock"))
-                process = context.Process(
-                    name=f"tensorlane-transform-{worker_index}",
-                    target=transform_worker,
-                    args=(root, transform, connection, daemon._queue, daemon._stopped),
-                )
-                process.start()
-                daemon._processes.append(process)
+            process = context.Process(
+                name=f"tensorlane-transform-{worker_index}",
+                target=transform_worker,
+                args=(root, transform, daemon._queue, daemon._stopped),
+            )
+            process.start()
+            daemon._processes.append(process)
         process = context.Process(
             name="tensorlane-collate",
             target=collate_worker,

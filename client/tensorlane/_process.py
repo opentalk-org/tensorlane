@@ -3,7 +3,6 @@ from __future__ import annotations
 from multiprocessing.connection import Client
 from pathlib import Path
 import queue
-import socket
 import sys
 import threading
 import traceback
@@ -26,12 +25,11 @@ def _connect(path: Path, key: bytes, stopped):
 def transform_worker(
     root: Path,
     transform,
-    connection: socket.socket,
     output,
     stopped,
 ) -> None:
     multiprocessing.current_process().authkey = (root / "auth").read_bytes()
-    receiver = _native.Listener(connection)
+    receiver = _native.Listener(root / "work.sock")
     try:
         import torch
 
@@ -41,7 +39,6 @@ def transform_worker(
 
         def feeder_error(error, _message):
             errors.put(error)
-            receiver.close()
 
         output._on_queue_feeder_error = feeder_error
         with torch.no_grad():
@@ -109,9 +106,6 @@ def transform_worker(
     except Exception:
         if not stopped.is_set():
             raise
-    finally:
-        receiver.close()
-        connection.close()
 
 
 def collate_worker(

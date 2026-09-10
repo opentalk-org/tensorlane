@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import importlib
 import multiprocessing
-import socket
+import os
 from pathlib import Path
 import struct
 import subprocess
@@ -184,6 +184,24 @@ class PipelineTests(unittest.TestCase):
                 rank.join(5)
             output.close()
 
+    def test_cpu_example_uses_custom_ipc_dir_for_every_rank(self):
+        example = Path(__file__).resolve().parents[1] / "examples" / "cpu.py"
+        result = subprocess.run(
+            [sys.executable, str(example), self.run_id, "--ipc-dir", "custom-ipc"],
+            cwd=self.temp.name,
+            env={**os.environ, "TENSORLANE_ADDR": f"localhost:{self.service.port}"},
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("rank=")]
+        self.assertEqual(len(lines), self.service.count)
+        self.assertEqual(sum(line.startswith("rank=0 ") for line in lines), 3)
+        self.assertEqual(sum(line.startswith("rank=1 ") for line in lines), 2)
+        self.assertTrue((Path(self.temp.name) / "custom-ipc").is_dir())
+        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
+
     def test_prefetch_credits_cover_unconsumed_batches(self):
         self.start(factor=1)
         wait_for(lambda: len(self.service.requests) == 2)
@@ -338,18 +356,20 @@ class PipelineTests(unittest.TestCase):
                 self.run_id, f"localhost:{self.service.port}", root, 1, 1, 1
             )
         )
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.connect(str(root / "work.sock"))
-            receiver = tensorlane._native.Listener(connection)
-            try:
-                self.assertFalse(hasattr(receiver, "ready"))
-                self.assertFalse(hasattr(receiver, "error"))
-                message = receiver.recv()
-                self.assertEqual(message["kind"], "sample")
-                self.assertEqual(message["batch"], (0, 1))
-                self.assertEqual(message["index"], 0)
-            finally:
-                receiver.close()
+        receiver = tensorlane._native.Listener(root / "work.sock")
+        try:
+            self.assertFalse(hasattr(receiver, "ready"))
+            self.assertFalse(hasattr(receiver, "error"))
+            message = receiver.recv()
+            self.assertEqual(message["kind"], "sample")
+            self.assertEqual(message["batch"], (0, 1))
+            self.assertEqual(message["index"], 0)
+        finally:
+            receiver.close()
+
+    def test_native_listener_reports_connection_failure(self):
+        with self.assertRaisesRegex(RuntimeError, "connecting to worker socket"):
+            tensorlane._native.Listener(Path(self.temp.name) / "missing.sock")
 
     def test_transform_from_callers_search_path(self):
         module_path = Path(self.temp.name) / "custom_transform.py"
