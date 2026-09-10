@@ -9,7 +9,7 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict},
 };
-use std::{os::unix::net::UnixStream, path::PathBuf, sync::Mutex};
+use std::{path::PathBuf, sync::Mutex};
 
 #[pyclass]
 pub struct Daemon {
@@ -76,53 +76,41 @@ impl Daemon {
 #[pyclass]
 pub struct Listener {
     receiver: Mutex<tokio::sync::mpsc::UnboundedReceiver<anyhow::Result<Work>>>,
-    socket: UnixStream,
     runtime: tokio::runtime::Runtime,
 }
 #[pymethods]
 impl Listener {
     #[new]
-    fn new(py: Python<'_>, socket: &Bound<'_, PyAny>) -> anyhow::Result<Self> {
-        let duplicate = socket.call_method0("dup")?;
-        let descriptor = duplicate
-            .call_method0("detach")?
-            .extract::<std::os::fd::RawFd>()?;
-        use std::os::fd::FromRawFd;
-        let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+    fn new(py: Python<'_>, path: PathBuf) -> anyhow::Result<Self> {
         py.allow_threads(|| {
-            stream.set_nonblocking(true)?;
-            let socket = stream.try_clone()?;
             let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
                 .enable_all()
                 .build()?;
-            let stream = {
-                let _entered = runtime.enter();
-                tokio::net::UnixStream::from_std(stream)?
-            };
-            let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
-            runtime.spawn(async move {
+            let receiver = runtime.block_on(async move {
+                let stream = tokio::net::UnixStream::connect(path).await?;
                 let mut reader = Receiver::<Work, _>::new(stream);
-                loop {
-                    match reader.recv().await {
-                        Ok(Some(message)) => {
-                            if messages.send(Ok(message)).is_err() {
+
+                let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
+                tokio::spawn(async move {
+                    loop {
+                        match reader.recv().await {
+                            Ok(Some(message)) => {
+                                if messages.send(Ok(message)).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                let _ = messages.send(Err(error));
                                 break;
                             }
                         }
-                        Ok(None) => break,
-                        Err(error) => {
-                            let _ = messages.send(Err(error));
-                            break;
-                        }
                     }
-                }
-            });
-            Ok(Self {
-                receiver: Mutex::new(receiver),
-                socket,
-                runtime,
-            })
+                });
+
+                anyhow::Ok(Mutex::new(receiver))
+            })?;
+            anyhow::Ok(Self { receiver, runtime })
         })
     }
     fn recv(&self, py: Python<'_>) -> anyhow::Result<Option<Py<PyAny>>> {
@@ -161,10 +149,6 @@ impl Listener {
             }
         }
         Ok(Some(object.into_any().unbind()))
-    }
-
-    fn close(&self) {
-        let _ = self.socket.shutdown(std::net::Shutdown::Both);
     }
 }
 
