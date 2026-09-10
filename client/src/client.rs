@@ -59,6 +59,22 @@ impl Daemon {
         }
         Ok(())
     }
+    fn check(&self) -> anyhow::Result<()> {
+        self.worker
+            .lock()
+            .map_err(|_| anyhow!("daemon lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow!("TensorLane daemon is closed"))?
+            .check()
+    }
+    fn ready(&self) -> anyhow::Result<bool> {
+        self.worker
+            .lock()
+            .map_err(|_| anyhow!("daemon lock poisoned"))?
+            .as_ref()
+            .ok_or_else(|| anyhow!("TensorLane daemon is closed"))?
+            .ready()
+    }
     fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
         py.allow_threads(|| {
             if let Some(mut worker) = self

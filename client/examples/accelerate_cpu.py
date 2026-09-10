@@ -13,42 +13,41 @@ def main():
     parser.add_argument("--ipc-dir", default=".client-cache")
     args = parser.parse_args()
     accelerator = Accelerator(cpu=True)
-    daemon = None
     try:
-        if accelerator.is_main_process:
-            daemon = tensorlane.init(
-                args.run_id,
-                transform_audio,
-                accelerator.num_processes,
-                ipc_dir=args.ipc_dir,
+        with tensorlane.init(
+            args.run_id,
+            transform_audio,
+            accelerator.num_processes,
+            rank=accelerator.process_index,
+            start_daemon=accelerator.is_main_process,
+            ipc_dir=args.ipc_dir,
+        ) as lane:
+            rank = lane.rank
+            print(
+                f"rank={rank} run_id={lane.run_id} train_config={lane.train_config!r}",
+                flush=True,
             )
-
-        rank = accelerator.process_index
-        with (
-            tensorlane.batches(args.run_id, rank, ipc_dir=args.ipc_dir) as training,
-            tensorlane.batches(
-                args.run_id, rank, validation=True, ipc_dir=args.ipc_dir
-            ) as validation,
-        ):
-            for index, batch in enumerate(training):
-                print(
-                    f"rank={rank} device={accelerator.device} split=training "
-                    f"batch={index} samples={len(batch)}",
-                    flush=True,
-                )
-                validation_batch = next(validation, None)
-                if validation_batch is not None:
+            with (
+                lane.batches() as training,
+                lane.batches(validation=True) as validation,
+            ):
+                for index, batch in enumerate(training):
                     print(
-                        f"rank={rank} device={accelerator.device} split=validation "
-                        f"batch={index} samples={len(validation_batch)}",
+                        f"rank={rank} device={accelerator.device} split=training "
+                        f"batch={index} samples={len(batch)}",
                         flush=True,
                     )
+                    validation_batch = next(validation, None)
+                    if validation_batch is not None:
+                        print(
+                            f"rank={rank} device={accelerator.device} split=validation "
+                            f"batch={index} samples={len(validation_batch)}",
+                            flush=True,
+                        )
 
-        if accelerator.num_processes > 1:
-            distributed.barrier()
+            if accelerator.num_processes > 1:
+                distributed.barrier()
     finally:
-        if daemon is not None:
-            daemon.close()
         accelerator.end_training()
 
 

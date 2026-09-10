@@ -11,7 +11,10 @@ use std::{
     io::Write,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -32,18 +35,11 @@ pub struct Options {
 pub struct Worker {
     stop: Option<oneshot::Sender<anyhow::Result<()>>>,
     thread: Option<JoinHandle<()>>,
+    connected: Arc<AtomicBool>,
+    outcome: Arc<Mutex<Option<Result<(), String>>>>,
     _resources: Resources,
 }
 
-pub fn status(root: &Path, state: &str, error: Option<&str>) -> anyhow::Result<()> {
-    let temporary = root.join("status.tmp");
-    std::fs::write(
-        &temporary,
-        serde_json::to_vec(&serde_json::json!({"state": state, "error": error}))?,
-    )?;
-    std::fs::rename(temporary, root.join("status.json"))?;
-    Ok(())
-}
 struct Resources {
     root: PathBuf,
     budgets: [Arc<BatchBudget>; 2],
@@ -81,7 +77,6 @@ impl Resources {
             std::fs::write(root.join(name), budget.semaphore.name()?)?;
         }
         std::fs::write(root.join("ranks"), ranks.to_string())?;
-        status(root, "starting", None)?;
         Ok(Self {
             root: root.to_owned(),
             budgets,
@@ -93,7 +88,7 @@ impl Drop for Resources {
     fn drop(&mut self) {
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten() {
-                if entry.file_name() != "lock" && entry.file_name() != "status.json" {
+                if entry.file_name() != "lock" {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -116,6 +111,10 @@ impl Worker {
         let root = options.root.clone();
         let (stop, stopped) = oneshot::channel();
         let (ready, initialized) = std::sync::mpsc::sync_channel(1);
+        let connected = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
+        let thread_connected = connected.clone();
+        let thread_outcome = outcome.clone();
         let thread = thread::Builder::new()
             .name("tensorlane-daemon".into())
             .spawn(move || {
@@ -124,19 +123,34 @@ impl Worker {
                         .worker_threads(2)
                         .enable_all()
                         .build()?;
-                    runtime.block_on(supervise(options, budgets, stopped, &ready))
+                    runtime.block_on(supervise(
+                        options,
+                        budgets,
+                        stopped,
+                        &ready,
+                        &thread_connected,
+                    ))
                 })();
+                let _ = std::fs::remove_file(root.join("init.json"));
+                if let Ok(mut outcome) = thread_outcome.lock() {
+                    *outcome = Some(
+                        result
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| format!("{error:#}")),
+                    );
+                }
                 if let Err(error) = result {
                     let message = format!("{error:#}");
-                    let _ = status(&root, "failed", Some(&message));
+                    eprintln!("TensorLane daemon failed: {message}");
                     let _ = ready.send(Err(anyhow!(message)));
-                } else {
-                    let _ = status(&root, "closed", None);
                 }
             })?;
         let mut worker = Self {
             stop: Some(stop),
             thread: Some(thread),
+            connected,
+            outcome,
             _resources: resources,
         };
         match initialized
@@ -151,12 +165,35 @@ impl Worker {
         }
     }
     pub fn stop(&mut self, error: Option<String>) {
+        let _ = std::fs::remove_file(self._resources.root.join("init.json"));
         for budget in &self._resources.budgets {
             budget.cancel();
         }
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(error.map_or(Ok(()), |message| Err(anyhow!(message))));
         }
+    }
+    pub fn check(&self) -> anyhow::Result<()> {
+        let outcome = self
+            .outcome
+            .lock()
+            .map_err(|_| anyhow!("daemon outcome lock poisoned"))?;
+        match outcome.as_ref() {
+            Some(Err(error)) => return Err(anyhow!(error.clone())),
+            Some(Ok(())) => return Err(anyhow!("TensorLane daemon is closed")),
+            None => {}
+        }
+        ensure!(
+            self.thread
+                .as_ref()
+                .is_some_and(|thread| !thread.is_finished()),
+            "TensorLane daemon stopped unexpectedly"
+        );
+        Ok(())
+    }
+    pub fn ready(&self) -> anyhow::Result<bool> {
+        self.check()?;
+        Ok(self.connected.load(Ordering::Acquire))
     }
     pub fn shutdown(&mut self) -> anyhow::Result<()> {
         self.stop(None);
@@ -178,6 +215,7 @@ async fn supervise(
     budgets: [Arc<BatchBudget>; 2],
     mut stop: oneshot::Receiver<anyhow::Result<()>>,
     ready: &std::sync::mpsc::SyncSender<anyhow::Result<InitResponse>>,
+    connected: &AtomicBool,
 ) -> anyhow::Result<()> {
     let work_listener = UnixListener::bind(options.root.join("work.sock"))?;
     let url = if options.addr.contains("://") {
@@ -247,7 +285,7 @@ async fn supervise(
     let mut idle_senders = None;
     let mut sender_complete = false;
     let result = async {
-        status(&options.root, "ready", None)?;
+        connected.store(true, Ordering::Release);
         loop {
             tokio::select! {
                 result = &mut stop => return result.unwrap_or(Ok(())),
@@ -262,10 +300,7 @@ async fn supervise(
         }
     }
     .await;
-    let saved_status = match &result {
-        Ok(()) => status(&options.root, "stopping", None),
-        Err(error) => status(&options.root, "failed", Some(&format!("{error:#}"))),
-    };
+    let _ = std::fs::remove_file(options.root.join("init.json"));
     for budget in &budgets {
         budget.cancel();
     }
@@ -276,5 +311,5 @@ async fn supervise(
         sender.abort();
         let _ = sender.await;
     }
-    result.and(saved_status)
+    result
 }
