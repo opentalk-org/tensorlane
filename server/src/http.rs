@@ -2,8 +2,12 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{
+        Path, State,
+        rejection::{JsonRejection, PathRejection},
+    },
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use serde::{Deserialize, Serialize};
@@ -33,6 +37,49 @@ struct CreateRunResponse {
 }
 
 #[derive(Serialize)]
+struct ErrorResponse {
+    message: String,
+}
+
+struct AppError {
+    status: StatusCode,
+    error: anyhow::Error,
+}
+
+impl AppError {
+    fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
+        Self {
+            status,
+            error: error.into(),
+        }
+    }
+}
+
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(error: E) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error)
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        if self.status.is_server_error() {
+            error!(error = format!("{:#}", self.error), "HTTP request failed");
+        }
+        (
+            self.status,
+            Json(ErrorResponse {
+                message: self.error.to_string(),
+            }),
+        )
+            .into_response()
+    }
+}
+
+#[derive(Serialize)]
 struct RunResponse {
     run_id: Uuid,
     project_id: Uuid,
@@ -52,6 +99,13 @@ pub async fn serve(
     let app = Router::new()
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run))
+        .fallback(async || AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Route not found")))
+        .method_not_allowed_fallback(async || {
+            AppError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                anyhow::anyhow!("Method not allowed"),
+            )
+        })
         .with_state(run_repo);
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -64,8 +118,9 @@ pub async fn serve(
 
 async fn create_run(
     State(run_repo): State<RunRepo>,
-    Json(request): Json<CreateRunRequest>,
-) -> Result<(StatusCode, Json<CreateRunResponse>), StatusCode> {
+    request: Result<Json<CreateRunRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CreateRunResponse>), AppError> {
+    let Json(request) = request.map_err(|err| AppError::new(err.status(), err))?;
     let run_id = run_repo
         .create(
             request.project_id,
@@ -73,11 +128,7 @@ async fn create_run(
             &request.data_config,
             &request.train_config,
         )
-        .await
-        .map_err(|err| {
-            error!(error = format!("{err:#}"), "creating run failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        .await?;
     info!(run = %run_id, "run created");
     Ok((
         StatusCode::CREATED,
@@ -90,28 +141,22 @@ async fn create_run(
 
 async fn get_run(
     State(run_repo): State<RunRepo>,
-    Path(run_id): Path<Uuid>,
-) -> Result<Json<RunResponse>, StatusCode> {
-    let run = run_repo.get(run_id).await.map_err(|err| {
-        error!(
-            run = %run_id,
-            error = format!("{err:#}"),
-            "getting run failed"
-        );
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    run_id: Result<Path<Uuid>, PathRejection>,
+) -> Result<Json<RunResponse>, AppError> {
+    let Path(run_id) = run_id.map_err(|err| AppError::new(err.status(), err))?;
+    let run = run_repo.get(run_id).await?;
 
     match run {
         Some(run) => Ok(Json(run.into())),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("Run not found"),
+        )),
     }
 }
 
-async fn list_runs(State(run_repo): State<RunRepo>) -> Result<Json<Vec<RunResponse>>, StatusCode> {
-    let runs = run_repo.list().await.map_err(|err| {
-        error!(error = format!("{err:#}"), "listing runs failed");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+async fn list_runs(State(run_repo): State<RunRepo>) -> Result<Json<Vec<RunResponse>>, AppError> {
+    let runs = run_repo.list().await?;
     Ok(Json(runs.into_iter().map(Into::into).collect()))
 }
 
