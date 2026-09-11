@@ -10,6 +10,7 @@ use anyhow::{Context, anyhow, bail, ensure};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
+    io::{Seek, SeekFrom},
     path::PathBuf,
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -348,11 +349,10 @@ impl Metrics {
         name: String,
         content_type: String,
     ) -> anyhow::Result<()> {
-        let mut file = File::open(&path)
+        let mut file = archive(path.clone())
             .await
             .with_context(|| format!("opening artifact {}", path.display()))?;
         let metadata = file.metadata().await?;
-        ensure!(metadata.is_file(), "artifact path must be a file");
         let size_bytes = metadata.len();
         self.send(metrics_request::Payload::Artifact(ArtifactMetric {
             step,
@@ -396,13 +396,9 @@ async fn checkpoint(
     step: u64,
     path: PathBuf,
 ) -> anyhow::Result<()> {
-    let mut file = File::open(&path)
+    let mut file = archive(path.clone())
         .await
         .with_context(|| format!("opening checkpoint {}", path.display()))?;
-    ensure!(
-        file.metadata().await?.is_file(),
-        "checkpoint path must be a file"
-    );
     let (sender, receiver) = mpsc::channel(4);
     let sending = async {
         sender
@@ -437,4 +433,28 @@ async fn checkpoint(
         .await
         .context("checkpoint upload timed out")??;
     Ok(())
+}
+
+async fn archive(path: PathBuf) -> anyhow::Result<File> {
+    let file = tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file() || metadata.is_dir(),
+            "upload path must be a file or directory"
+        );
+        let name = path.file_name().context("upload path must have a name")?;
+        let mut archive = tar::Builder::new(tempfile::tempfile()?);
+        archive.follow_symlinks(false);
+        if metadata.is_dir() {
+            archive.append_dir_all(name, &path)?;
+        } else {
+            archive.append_path_with_name(&path, name)?;
+        }
+        let mut file = archive.into_inner()?;
+        file.seek(SeekFrom::Start(0))?;
+        anyhow::Ok(file)
+    })
+    .await
+    .context("archive task failed")??;
+    Ok(File::from_std(file))
 }

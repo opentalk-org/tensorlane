@@ -312,7 +312,10 @@ class PipelineTests(unittest.TestCase):
         finally:
             self.service.upload_gate.set()
         self.assertEqual(self.service.uploads_at_end, [(1, 1, 1)])
-        self.assertEqual(self.service.checkpoints[0][1], path.read_bytes())
+        self.assertEqual(
+            self.archive_contents(self.service.checkpoints[0][1]),
+            {path.name: path.read_bytes()},
+        )
 
     def test_failed_asset_startup_still_ends_initialized_run(self):
         self.service.assets = {"asset": (None, b"data" * 128)}
@@ -356,16 +359,22 @@ class PipelineTests(unittest.TestCase):
         for run_id, metric in self.service.metrics:
             self.assertEqual(run_id, self.service.returned_run_id)
             self.assertTrue(before <= metric.timestamp_unix_ms <= after)
-        self.assertEqual([item[2] for item in self.service.artifacts], [data, b""])
+        self.assertEqual(
+            [self.archive_contents(item[2]) for item in self.service.artifacts],
+            [{"raw.dat": data}, {"empty": b""}],
+        )
+        for _, metadata, received in self.service.artifacts:
+            self.assertEqual(metadata.size_bytes, len(received))
         self.assertEqual(self.service.artifacts[0][1].content_type, "audio/wav")
         self.assertEqual(
             self.service.artifacts[1][1].content_type, "application/octet-stream"
         )
         metadata, received = self.service.checkpoints[0]
         self.assertEqual(
-            (metadata.run_id, metadata.step, received),
-            (self.service.returned_run_id, 3, data),
+            (metadata.run_id, metadata.step),
+            (self.service.returned_run_id, 3),
         )
+        self.assertEqual(self.archive_contents(received), {"raw.dat": data})
         self.daemon.metric(4, "next", 1)
         self.daemon.close()
         self.assertEqual(self.service.metrics[-1][1].name, "next")
@@ -394,7 +403,33 @@ class PipelineTests(unittest.TestCase):
                 finished.result(timeout=10)
         finally:
             self.service.upload_gate.set()
-        self.assertEqual(self.service.checkpoints[0][1], path.read_bytes())
+        self.assertEqual(
+            self.archive_contents(self.service.checkpoints[0][1]),
+            {path.name: path.read_bytes()},
+        )
+
+    def test_directories_are_uploaded_as_tar_archives(self):
+        self.start()
+        path = Path(self.temp.name) / "bundle"
+        (path / "nested").mkdir(parents=True)
+        (path / "empty").mkdir()
+        (path / "config.yaml").write_bytes(b"config")
+        (path / "nested" / "weights.pth").write_bytes(b"weights")
+        self.daemon.metric_artifact(1, path, "bundle")
+        self.daemon.checkpoint(1, path)
+        self.daemon.flush()
+        _, metadata, artifact = self.service.artifacts[0]
+        self.assertEqual(metadata.size_bytes, len(artifact))
+        for received in (artifact, self.service.checkpoints[0][1]):
+            self.assertEqual(
+                self.archive_contents(received),
+                {
+                    "bundle/config.yaml": b"config",
+                    "bundle/nested/weights.pth": b"weights",
+                },
+            )
+            with tarfile.open(fileobj=io.BytesIO(received), mode="r:") as archive:
+                self.assertTrue(archive.getmember("bundle/empty").isdir())
 
     def test_each_rank_process_can_upload(self):
         self.start()
@@ -480,6 +515,15 @@ class PipelineTests(unittest.TestCase):
         self.daemon.close()
         follower.close()
         self.assertEqual(self.service.metrics[0][1].name, "flushed")
+
+    @staticmethod
+    def archive_contents(data):
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            return {
+                member.name: archive.extractfile(member).read()
+                for member in archive.getmembers()
+                if member.isfile()
+            }
 
     @staticmethod
     def archive(files):
