@@ -24,7 +24,7 @@ mod loader;
 mod metrics;
 mod prefetch;
 mod run;
-mod run_manager;
+mod run_repo;
 mod sampling;
 mod symbols;
 mod uploads;
@@ -172,19 +172,19 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&assets_cache_dir).await?;
     fs::create_dir_all(&uploads_cache_dir).await?;
 
-    let run_manager = run_manager::RunManager::new(database.clone());
+    let run_repo = run_repo::RunRepo::new(database.clone());
     let shutdown = CancellationToken::new();
     tokio::spawn(watch_shutdown_signals(shutdown.clone()));
     let mut http_server = tokio::spawn(http::serve(
         args.http_port,
-        run_manager.clone(),
+        run_repo.clone(),
         shutdown.clone(),
     ));
     let mut grpc_server = tokio::spawn(grpc::serve(
         args.grpc_port,
         s3_client,
         database,
-        run_manager,
+        run_repo,
         args.bucket.leak(),
         data_cache_dir,
         assets_cache_dir,

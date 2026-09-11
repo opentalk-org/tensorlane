@@ -12,7 +12,7 @@ use crate::proto::{
     checkpoint_request, metrics_request,
     tensor_lane_server::{TensorLane as TensorLaneService, TensorLaneServer},
 };
-use crate::run_manager::{RunManager, RunStatus};
+use crate::run_repo::{RunRepo, RunStatus};
 use crate::uploads::UploadStore;
 use clickhouse::Client;
 use futures::Stream;
@@ -25,7 +25,7 @@ use tracing::{debug, error, info};
 
 struct TensorLane {
     database: Client,
-    run_manager: RunManager,
+    run_repo: RunRepo,
     loader: Arc<dyn Loader>,
     assets: AssetStore,
     cache_dir: &'static Path,
@@ -37,7 +37,7 @@ impl TensorLane {
     fn new(
         s3_client: aws_sdk_s3::Client,
         database: Client,
-        run_manager: RunManager,
+        run_repo: RunRepo,
         bucket: &'static str,
         cache_dir: &'static Path,
         assets_cache_dir: &'static Path,
@@ -51,7 +51,7 @@ impl TensorLane {
             cache_dir,
             uploads,
             database,
-            run_manager,
+            run_repo,
         }
     }
 }
@@ -63,7 +63,7 @@ impl TensorLaneService for TensorLane {
         debug!(run = %run_id, "init request");
         let initialized = grpc_support::initialize(
             run_id,
-            &self.run_manager,
+            &self.run_repo,
             &self.assets,
             &self.database,
             self.loader.clone(),
@@ -248,7 +248,7 @@ impl TensorLaneService for TensorLane {
             None => return Err(Status::not_found("unknown run")),
             Some(active) => active.handle.finish().await,
         }
-        self.run_manager
+        self.run_repo
             .append_status(run_id, RunStatus::Succeeded)
             .await
             .map_err(|err| {
@@ -264,7 +264,7 @@ pub async fn serve(
     port: u16,
     s3_client: aws_sdk_s3::Client,
     database: Client,
-    run_manager: RunManager,
+    run_repo: RunRepo,
     bucket: &'static str,
     cache_dir: &'static Path,
     assets_cache_dir: &'static Path,
@@ -287,7 +287,7 @@ pub async fn serve(
         .add_service(TensorLaneServer::new(TensorLane::new(
             s3_client,
             database,
-            run_manager,
+            run_repo,
             bucket,
             cache_dir,
             assets_cache_dir,

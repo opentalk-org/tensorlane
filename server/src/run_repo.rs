@@ -103,11 +103,11 @@ impl TryFrom<RunRow> for Run {
 }
 
 #[derive(Clone)]
-pub struct RunManager {
+pub struct RunRepo {
     client: clickhouse::Client,
 }
 
-impl RunManager {
+impl RunRepo {
     pub fn new(client: clickhouse::Client) -> Self {
         Self { client }
     }

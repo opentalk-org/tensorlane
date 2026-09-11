@@ -22,7 +22,7 @@ use crate::proto::{
     checkpoint_request,
 };
 use crate::run::{DataConfig, RunHandle, RunState};
-use crate::run_manager::{RunManager, RunStatus};
+use crate::run_repo::{RunRepo, RunStatus};
 
 const ASSET_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 
@@ -88,13 +88,13 @@ impl AssetStore {
 
 pub async fn initialize(
     run_id: Uuid,
-    run_manager: &RunManager,
+    run_repo: &RunRepo,
     assets: &AssetStore,
     database: &Client,
     loader: Arc<dyn Loader>,
     cache_dir: &'static Path,
 ) -> Result<InitializedRun, Status> {
-    let run = run_manager
+    let run = run_repo
         .get(run_id)
         .await
         .map_err(|err| {
@@ -105,7 +105,7 @@ pub async fn initialize(
     let train_config = serde_json::to_string(&run.train_config)
         .map_err(|err| Status::internal(format!("{err:#}")))?;
     let config = Arc::new(run.data_config);
-    run_manager
+    run_repo
         .append_status(run_id, RunStatus::Running)
         .await
         .map_err(|err| {
@@ -131,7 +131,7 @@ pub async fn initialize(
         }),
         Err(err) => {
             error!(run = %run_id, error = format!("{err:#}"), "run initialization failed");
-            if let Err(status_err) = run_manager.append_status(run_id, RunStatus::Failed).await {
+            if let Err(status_err) = run_repo.append_status(run_id, RunStatus::Failed).await {
                 error!(run = %run_id, error = format!("{status_err:#}"), "recording failed status failed");
             }
             Err(Status::internal(format!("{err:#}")))

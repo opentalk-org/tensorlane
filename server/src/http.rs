@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     run::DataConfig,
-    run_manager::{Run, RunManager, RunStatus},
+    run_repo::{Run, RunRepo, RunStatus},
 };
 
 #[derive(Deserialize)]
@@ -46,13 +46,13 @@ struct RunResponse {
 
 pub async fn serve(
     port: u16,
-    run_manager: RunManager,
+    run_repo: RunRepo,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run))
-        .with_state(run_manager);
+        .with_state(run_repo);
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, "HTTP server listening");
@@ -63,10 +63,10 @@ pub async fn serve(
 }
 
 async fn create_run(
-    State(run_manager): State<RunManager>,
+    State(run_repo): State<RunRepo>,
     Json(request): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), StatusCode> {
-    let run_id = run_manager
+    let run_id = run_repo
         .create(
             request.project_id,
             &request.name,
@@ -89,10 +89,10 @@ async fn create_run(
 }
 
 async fn get_run(
-    State(run_manager): State<RunManager>,
+    State(run_repo): State<RunRepo>,
     Path(run_id): Path<Uuid>,
 ) -> Result<Json<RunResponse>, StatusCode> {
-    let run = run_manager.get(run_id).await.map_err(|err| {
+    let run = run_repo.get(run_id).await.map_err(|err| {
         error!(
             run = %run_id,
             error = format!("{err:#}"),
@@ -107,10 +107,8 @@ async fn get_run(
     }
 }
 
-async fn list_runs(
-    State(run_manager): State<RunManager>,
-) -> Result<Json<Vec<RunResponse>>, StatusCode> {
-    let runs = run_manager.list().await.map_err(|err| {
+async fn list_runs(State(run_repo): State<RunRepo>) -> Result<Json<Vec<RunResponse>>, StatusCode> {
+    let runs = run_repo.list().await.map_err(|err| {
         error!(error = format!("{err:#}"), "listing runs failed");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
