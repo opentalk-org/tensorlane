@@ -141,6 +141,26 @@ impl RunState {
             self.training_batches.drain(),
         );
     }
+
+    async fn handle_commands(mut self, mut rx: mpsc::Receiver<Command>) {
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Command::NextBatch { validation, reply } => {
+                    let _ = reply.send(self.next_batch(validation).await);
+                }
+                Command::Finish { reply } => {
+                    self.finish().await;
+                    let _ = reply.send(());
+                    debug!("run finished");
+                    return;
+                }
+            }
+        }
+
+        // all handles dropped without an End: still stop prefetchers and drain the cache
+        self.finish().await;
+        debug!("run finished after handles dropped");
+    }
 }
 
 enum Command {
@@ -162,7 +182,10 @@ impl RunHandle {
     pub fn spawn(run: RunState) -> Self {
         let id = run.id;
         let (tx, rx) = mpsc::channel(1);
-        tokio::spawn(serve_commands(run, rx).instrument(info_span!("run", run = %id)));
+        tokio::spawn(
+            run.handle_commands(rx)
+                .instrument(info_span!("run", run = %id)),
+        );
         Self { tx }
     }
 
@@ -189,24 +212,4 @@ impl RunHandle {
             let _ = response.await;
         }
     }
-}
-
-async fn serve_commands(mut run: RunState, mut rx: mpsc::Receiver<Command>) {
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Command::NextBatch { validation, reply } => {
-                let _ = reply.send(run.next_batch(validation).await);
-            }
-            Command::Finish { reply } => {
-                run.finish().await;
-                let _ = reply.send(());
-                debug!("run finished");
-                return;
-            }
-        }
-    }
-
-    // all handles dropped without an End: still stop prefetchers and drain the cache
-    run.finish().await;
-    debug!("run finished after handles dropped");
 }
