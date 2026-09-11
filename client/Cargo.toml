@@ -16,6 +16,8 @@ postcard = { version = "1", features = ["alloc"] }
 futures-util = { version = "0.3", features = ["sink"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 fs2 = "0.4"
+tar = "0.4"
+tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1.44.2", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros", "fs"] }
 tonic = "0.13.1"

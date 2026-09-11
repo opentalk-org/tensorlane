@@ -187,7 +187,7 @@ impl UploadStore {
     ) -> anyhow::Result<()> {
         let local_path = self.staging_path(id);
         let key = format!("{}/{}", self.metrics_prefix, id);
-        self.upload(&local_path, &key, &content_type).await?;
+        self.upload(&local_path, &key, "application/x-tar").await?;
         let row = ArtifactRecord {
             id,
             run_id,

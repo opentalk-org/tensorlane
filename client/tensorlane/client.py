@@ -153,13 +153,16 @@ class TensorLane:
         name: str,
         content_type: str = "application/octet-stream",
     ) -> None:
-        """Queue a file unchanged. Keep it available and unchanged until flush completes."""
+        """Queue a file or directory for TAR upload; content_type describes its contents.
+
+        Keep the source available and unchanged until flush completes.
+        """
         self._upload_client().metric_artifact(
             step, Path(path).absolute(), name, content_type
         )
 
     def checkpoint(self, step: int, path: str | Path) -> None:
-        """Queue a file unchanged. Keep it available and unchanged until flush completes."""
+        """Queue a file or directory for TAR upload. Keep it unchanged until flush completes."""
         self._upload_client().checkpoint(step, Path(path).absolute())
 
     def flush(self, *, timeout: float = 300) -> None:
