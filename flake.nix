@@ -93,12 +93,14 @@
               CACHE_DIR = "$DNVR_ROOT/.tensorlane/cache";
               ASSETS_DIR = "$DNVR_ROOT/.tensorlane/assets";
               CHECKPOINT_PREFIX = "/checkpoints";
-              METRICS_PREFIX = "/artifacts";
+              METRICS_PREFIX = "/metrics";
 
               UV_PYTHON_PREFERENCE = "only-system";
               UV_PYTHON_DOWNLOADS = "never";
 
               LIBTORCH_USE_PYTORCH = "1";
+
+              RUST_LOG = "off,tensorlane=debug";
             };
 
             shellHook = ''

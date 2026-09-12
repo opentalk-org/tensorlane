@@ -14,6 +14,7 @@ use clap_complete::{Shell, generate};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 
 mod audio;
 mod db;
@@ -123,7 +124,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter("debug,h2=off,hyper=off,tower=off,aws_runtime=off,aws_sdk_s3=off,aws_smithy_runtime_api=off,aws_smithy_runtime=off")
+        .with_env_filter(EnvFilter::from_default_env())
         .init();
 
     let matches = Args::command().get_matches();
