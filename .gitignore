@@ -2,6 +2,7 @@
 target/
 .dnvr/
 .envrc
+.env
 .cache/
 .client-cache/
 .tensorlane/

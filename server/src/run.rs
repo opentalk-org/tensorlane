@@ -182,6 +182,7 @@ impl RunHandle {
     pub fn spawn(run: RunState) -> Self {
         let id = run.id;
         let (tx, rx) = mpsc::channel(1);
+        // TODO: spawn with task tracker, wait on shutdown
         tokio::spawn(
             run.handle_commands(rx)
                 .instrument(info_span!("run", run = %id)),

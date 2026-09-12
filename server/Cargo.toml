@@ -37,6 +37,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
 clickhouse = { version = "0.15.2", features = ["uuid", "time", "rustls-tls"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
 
 [build-dependencies]
 protox = "0.7.2"

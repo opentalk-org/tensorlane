@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
             None,
             "r2",
         ))
+        .region("")
         .load()
         .await;
     let s3_client = aws_sdk_s3::Client::from_conf(
