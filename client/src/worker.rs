@@ -270,7 +270,7 @@ async fn supervise(
         anyhow::Ok((grpc, initialized, work))
     };
     let started = tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(120), startup) => result.context("daemon startup timed out").and_then(|result| result).map(Some),
+        result = tokio::time::timeout(Duration::from_mins(10), startup) => result.context("daemon startup timed out").and_then(|result| result).map(Some),
         result = &mut stop => result.unwrap_or(Ok(())).map(|()| None),
     };
     let (grpc, initialized, work) = match started {

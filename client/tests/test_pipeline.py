@@ -853,6 +853,39 @@ class PipelineTests(unittest.TestCase):
         self.daemon.close()
         self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
 
+    def test_load_example_drains_training_across_ranks(self):
+        example = Path(__file__).resolve().parents[1] / "examples" / "load_test.py"
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(example),
+                self.run_id,
+                "--ranks",
+                "2",
+                "--workers",
+                "1",
+                "--prefetch-factor",
+                "1",
+                "--addr",
+                f"localhost:{self.service.port}",
+                "--ipc-dir",
+                "load-ipc",
+            ],
+            cwd=self.temp.name,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("rank=0 batches=3 ", result.stdout)
+        self.assertIn("rank=1 batches=2 ", result.stdout)
+        self.assertIn("total batches=5 ", result.stdout)
+        self.assertIn("samples/s=", result.stdout)
+        self.assertEqual(len(self.service.init_requests), 1)
+        self.assertEqual(len(self.service.end_requests), 1)
+        self.assertEqual(self.service.metrics, [])
+        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
+
     def test_cpu_example_uses_custom_ipc_dir_for_every_rank(self):
         self.service.validation_count = self.service.count
         example = Path(__file__).resolve().parents[1] / "examples" / "cpu.py"
