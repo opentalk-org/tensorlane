@@ -1,0 +1,35 @@
+{
+  "data_config": {
+    "dataset_id": "e25b39ac-3400-4f9f-9fac-3e9c94e1a92b",
+    "asset_type": "testing",
+    "seed": 1,
+    "max_text_tokens": 512,
+    "plbert_languages": [],
+    "assets": {},
+    "validation": {
+      "samples": 1000,
+      "max_seconds": 65
+    },
+    "training": [
+      {
+        "batches": 20,
+        "max_seconds": 150
+      },
+      {
+        "batches": 20,
+        "max_seconds": 30
+      },
+      {
+        "batches": 20,
+        "max_seconds": 90
+      }
+    ]
+  },
+  "train_config": {
+    "my": {
+      "train": "config"
+    }
+  },
+  "project_id": "f3b83939-af56-473a-8ad8-b77b12bfef37",
+  "name": "testing run"
+}

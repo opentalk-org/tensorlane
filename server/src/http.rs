@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
+use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -106,6 +107,7 @@ pub async fn serve(
                 anyhow::anyhow!("Method not allowed"),
             )
         })
+        .layer(TraceLayer::new_for_http())
         .with_state(run_repo);
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
