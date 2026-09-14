@@ -1,7 +1,7 @@
 use std::{io, path::PathBuf};
 
 use anyhow::Context;
-use aws_config::BehaviorVersion;
+use aws_config::{BehaviorVersion, retry::RetryConfig};
 use aws_sdk_s3::config::Credentials;
 use clap::{
     CommandFactory, FromArgMatches, Parser, Subcommand,
@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
 
     let s3_config = aws_config::defaults(BehaviorVersion::latest())
         .endpoint_url(&args.s3_endpoint)
+        .retry_config(RetryConfig::standard().with_max_attempts(5))
         .credentials_provider(Credentials::new(
             &args.s3_key,
             &args.s3_secret,

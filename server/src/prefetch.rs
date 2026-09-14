@@ -63,7 +63,7 @@ impl Prefetcher {
         tokio::spawn({
             let cancel_token = cancel_token.clone();
             async move {
-                loop {
+                'outer: loop {
                     let permit = tokio::select! {
                         biased;
                         () = cancel_token.cancelled() => break,
@@ -73,25 +73,26 @@ impl Prefetcher {
                         },
                     };
 
-                    let loaded = match sampler.next_batch() {
-                        Ok(Some(batch)) => load_batch(&loader, cache_dir, batch).await,
-                        Ok(None) => {
-                            debug!("schedule exhausted");
-                            break;
+                    let result = loop {
+                        let loaded = match sampler.next_batch() {
+                            Ok(Some(batch)) => load_batch(&loader, cache_dir, batch).await,
+                            Ok(None) => {
+                                debug!("schedule exhausted");
+                                break 'outer;
+                            }
+                            Err(err) => Err(err),
+                        };
+
+                        match loaded {
+                            Ok(None) => continue,
+                            Ok(Some(batch)) => break Ok(batch),
+                            Err(err) => {
+                                error!(error = format!("{err:#}"), "prefetching batch failed");
+                                break Err(err);
+                            }
                         }
-                        Err(err) => Err(err),
                     };
-                    match &loaded {
-                        Ok(batch) => debug!(samples = batch.len(), "batch ready"),
-                        Err(err) => {
-                            error!(error = format!("{err:#}"), "prefetching batch failed")
-                        }
-                    }
-                    let failed = loaded.is_err();
-                    permit.send(loaded);
-                    if failed {
-                        break;
-                    }
+                    permit.send(result);
                 }
                 debug!("prefetcher stopped");
             }
@@ -146,15 +147,19 @@ async fn load_batch(
     loader: &Arc<dyn Loader>,
     cache_dir: &'static Path,
     batch: Vec<Sample>,
-) -> anyhow::Result<PrefetchedBatch> {
+) -> anyhow::Result<Option<PrefetchedBatch>> {
     debug!(samples = batch.len(), "loading batch");
 
     let mut loaded_batch: Vec<PrefetchedSample> = vec![];
-    for (sample, wave) in loader.load_batch(batch).await? {
-        let path = cache_dir.join(format!("{}-{}.raw", sample.audio_id, uuid::Uuid::new_v4()));
-        fs::write(&path, &wave).await?;
-        loaded_batch.push(PrefetchedSample { sample, path });
+    if let Some(batch) = loader.load_batch(batch).await? {
+        for (sample, wave) in batch {
+            let path = cache_dir.join(format!("{}-{}.raw", sample.audio_id, uuid::Uuid::new_v4()));
+            fs::write(&path, &wave).await?;
+            loaded_batch.push(PrefetchedSample { sample, path });
+        }
+    } else {
+        return Ok(None);
     }
 
-    Ok(loaded_batch)
+    Ok(Some(loaded_batch))
 }
