@@ -9,9 +9,7 @@ use tonic::{Status, Streaming};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
-use crate::proto::{
-    ArrayMetric, ArtifactMetric, MetricsRequest, MetricsResponse, ScalarMetric, metrics_request,
-};
+use crate::proto::{ArtifactMetric, MetricsRequest, MetricsResponse, metrics_request};
 use crate::uploads::UploadStore;
 
 #[derive(clickhouse::Row, Serialize)]
@@ -52,6 +50,12 @@ pub async fn receive(
 ) -> Result<MetricsResponse, Status> {
     let mut pending: Option<PendingArtifact> = None;
     let mut response = MetricsResponse::default();
+    let mut scalar_inserter = client
+        .inserter::<ScalarRecord>("metrics")
+        .with_max_rows(1000);
+    let mut array_inserter = client
+        .inserter::<ArrayRecord>("array_metrics")
+        .with_max_rows(1000);
     let result = async {
         while let Some(request) = stream.message().await? {
             match request.payload {
@@ -69,7 +73,17 @@ pub async fn receive(
                         value = metric.value,
                         "metric received"
                     );
-                    store_metric(client, run_id, metric).await?;
+                    if metric.name.is_empty() {
+                        return Err(Status::invalid_argument("metric name cannot be empty"));
+                    }
+                    let row = ScalarRecord {
+                        timestamp: metric_timestamp(metric.timestamp_unix_ms)?,
+                        run_id,
+                        step: metric.step,
+                        name: metric.name,
+                        value: metric.value,
+                    };
+                    scalar_inserter.write(&row).await.map_err(internal)?;
                     response.metrics_received += 1;
                 }
                 Some(metrics_request::Payload::ArrayMetric(metric)) => {
@@ -81,7 +95,17 @@ pub async fn receive(
                         values = metric.value.len(),
                         "array metric received"
                     );
-                    store_array_metric(client, run_id, metric).await?;
+                    if metric.name.is_empty() {
+                        return Err(Status::invalid_argument("metric name cannot be empty"));
+                    }
+                    let row = ArrayRecord {
+                        timestamp: metric_timestamp(metric.timestamp_unix_ms)?,
+                        run_id,
+                        step: metric.step,
+                        name: metric.name,
+                        value: metric.value,
+                    };
+                    array_inserter.write(&row).await.map_err(internal)?;
                     response.array_metrics_received += 1;
                 }
                 Some(metrics_request::Payload::Artifact(artifact)) => {
@@ -158,7 +182,14 @@ pub async fn receive(
                 }
                 None => return Err(Status::invalid_argument("metrics message has no payload")),
             }
+            let res = scalar_inserter.commit().await.map_err(internal);
+            let _ = array_inserter.commit().await.map_err(internal)?;
+            let _ = res?;
         }
+
+        let res = scalar_inserter.end().await.map_err(internal);
+        let _ = array_inserter.end().await.map_err(internal)?;
+        let _ = res?;
 
         if pending.is_some() {
             return Err(Status::invalid_argument(
@@ -176,48 +207,6 @@ pub async fn receive(
     }
     result?;
     Ok(response)
-}
-
-async fn store_metric(client: &Client, run_id: Uuid, metric: ScalarMetric) -> Result<(), Status> {
-    if metric.name.is_empty() {
-        return Err(Status::invalid_argument("metric name cannot be empty"));
-    }
-    let row = ScalarRecord {
-        timestamp: metric_timestamp(metric.timestamp_unix_ms)?,
-        run_id,
-        step: metric.step,
-        name: metric.name,
-        value: metric.value,
-    };
-    let mut insert = client
-        .insert::<ScalarRecord>("metrics")
-        .await
-        .map_err(internal)?;
-    insert.write(&row).await.map_err(internal)?;
-    insert.end().await.map_err(internal)
-}
-
-async fn store_array_metric(
-    client: &Client,
-    run_id: Uuid,
-    metric: ArrayMetric,
-) -> Result<(), Status> {
-    if metric.name.is_empty() {
-        return Err(Status::invalid_argument("metric name cannot be empty"));
-    }
-    let row = ArrayRecord {
-        timestamp: metric_timestamp(metric.timestamp_unix_ms)?,
-        run_id,
-        step: metric.step,
-        name: metric.name,
-        value: metric.value,
-    };
-    let mut insert = client
-        .insert::<ArrayRecord>("array_metrics")
-        .await
-        .map_err(internal)?;
-    insert.write(&row).await.map_err(internal)?;
-    insert.end().await.map_err(internal)
 }
 
 async fn begin_artifact(
