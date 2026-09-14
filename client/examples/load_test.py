@@ -33,6 +33,8 @@ def consume(args, rank, barrier, results):
             for batch in batches:
                 batch_count += 1
                 sample_count += len(batch)
+                print("sending metric")
+                lane.metric(batch_count, "test/samples", sample_count)
                 print(
                     f"rank={rank} batch={batch_count} samples={len(batch)} "
                     f"elapsed_seconds={time.perf_counter() - started:.3f}",

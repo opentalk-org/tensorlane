@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clickhouse::Client;
+use clickhouse::{Client, RowOwned, RowWrite};
 use serde::Serialize;
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 use crate::proto::{ArtifactMetric, MetricsRequest, MetricsResponse, metrics_request};
 use crate::uploads::UploadStore;
+
+const METRIC_BATCH_SIZE: usize = 1000;
 
 #[derive(clickhouse::Row, Serialize)]
 struct ScalarRecord {
@@ -50,12 +52,8 @@ pub async fn receive(
 ) -> Result<MetricsResponse, Status> {
     let mut pending: Option<PendingArtifact> = None;
     let mut response = MetricsResponse::default();
-    let mut scalar_inserter = client
-        .inserter::<ScalarRecord>("metrics")
-        .with_max_rows(1000);
-    let mut array_inserter = client
-        .inserter::<ArrayRecord>("array_metrics")
-        .with_max_rows(1000);
+    let mut scalars = Vec::new();
+    let mut arrays = Vec::new();
     let result = async {
         while let Some(request) = stream.message().await? {
             match request.payload {
@@ -83,7 +81,10 @@ pub async fn receive(
                         name: metric.name,
                         value: metric.value,
                     };
-                    scalar_inserter.write(&row).await.map_err(internal)?;
+                    scalars.push(row);
+                    if scalars.len() == METRIC_BATCH_SIZE {
+                        flush_metrics(client, "metrics", &mut scalars).await?;
+                    }
                     response.metrics_received += 1;
                 }
                 Some(metrics_request::Payload::ArrayMetric(metric)) => {
@@ -105,7 +106,10 @@ pub async fn receive(
                         name: metric.name,
                         value: metric.value,
                     };
-                    array_inserter.write(&row).await.map_err(internal)?;
+                    arrays.push(row);
+                    if arrays.len() == METRIC_BATCH_SIZE {
+                        flush_metrics(client, "array_metrics", &mut arrays).await?;
+                    }
                     response.array_metrics_received += 1;
                 }
                 Some(metrics_request::Payload::Artifact(artifact)) => {
@@ -182,14 +186,14 @@ pub async fn receive(
                 }
                 None => return Err(Status::invalid_argument("metrics message has no payload")),
             }
-            let res = scalar_inserter.commit().await.map_err(internal);
-            let _ = array_inserter.commit().await.map_err(internal)?;
-            let _ = res?;
         }
 
-        let res = scalar_inserter.end().await.map_err(internal);
-        let _ = array_inserter.end().await.map_err(internal)?;
-        let _ = res?;
+        let (scalar_result, array_result) = tokio::join!(
+            flush_metrics(client, "metrics", &mut scalars),
+            flush_metrics(client, "array_metrics", &mut arrays),
+        );
+        scalar_result?;
+        array_result?;
 
         if pending.is_some() {
             return Err(Status::invalid_argument(
@@ -207,6 +211,23 @@ pub async fn receive(
     }
     result?;
     Ok(response)
+}
+
+async fn flush_metrics<Record: RowOwned + RowWrite>(
+    client: &Client,
+    table: &str,
+    rows: &mut Vec<Record>,
+) -> Result<(), Status> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let mut insert = client.insert::<Record>(table).await.map_err(internal)?;
+    for row in rows.iter() {
+        insert.write(row).await.map_err(internal)?;
+    }
+    insert.end().await.map_err(internal)?;
+    rows.clear();
+    Ok(())
 }
 
 async fn begin_artifact(
