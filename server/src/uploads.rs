@@ -21,7 +21,8 @@ struct CheckpointRecord {
     step: u64,
     path: String,
     size: u64,
-    content_hash: String,
+    #[serde(with = "serde_big_array::BigArray")]
+    content_hash: [u8; 64],
     #[serde(rename = "type")]
     asset_type: String,
     metadata: String,
@@ -92,7 +93,7 @@ impl UploadStore {
         run_id: Uuid,
         step: u64,
         size: u64,
-        content_hash: String,
+        content_hash: [u8; 64],
         asset_type: String,
     ) {
         let store = self.clone();
@@ -146,7 +147,7 @@ impl UploadStore {
         run_id: Uuid,
         step: u64,
         size: u64,
-        content_hash: String,
+        content_hash: [u8; 64],
         asset_type: String,
     ) -> anyhow::Result<()> {
         let local_path = self.staging_path(id);
