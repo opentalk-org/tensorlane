@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::{
+    primitives::{ByteStream, Length},
+    types::{CompletedMultipartUpload, CompletedPart},
+};
 use clickhouse::Client;
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -208,24 +211,110 @@ impl UploadStore {
     }
 
     async fn upload(&self, local_path: &Path, key: &str, content_type: &str) -> anyhow::Result<()> {
-        let body = ByteStream::from_path(local_path)
+        let size = fs::metadata(local_path)
             .await
-            .with_context(|| format!("opening staged upload {}", local_path.display()))?;
-        self.s3
-            .put_object()
+            .with_context(|| format!("reading staged upload {}", local_path.display()))?
+            .len();
+        if size == 0 {
+            self.s3
+                .put_object()
+                .bucket(self.bucket)
+                .key(key)
+                .content_type(content_type)
+                .body(ByteStream::from_static(b""))
+                .send()
+                .await
+                .with_context(|| format!("uploading empty object to s3://{}/{key}", self.bucket))?;
+            return Ok(());
+        }
+        let part_size = (64 * 1024 * 1024_u64).max(size.div_ceil(10_000));
+        anyhow::ensure!(
+            part_size <= 5 * 1024 * 1024 * 1024,
+            "upload exceeds S3 multipart size limits"
+        );
+        let upload = self
+            .s3
+            .create_multipart_upload()
             .bucket(self.bucket)
             .key(key)
             .content_type(content_type)
-            .body(body)
             .send()
             .await
-            .with_context(|| {
-                format!(
-                    "uploading {} to s3://{}/{key}",
-                    local_path.display(),
-                    self.bucket
+            .with_context(|| format!("starting multipart upload to s3://{}/{key}", self.bucket))?;
+        let upload_id = upload
+            .upload_id()
+            .context("multipart upload response missing upload ID")?;
+        let result: anyhow::Result<()> = async {
+            let mut parts = Vec::new();
+            for index in 0..size.div_ceil(part_size) {
+                let offset = index * part_size;
+                let length = part_size.min(size - offset);
+                let part_number = i32::try_from(index + 1)?;
+                let body = ByteStream::read_from()
+                    .path(local_path)
+                    .offset(offset)
+                    .length(Length::Exact(length))
+                    .build()
+                    .await
+                    .with_context(|| format!("reading upload part {part_number}"))?;
+                let part = self
+                    .s3
+                    .upload_part()
+                    .bucket(self.bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .part_number(part_number)
+                    .body(body)
+                    .send()
+                    .await
+                    .with_context(|| format!("uploading part {part_number}"))?;
+                parts.push(
+                    CompletedPart::builder()
+                        .part_number(part_number)
+                        .e_tag(part.e_tag().context("upload part response missing ETag")?)
+                        .build(),
+                );
+            }
+            self.s3
+                .complete_multipart_upload()
+                .bucket(self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
                 )
-            })?;
-        Ok(())
+                .send()
+                .await
+                .context("completing multipart upload")?;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            if let Err(err) = self
+                .s3
+                .abort_multipart_upload()
+                .bucket(self.bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+            {
+                error!(
+                    key,
+                    upload_id,
+                    error = format!("{err:#}"),
+                    "aborting multipart upload failed"
+                );
+            }
+        }
+        result.with_context(|| {
+            format!(
+                "uploading {} to s3://{}/{key}",
+                local_path.display(),
+                self.bucket
+            )
+        })
     }
 }
