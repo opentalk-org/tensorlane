@@ -182,6 +182,11 @@ impl RunState {
             let _ = reply.send(batch);
         }
 
+        self.finish().await;
+    }
+
+    async fn finish(self) {
+        self.cancel_token.cancel();
         tokio::join!(
             self.validation_batches.finish(),
             self.training_batches.finish(),
@@ -267,24 +272,27 @@ impl RunExecutor {
         .instrument(run_span)
         .await?;
 
-        let res = self.repo.append_status(id, RunStatus::Running).await;
-        if res.is_err() {
-            if let Err(err) = fs::remove_dir_all(&state.run_cache_dir).await
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                error!(run = %id, error = %err, path = %state.run_cache_dir.display(), "removing run cache failed");
+        let setup: Result<()> = async {
+            self.repo.append_status(id, RunStatus::Running).await?;
+            let assets = futures::future::join_all(
+                run_record
+                    .data_config
+                    .assets
+                    .iter()
+                    .map(|(name, asset)| self.assets.ensure(id, name, &asset.object)),
+            )
+            .await;
+            for asset in assets {
+                asset?;
             }
-            res?;
+            Ok(())
         }
-
-        futures::future::join_all(
-            run_record
-                .data_config
-                .assets
-                .iter()
-                .map(|(name, asset)| self.assets.ensure(id, name, &asset.object)),
-        )
         .await;
+
+        if let Err(err) = setup {
+            state.finish().await;
+            return Err(err);
+        }
 
         let cancel = state.cancel_token.clone();
 
