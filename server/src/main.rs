@@ -19,7 +19,6 @@ use tracing_subscriber::EnvFilter;
 mod audio;
 mod db;
 mod grpc;
-mod grpc_support;
 mod http;
 mod loader;
 mod metrics;
@@ -165,23 +164,21 @@ async fn main() -> anyhow::Result<()> {
             .build(),
     );
 
-    let data_cache_dir: &'static std::path::Path =
-        Box::leak(args.cache_dir.join("data").into_boxed_path());
-    let assets_cache_dir: &'static std::path::Path =
-        Box::leak(args.cache_dir.join("assets").into_boxed_path());
+    let runs_cache_dir: &'static std::path::Path =
+        Box::leak(args.cache_dir.join("runs").into_boxed_path());
     let uploads_cache_dir: &'static std::path::Path =
         Box::leak(args.cache_dir.join("uploads").into_boxed_path());
-    fs::create_dir_all(&data_cache_dir).await?;
-    fs::create_dir_all(&assets_cache_dir).await?;
+    fs::create_dir_all(&runs_cache_dir).await?;
     fs::create_dir_all(&uploads_cache_dir).await?;
 
     let run_repo = run_repo::RunRepo::new(database.clone());
     let shutdown = CancellationToken::new();
+    let http_shutdown = CancellationToken::new();
     tokio::spawn(watch_shutdown_signals(shutdown.clone()));
     let mut http_server = tokio::spawn(http::serve(
         args.http_port,
         run_repo.clone(),
-        shutdown.clone(),
+        http_shutdown.clone(),
     ));
     let mut grpc_server = tokio::spawn(grpc::serve(
         args.grpc_port,
@@ -189,8 +186,7 @@ async fn main() -> anyhow::Result<()> {
         database,
         run_repo,
         args.bucket.leak(),
-        data_cache_dir,
-        assets_cache_dir,
+        runs_cache_dir,
         uploads_cache_dir,
         args.checkpoint_prefix.leak(),
         args.metrics_prefix.leak(),
@@ -199,13 +195,16 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         result = &mut http_server => {
             shutdown.cancel();
+            let grpc_result = grpc_server.await;
             result??;
-            grpc_server.await??;
+            grpc_result??;
         }
         result = &mut grpc_server => {
             shutdown.cancel();
+            http_shutdown.cancel();
+            let http_result = http_server.await;
             result??;
-            http_server.await??;
+            http_result??;
         }
     }
     Ok(())

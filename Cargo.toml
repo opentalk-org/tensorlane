@@ -2,5 +2,9 @@
 resolver = "3"
 members = [
     "server",
-    "client"
+    "client",
+    "error-context",
 ]
+
+[workspace.dependencies]
+error-context = { path = "error-context" }

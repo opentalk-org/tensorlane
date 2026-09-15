@@ -5,8 +5,8 @@ use std::{
 
 use bytes::Bytes;
 use tokio::{fs, sync::mpsc};
-use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, warn};
+use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
+use tracing::{Instrument, debug, error};
 
 use crate::{
     loader::Loader,
@@ -47,35 +47,39 @@ const CACHED_BATCHES: usize = 5;
 pub struct Prefetcher {
     rx: mpsc::Receiver<anyhow::Result<PrefetchedBatch>>,
     cancel_token: CancellationToken,
+    tasks: TaskTracker,
 }
 
 impl Prefetcher {
     pub fn spawn(
         mut sampler: Box<dyn Sampler>,
         loader: Arc<dyn Loader>,
-        cache_dir: &'static Path,
+        cache_dir: PathBuf,
         cancel_token: CancellationToken,
         span: tracing::Span,
     ) -> Self {
         let (tx, rx) = mpsc::channel(CACHED_BATCHES);
 
+        let tasks = TaskTracker::new();
         let cancel_token = cancel_token.child_token();
-        tokio::spawn({
+        tasks.spawn({
             let cancel_token = cancel_token.clone();
             async move {
                 'outer: loop {
-                    let permit = tokio::select! {
-                        biased;
-                        () = cancel_token.cancelled() => break,
-                        permit = tx.reserve() => match permit {
-                            Ok(permit) => permit,
-                            Err(_) => break,
-                        },
+                    let permit = match tx.reserve().with_cancellation_token(&cancel_token).await {
+                        Some(Err(_)) | None => break,
+                        Some(Ok(permit)) => permit,
                     };
 
                     let result = loop {
                         let loaded = match sampler.next_batch() {
-                            Ok(Some(batch)) => load_batch(&loader, cache_dir, batch).await,
+                            Ok(Some(batch)) => match load_batch(&loader, &cache_dir, batch)
+                                .with_cancellation_token(&cancel_token)
+                                .await
+                            {
+                                None => break 'outer,
+                                Some(v) => v,
+                            },
                             Ok(None) => {
                                 debug!("schedule exhausted");
                                 break 'outer;
@@ -99,7 +103,11 @@ impl Prefetcher {
             .instrument(span)
         });
 
-        Self { rx, cancel_token }
+        Self {
+            rx,
+            cancel_token,
+            tasks,
+        }
     }
 
     pub async fn next_batch(&mut self) -> anyhow::Result<Option<LoadedBatch>> {
@@ -111,22 +119,11 @@ impl Prefetcher {
         }
     }
 
-    // best-effort removal of every cached file still in flight; consumes self
-    pub async fn drain(mut self) {
+    /// Cancels all of the running prefeching tasks.
+    pub async fn finish(self) {
+        self.tasks.close();
         self.cancel_token.cancel();
-
-        while let Some(batch) = self.rx.recv().await {
-            let Ok(batch) = batch else { continue };
-            for sample in batch {
-                if let Err(err) = fs::remove_file(&sample.path).await {
-                    warn!(
-                        error = format!("{err:#}"),
-                        path = %sample.path.display(),
-                        "failed to drain cache file"
-                    );
-                }
-            }
-        }
+        self.tasks.wait().await;
     }
 }
 
@@ -145,7 +142,7 @@ async fn read_sample(sample: PrefetchedSample) -> anyhow::Result<LoadedSample> {
 
 async fn load_batch(
     loader: &Arc<dyn Loader>,
-    cache_dir: &'static Path,
+    cache_dir: &Path,
     batch: Vec<Sample>,
 ) -> anyhow::Result<Option<PrefetchedBatch>> {
     debug!(samples = batch.len(), "loading batch");

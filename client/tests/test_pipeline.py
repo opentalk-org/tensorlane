@@ -9,6 +9,7 @@ import json
 import multiprocessing
 import os
 import re
+import signal
 from pathlib import Path
 import struct
 import subprocess
@@ -50,6 +51,8 @@ class Fixture(rpc.TensorLaneServicer):
         self.requests = []
         self.init_requests = []
         self.end_requests = []
+        self.end_gate = threading.Event()
+        self.end_gate.set()
         self.uploads_at_end = []
         self.fail_init = False
         self.returned_run_id = None
@@ -88,6 +91,7 @@ class Fixture(rpc.TensorLaneServicer):
 
     def End(self, request, context):
         self.end_requests.append(request)
+        self.end_gate.wait(20)
         self.uploads_at_end.append(
             (len(self.metrics), len(self.artifacts), len(self.checkpoints))
         )
@@ -884,6 +888,58 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(self.service.init_requests), 1)
         self.assertEqual(len(self.service.end_requests), 1)
         self.assertEqual(self.service.metrics, [])
+        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
+
+    def test_load_example_ctrl_c_finishes_run_and_workers(self):
+        self.service.count = 100_000
+        self.service.end_gate.clear()
+        example = Path(__file__).resolve().parents[1] / "examples" / "load_test.py"
+        output = Path(self.temp.name) / "load.log"
+        with output.open("w") as log:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(example),
+                    self.run_id,
+                    "--ranks",
+                    "2",
+                    "--workers",
+                    "2",
+                    "--addr",
+                    f"localhost:{self.service.port}",
+                    "--ipc-dir",
+                    "load-ipc",
+                ],
+                cwd=self.temp.name,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+            try:
+                deadline = time.monotonic() + 30
+                while " batch=" not in output.read_text():
+                    self.assertIsNone(process.poll(), output.read_text())
+                    self.assertLess(time.monotonic(), deadline, output.read_text())
+                    time.sleep(0.05)
+                os.killpg(process.pid, signal.SIGINT)
+                deadline = time.monotonic() + 15
+                while not self.service.end_requests:
+                    self.assertIsNone(process.poll(), output.read_text())
+                    self.assertLess(time.monotonic(), deadline, output.read_text())
+                    time.sleep(0.05)
+                os.killpg(process.pid, signal.SIGINT)
+                time.sleep(0.1)
+                self.assertIsNone(process.poll(), output.read_text())
+                self.service.end_gate.set()
+                self.assertEqual(process.wait(timeout=15), 130, output.read_text())
+            finally:
+                self.service.end_gate.set()
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        self.assertEqual(len(self.service.end_requests), 1)
+        self.assertIn("Workers stopped; run closed.", output.read_text())
+        self.assertNotIn("KeyboardInterrupt", output.read_text())
         self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
 
     def test_cpu_example_uses_custom_ipc_dir_for_every_rank(self):
