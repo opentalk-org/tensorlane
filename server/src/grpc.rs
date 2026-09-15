@@ -304,7 +304,7 @@ pub fn asset_stream(
 pub async fn receive_checkpoint(
     path: &Path,
     stream: &mut Streaming<CheckpointRequest>,
-) -> anyhow::Result<(u64, String)> {
+) -> anyhow::Result<(u64, [u8; 64])> {
     let part = path.with_extension("part");
     let mut file = fs::File::create(&part).await?;
     let mut bytes = 0;
@@ -321,7 +321,9 @@ pub async fn receive_checkpoint(
     }
     file.sync_all().await?;
     fs::rename(&part, &path).await?;
-    Ok((bytes, format!("{:x}", hasher.finalize())))
+    let mut hash_slice = [0u8; 64];
+    hex::encode_to_slice(hasher.finalize(), &mut hash_slice)?;
+    Ok((bytes, hash_slice))
 }
 
 pub async fn serve(
