@@ -67,9 +67,7 @@ impl TensorLane {
 
     async fn wait(&self) {
         self.shutdown.cancelled().await;
-        if let Err(err) = self.runs.drain_and_wait().await {
-            error!(error = format!("{err:#}"), "failed to await all runs");
-        }
+        self.runs.shutdown().await;
         info!("active runs finished");
     }
 }
