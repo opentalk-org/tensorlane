@@ -10,13 +10,16 @@ use tokio::{
     fs,
     io::AsyncWriteExt,
     sync::{
-        RwLock,
+        Mutex, RwLock,
         mpsc::{self, Sender},
         oneshot,
     },
     task::JoinHandle,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{
+    sync::CancellationToken,
+    task::{TaskTracker, task_tracker::TaskTrackerToken},
+};
 use tracing::{Instrument, debug, error, info, info_span};
 use uuid::Uuid;
 
@@ -195,6 +198,7 @@ impl RunState {
 #[derive(Clone)]
 pub struct RunExecutor {
     runs: Arc<RwLock<HashMap<Uuid, Run>>>,
+    lifecycle: Arc<Mutex<TaskTracker>>,
     repo: RunRepo,
     data_source: clickhouse::Client,
     loader: Arc<dyn Loader>,
@@ -207,6 +211,7 @@ pub struct Run {
     cancel: CancellationToken,
     handle: JoinHandle<()>,
     config: DataConfig,
+    _lifetime: TaskTrackerToken,
 }
 
 pub struct RunInitialization {
@@ -225,6 +230,7 @@ impl RunExecutor {
     ) -> Self {
         Self {
             runs: Default::default(),
+            lifecycle: Default::default(),
             repo,
             data_source,
             cache_dir: root_cache_dir,
@@ -239,6 +245,7 @@ impl RunExecutor {
 
     /// Starts a new run and returns its train config.
     pub async fn start(&self, id: Uuid) -> Result<RunInitialization> {
+        let lifetime = self.admit().await?;
         if self.runs.read().await.contains_key(&id) {
             bail!("run is already active");
         }
@@ -282,7 +289,11 @@ impl RunExecutor {
         let cancel = state.cancel_token.clone();
 
         let (tx, rx) = mpsc::channel(1);
-        let handle = tokio::spawn(state.handle_requests(rx));
+        let actor_lifetime = lifetime.clone();
+        let handle = tokio::spawn(async move {
+            let _lifetime = actor_lifetime;
+            state.handle_requests(rx).await;
+        });
 
         let mut runs = self.runs.write().await;
         runs.insert(
@@ -292,6 +303,7 @@ impl RunExecutor {
                 cancel,
                 handle,
                 config: run_record.data_config.clone(),
+                _lifetime: lifetime,
             },
         );
 
@@ -302,11 +314,16 @@ impl RunExecutor {
     }
 
     pub async fn next_batch(&self, id: Uuid, validation: bool) -> Result<Option<LoadedBatch>> {
-        let runs = self.runs.read().await;
-        let run = runs.get(&id).ok_or_else(|| anyhow!("unknown run"))?;
+        let sender = {
+            let runs = self.runs.read().await;
+            runs.get(&id)
+                .ok_or_else(|| anyhow!("unknown run"))?
+                .tx
+                .clone()
+        };
 
         let (tx, rx) = oneshot::channel();
-        run.tx
+        sender
             .send(BatchRequest {
                 validation,
                 reply: tx,
@@ -316,6 +333,7 @@ impl RunExecutor {
         rx.await?
     }
 
+    /// Finish a single run.
     pub async fn finish(&self, id: Uuid) -> Result<()> {
         let mut runs = self.runs.write().await;
         let Some(run) = runs.remove(&id) else {
@@ -362,17 +380,25 @@ impl RunExecutor {
         return runs.contains_key(&id);
     }
 
-    /// Awaits and removes all of the currently active runs.
-    pub async fn drain_and_wait(&self) -> Result<()> {
-        let mut runs = self.runs.write().await;
-
-        info!(runs = runs.len(), "waiting for active runs before shutdown");
-
-        for (_, run) in runs.drain() {
-            run.handle.await?;
+    async fn admit(&self) -> Result<TaskTrackerToken> {
+        let lifecycle = self.lifecycle.lock().await;
+        if lifecycle.is_closed() {
+            bail!("server is shutting down; new runs are not accepted");
         }
+        Ok(lifecycle.token())
+    }
 
-        Ok(())
+    pub async fn shutdown(&self) {
+        let lifecycle = {
+            let lifecycle = self.lifecycle.lock().await;
+            lifecycle.close();
+            lifecycle.clone()
+        };
+        info!(
+            pending = lifecycle.len(),
+            "waiting for active runs before shutdown"
+        );
+        lifecycle.wait().await;
     }
 }
 
