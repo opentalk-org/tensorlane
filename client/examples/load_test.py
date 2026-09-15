@@ -7,9 +7,8 @@ Consumption timing includes rank socket setup, but excludes process startup and 
 import argparse
 import multiprocessing
 from multiprocessing.connection import wait
+import signal
 import time
-
-import tensorlane
 
 
 def identity(wave):
@@ -17,6 +16,8 @@ def identity(wave):
 
 
 def consume(args, rank, barrier, results):
+    import tensorlane
+
     with tensorlane.init(
         args.run_id,
         identity,
@@ -45,6 +46,8 @@ def consume(args, rank, barrier, results):
 
 
 def main():
+    import tensorlane
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_id")
     parser.add_argument("--ranks", type=int, default=4)
@@ -94,7 +97,12 @@ def main():
                 for process in processes:
                     if process.is_alive():
                         process.terminate()
+                deadline = time.monotonic() + 5
+                for process in processes:
                     if process.pid is not None:
+                        process.join(max(0, deadline - time.monotonic()))
+                        if process.is_alive():
+                            process.kill()
                         process.join()
 
             for rank, batches, samples, begin, end in sorted(measurements):
@@ -118,5 +126,17 @@ def main():
         results.join_thread()
 
 
+def interrupt(signum, frame):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    raise KeyboardInterrupt
+
+
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, interrupt)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Workers stopped; run closed.", flush=True)
+        raise SystemExit(130)
+elif __name__ == "__mp_main__":
+    signal.signal(signal.SIGINT, signal.SIG_IGN)

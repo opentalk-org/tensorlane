@@ -1,36 +1,42 @@
 use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::grpc_support::{self, ActiveRuns, AssetStore};
-use crate::loader::{Loader, S3Loader};
-use crate::metrics;
+use crate::loader::S3Loader;
 use crate::proto::{
     AssetRequest, AssetResponse, CheckpointRequest, CheckpointResponse, DataRequest, DataResponse,
     EndRequest, EndResponse, InitRequest, InitResponse, MetricsRequest, MetricsResponse,
     checkpoint_request, metrics_request,
     tensor_lane_server::{TensorLane as TensorLaneService, TensorLaneServer},
 };
-use crate::run_repo::{RunRepo, RunStatus};
+use crate::proto::{Split, asset_response};
+use crate::run::RunExecutor;
+use crate::run_repo::RunRepo;
 use crate::uploads::UploadStore;
+use crate::{metrics, proto};
+use bytes::BytesMut;
 use clickhouse::Client;
 use futures::Stream;
-use tokio::sync::mpsc;
+use sha2::{Digest, Sha256};
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info};
+use uuid::Uuid;
 
+const ASSET_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone)]
 struct TensorLane {
     database: Client,
-    run_repo: RunRepo,
-    loader: Arc<dyn Loader>,
-    assets: AssetStore,
-    cache_dir: &'static Path,
     uploads: UploadStore,
-    active_runs: ActiveRuns,
+    shutdown: CancellationToken,
+    runs: RunExecutor,
 }
 
 impl TensorLane {
@@ -40,48 +46,55 @@ impl TensorLane {
         run_repo: RunRepo,
         bucket: &'static str,
         cache_dir: &'static Path,
-        assets_cache_dir: &'static Path,
         uploads: UploadStore,
+        shutdown: CancellationToken,
     ) -> Self {
-        let loader = Arc::new(S3Loader::new(s3_client.clone(), bucket));
-        Self {
-            active_runs: Default::default(),
-            loader,
-            assets: AssetStore::new(s3_client, bucket, assets_cache_dir),
+        let runs = RunExecutor::new(
+            run_repo.clone(),
+            database.clone(),
+            Arc::new(S3Loader::new(s3_client.clone(), bucket)),
             cache_dir,
+            s3_client,
+            bucket,
+        );
+        Self {
+            runs,
             uploads,
             database,
-            run_repo,
+            shutdown,
         }
+    }
+
+    async fn wait(&self) {
+        self.shutdown.cancelled().await;
+        if let Err(err) = self.runs.drain_and_wait().await {
+            error!(error = format!("{err:#}"), "failed to await all runs");
+        }
+        info!("active runs finished");
     }
 }
 
 #[tonic::async_trait]
 impl TensorLaneService for TensorLane {
     async fn init(&self, request: Request<InitRequest>) -> Result<Response<InitResponse>, Status> {
-        let run_id = grpc_support::parse_run_id(&request.into_inner().run_id)?;
+        if self.shutdown.is_cancelled() {
+            return Err(Status::unavailable(
+                "server is shutting down; new runs are not accepted",
+            ));
+        }
+        let run_id = parse_run_id(&request.into_inner().run_id)?;
         debug!(run = %run_id, "init request");
-        let initialized = grpc_support::initialize(
-            run_id,
-            &self.run_repo,
-            &self.assets,
-            &self.database,
-            self.loader.clone(),
-            self.cache_dir,
-        )
-        .await?;
-        let mut assets: Vec<_> = initialized.active.config.assets.keys().cloned().collect();
-        assets.sort();
-        self.active_runs
-            .write()
+        let init = self
+            .runs
+            .start(run_id)
             .await
-            .insert(run_id, initialized.active);
+            .map_err(|err| Status::internal(format!("{err:#}")))?;
         info!(run = %run_id, "run initialized");
 
         Ok(Response::new(InitResponse {
             run_id: run_id.to_string(),
-            train_config: initialized.train_config,
-            assets,
+            train_config: init.train_config,
+            assets: init.assets,
         }))
     }
 
@@ -95,11 +108,9 @@ impl TensorLaneService for TensorLane {
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         tokio::spawn({
-            let active_runs = self.active_runs.clone();
+            let runs = self.runs.clone();
             async move {
-                if let Err(err) =
-                    grpc_support::data_handler(active_runs, &mut stream, &out_tx).await
-                {
+                if let Err(err) = data_handler(runs, &mut stream, &out_tx).await {
                     error!(error = format!("{err:#}"), "data stream failed");
                     let _ = out_tx.send(Err(Status::internal(format!("{err:#}"))));
                 }
@@ -116,31 +127,13 @@ impl TensorLaneService for TensorLane {
         request: Request<AssetRequest>,
     ) -> Result<Response<Self::AssetStream>, Status> {
         let request = request.into_inner();
-        let run_id = grpc_support::parse_run_id(&request.run_id)?;
-        let active = self
-            .active_runs
-            .read()
+        let run_id = parse_run_id(&request.run_id)?;
+        let (path, entrypoint) = self
+            .runs
+            .asset(run_id, &request.name)
             .await
-            .get(&run_id)
-            .cloned()
-            .ok_or_else(|| Status::not_found("unknown run"))?;
-        let asset = active
-            .config
-            .assets
-            .get(&request.name)
-            .ok_or_else(|| Status::not_found(format!("unknown asset {:?}", request.name)))?;
-        info!(run = %run_id, asset = %request.name, "asset requested");
-
-        let path = self
-            .assets
-            .ensure(run_id, &request.name, &asset.object)
-            .await
-            .map_err(|err| {
-                error!(error = format!("{err:#}"), asset = %request.name, "asset fetch failed");
-                Status::internal(format!("{err:#}"))
-            })?;
-        let entrypoint = asset.entrypoint.clone();
-        Ok(Response::new(grpc_support::asset_stream(path, entrypoint)))
+            .map_err(|err| Status::internal(format!("{err:#}")))?;
+        Ok(Response::new(asset_stream(path, entrypoint)))
     }
 
     async fn checkpoint(
@@ -157,21 +150,17 @@ impl TensorLaneService for TensorLane {
                 ));
             }
         };
-        let run_id = grpc_support::parse_run_id(&metadata.run_id)?;
+        let run_id = parse_run_id(&metadata.run_id)?;
         let asset_type = self
-            .active_runs
-            .read()
+            .runs
+            .asset_type(run_id)
             .await
-            .get(&run_id)
-            .ok_or_else(|| Status::not_found("unknown run"))?
-            .config
-            .asset_type
-            .clone();
+            .map_err(|err| Status::internal(format!("{err:#}")))?;
         info!(run = %run_id, step = metadata.step, "receiving checkpoint");
 
         let checkpoint_id = uuid::Uuid::new_v4();
         let path = self.uploads.staging_path(checkpoint_id);
-        let result = grpc_support::receive_checkpoint(&path, &mut stream).await;
+        let result = receive_checkpoint(&path, &mut stream).await;
 
         match result {
             Ok((bytes, content_hash)) => {
@@ -213,8 +202,8 @@ impl TensorLaneService for TensorLane {
                 ));
             }
         };
-        let run_id = grpc_support::parse_run_id(&metadata.run_id)?;
-        if !self.active_runs.read().await.contains_key(&run_id) {
+        let run_id = parse_run_id(&metadata.run_id)?;
+        if !self.runs.is_running(run_id).await {
             return Err(Status::not_found("unknown run"));
         }
         info!(run = %run_id, "receiving metrics");
@@ -243,24 +232,96 @@ impl TensorLaneService for TensorLane {
     }
 
     async fn end(&self, request: Request<EndRequest>) -> Result<Response<EndResponse>, Status> {
-        let run_id = grpc_support::parse_run_id(&request.into_inner().run_id)?;
+        let run_id = parse_run_id(&request.into_inner().run_id)?;
         info!(run = %run_id, "ending run");
-        let removed = self.active_runs.write().await.remove(&run_id);
-
-        match removed {
-            None => return Err(Status::not_found("unknown run")),
-            Some(active) => active.handle.finish().await,
-        }
-        self.run_repo
-            .append_status(run_id, RunStatus::Succeeded)
+        self.runs
+            .finish(run_id)
             .await
-            .map_err(|err| {
-                error!(run = %run_id, error = format!("{err:#}"), "finishing run failed");
-                Status::internal(format!("{err:#}"))
-            })?;
+            .map_err(|err| Status::internal(format!("{err:#}")))?;
 
         Ok(Response::new(EndResponse {}))
     }
+}
+
+pub fn parse_run_id(value: &str) -> Result<Uuid, Status> {
+    Uuid::parse_str(value).map_err(|_| Status::invalid_argument("invalid run ID"))
+}
+
+pub async fn data_handler(
+    runs: RunExecutor,
+    req_stream: &mut Streaming<DataRequest>,
+    resp_stream: &UnboundedSender<Result<DataResponse, Status>>,
+) -> anyhow::Result<()> {
+    while let Some(req) = req_stream.message().await? {
+        let run_id = parse_run_id(&req.run_id)?;
+        debug!(run = %run_id, split = ?req.split(), "data request");
+        let Some(loaded_batch) = runs
+            .next_batch(run_id, req.split() == Split::Validation)
+            .await?
+        else {
+            debug!(run = %run_id, split = ?req.split(), "data stream exhausted");
+            return Ok(());
+        };
+        let batch = loaded_batch.into_iter().map(proto::Sample::from).collect();
+        resp_stream.send(Ok(DataResponse { batch }))?;
+    }
+    Ok(())
+}
+
+pub fn asset_stream(
+    path: PathBuf,
+    entrypoint: Option<String>,
+) -> Pin<Box<dyn Stream<Item = Result<AssetResponse, Status>> + Send>> {
+    Box::pin(async_stream::stream! {
+        yield Ok(AssetResponse {
+            payload: Some(asset_response::Payload::Metadata(proto::AssetMetadata {
+                entrypoint,
+            })),
+        });
+        let mut file = match fs::File::open(&path).await {
+            Ok(file) => file,
+            Err(err) => {
+                yield Err(Status::internal(format!("{err:#}")));
+                return;
+            }
+        };
+        loop {
+            let mut buf = BytesMut::with_capacity(ASSET_CHUNK_BYTES);
+            match file.read_buf(&mut buf).await {
+                Ok(0) => break,
+                Ok(_) => yield Ok(AssetResponse {
+                    payload: Some(asset_response::Payload::Chunk(buf.freeze())),
+                }),
+                Err(err) => {
+                    yield Err(Status::internal(format!("{err:#}")));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+pub async fn receive_checkpoint(
+    path: &Path,
+    stream: &mut Streaming<CheckpointRequest>,
+) -> anyhow::Result<(u64, String)> {
+    let part = path.with_extension("part");
+    let mut file = fs::File::create(&part).await?;
+    let mut bytes = 0;
+    let mut hasher = Sha256::new();
+    while let Some(request) = stream.message().await? {
+        match request.payload {
+            Some(checkpoint_request::Payload::Chunk(chunk)) => {
+                bytes += chunk.len() as u64;
+                hasher.update(&chunk);
+                file.write_all(&chunk).await?;
+            }
+            _ => anyhow::bail!("expected checkpoint chunks after the metadata"),
+        }
+    }
+    file.sync_all().await?;
+    fs::rename(&part, &path).await?;
+    Ok((bytes, format!("{:x}", hasher.finalize())))
 }
 
 pub async fn serve(
@@ -270,7 +331,6 @@ pub async fn serve(
     run_repo: RunRepo,
     bucket: &'static str,
     cache_dir: &'static Path,
-    assets_cache_dir: &'static Path,
     uploads_dir: &'static Path,
     checkpoint_prefix: &'static str,
     metrics_prefix: &'static str,
@@ -286,19 +346,20 @@ pub async fn serve(
         metrics_prefix,
         uploads_dir,
     )?;
+    let service = TensorLane::new(
+        s3_client,
+        database,
+        run_repo,
+        bucket,
+        cache_dir,
+        uploads.clone(),
+        shutdown,
+    );
     let result = Server::builder()
-        .add_service(TensorLaneServer::new(TensorLane::new(
-            s3_client,
-            database,
-            run_repo,
-            bucket,
-            cache_dir,
-            assets_cache_dir,
-            uploads.clone(),
-        )))
+        .add_service(TensorLaneServer::new(service.clone()))
         .serve_with_shutdown(
             SocketAddr::from((Ipv4Addr::new(0, 0, 0, 0), port)),
-            shutdown.cancelled_owned(),
+            service.wait(),
         )
         .await;
 

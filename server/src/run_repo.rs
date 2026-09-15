@@ -1,3 +1,5 @@
+use anyhow::Result;
+use error_context::error_context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
@@ -118,7 +120,7 @@ impl RunRepo {
         name: &str,
         data_config: &DataConfig,
         train_config: &Map<String, Value>,
-    ) -> anyhow::Result<Uuid> {
+    ) -> Result<Uuid> {
         let row = RunConfigRow {
             id: Uuid::new_v4(),
             project_id,
@@ -133,11 +135,11 @@ impl RunRepo {
         Ok(row.id)
     }
 
-    pub async fn get(&self, id: Uuid) -> anyhow::Result<Option<Run>> {
+    pub async fn get(&self, id: Uuid) -> Result<Option<Run>> {
         self.current(id).await?.map(Run::try_from).transpose()
     }
 
-    pub async fn list(&self) -> anyhow::Result<Vec<Run>> {
+    pub async fn list(&self) -> Result<Vec<Run>> {
         self.client
             .query(&format!("{SELECT_RUNS} order by project_id, id"))
             .fetch_all::<RunRow>()
@@ -147,7 +149,7 @@ impl RunRepo {
             .collect()
     }
 
-    async fn current(&self, id: Uuid) -> anyhow::Result<Option<RunRow>> {
+    async fn current(&self, id: Uuid) -> Result<Option<RunRow>> {
         self.client
             .query(&format!("{SELECT_RUNS} where id = ?"))
             .bind(id.to_string())
@@ -156,7 +158,8 @@ impl RunRepo {
             .map_err(Into::into)
     }
 
-    pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> anyhow::Result<()> {
+    #[error_context("failed to append a run status")]
+    pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> Result<()> {
         let row = StatusRow {
             timestamp: OffsetDateTime::now_utc(),
             run_id,
