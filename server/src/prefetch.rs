@@ -1,12 +1,17 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
-use tokio::{fs, sync::mpsc};
+use tokio::{
+    fs,
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    time::{Instant, MissedTickBehavior, interval_at},
+};
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
-use tracing::{Instrument, debug, error};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     loader::Loader,
@@ -42,10 +47,11 @@ impl From<LoadedSample> for crate::proto::Sample {
     }
 }
 
-const CACHED_BATCHES: usize = 5;
+const CACHED_BATCHES: usize = 20;
+const CACHE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct Prefetcher {
-    rx: mpsc::Receiver<anyhow::Result<PrefetchedBatch>>,
+    rx: mpsc::UnboundedReceiver<(anyhow::Result<PrefetchedBatch>, OwnedSemaphorePermit)>,
     cancel_token: CancellationToken,
     tasks: TaskTracker,
 }
@@ -58,15 +64,27 @@ impl Prefetcher {
         cancel_token: CancellationToken,
         span: tracing::Span,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(CACHED_BATCHES);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let slots = Arc::new(Semaphore::new(CACHED_BATCHES));
 
         let tasks = TaskTracker::new();
         let cancel_token = cancel_token.child_token();
         tasks.spawn({
             let cancel_token = cancel_token.clone();
+            let cache_dir = cache_dir.clone();
+            let slots = slots.clone();
+            log_cache(cancel_token, cache_dir, slots)
+        });
+        tasks.spawn({
+            let cancel_token = cancel_token.clone();
             async move {
                 'outer: loop {
-                    let permit = match tx.reserve().with_cancellation_token(&cancel_token).await {
+                    let permit = match slots
+                        .clone()
+                        .acquire_owned()
+                        .with_cancellation_token(&cancel_token)
+                        .await
+                    {
                         Some(Err(_)) | None => break,
                         Some(Ok(permit)) => permit,
                     };
@@ -96,7 +114,9 @@ impl Prefetcher {
                             }
                         }
                     };
-                    permit.send(result);
+                    if tx.send((result, permit)).is_err() {
+                        break;
+                    }
                 }
                 debug!("prefetcher stopped");
             }
@@ -112,9 +132,11 @@ impl Prefetcher {
 
     pub async fn next_batch(&mut self) -> anyhow::Result<Option<LoadedBatch>> {
         match self.rx.recv().await {
-            Some(batch) => futures::future::try_join_all(batch?.into_iter().map(read_sample))
-                .await
-                .map(Some),
+            Some((batch, _permit)) => {
+                futures::future::try_join_all(batch?.into_iter().map(read_sample))
+                    .await
+                    .map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -124,6 +146,52 @@ impl Prefetcher {
         self.tasks.close();
         self.cancel_token.cancel();
         self.tasks.wait().await;
+    }
+}
+
+async fn cache_bytes(cache_dir: &Path) -> std::io::Result<u64> {
+    let mut entries = fs::read_dir(cache_dir).await?;
+    let mut bytes = 0;
+    while let Some(entry) = entries.next_entry().await? {
+        match entry.metadata().await {
+            Ok(metadata) if metadata.is_file() => bytes += metadata.len(),
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(bytes)
+}
+
+async fn log_cache(cancel_token: CancellationToken, cache_dir: PathBuf, slots: Arc<Semaphore>) {
+    let mut interval = interval_at(Instant::now() + CACHE_LOG_INTERVAL, CACHE_LOG_INTERVAL);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        if interval
+            .tick()
+            .with_cancellation_token(&cancel_token)
+            .await
+            .is_none()
+        {
+            break;
+        }
+        match cache_bytes(&cache_dir)
+            .with_cancellation_token(&cancel_token)
+            .await
+        {
+            None => break,
+            Some(Ok(cached_bytes)) => info!(
+                cached_bytes,
+                cached_batches = CACHED_BATCHES - slots.available_permits(),
+                cache_dir = %cache_dir.display(),
+                "prefetch cache usage"
+            ),
+            Some(Err(err)) => warn!(
+                error = format!("{err:#}"),
+                cache_dir = %cache_dir.display(),
+                "failed to measure prefetch cache"
+            ),
+        }
     }
 }
 
