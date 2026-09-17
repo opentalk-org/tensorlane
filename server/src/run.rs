@@ -5,7 +5,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
     io::AsyncWriteExt,
@@ -20,185 +19,19 @@ use tokio_util::{
     sync::CancellationToken,
     task::{TaskTracker, task_tracker::TaskTrackerToken},
 };
-use tracing::{Instrument, debug, error, info, info_span};
+use tracing::{Instrument, info, info_span};
 use uuid::Uuid;
 
 use crate::{
-    db::{fetch_training_samples, fetch_validation_samples},
     loader::Loader,
-    prefetch::{LoadedBatch, Prefetcher},
+    prefetch::LoadedBatch,
     run_repo::{RunRepo, RunStatus},
-    sampling::{HistogramSampler, Sampler, ScheduledSampler, bins_from_rows},
 };
 
-#[derive(Clone, Deserialize, Serialize)]
-pub struct DataConfig {
-    pub dataset_id: Uuid,
-    pub asset_type: String,
-    pub seed: u64,
-    pub max_text_tokens: i32,
-    #[serde(default)]
-    pub plbert_languages: Vec<String>,
-    /// Asset names are the contract with the training side.
-    #[serde(default)]
-    pub assets: std::collections::HashMap<String, AssetConfig>,
-    pub validation: ValidationConfig,
-    pub training: Vec<SequenceConfig>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct AssetConfig {
-    pub object: String,
-    pub entrypoint: Option<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct ValidationConfig {
-    pub samples: i64,
-    pub max_seconds: f32,
-}
-
-#[derive(Clone, Deserialize, Serialize)]
-pub struct SequenceConfig {
-    pub batches: u64,
-    pub max_seconds: f32,
-}
-
-impl DataConfig {
-    pub fn training_max_seconds(&self) -> f32 {
-        self.training
-            .iter()
-            .map(|s| s.max_seconds)
-            .fold(0.0, f32::max)
-    }
-}
-
-pub struct RunState {
-    pub id: Uuid,
-    cancel_token: CancellationToken,
-    validation_batches: Prefetcher,
-    training_batches: Prefetcher,
-    run_cache_dir: PathBuf,
-}
-
-struct BatchRequest {
-    validation: bool,
-    reply: oneshot::Sender<Result<Option<LoadedBatch>>>,
-}
-
-impl RunState {
-    pub async fn new(
-        id: Uuid,
-        database: &clickhouse::Client,
-        loader: Arc<dyn Loader>,
-        cache_dir: &Path,
-        config: &DataConfig,
-    ) -> Result<Self> {
-        info!(run = %id, dataset = %config.dataset_id, "initializing run");
-
-        let validation_rows = fetch_validation_samples(database, config).await?;
-        info!(
-            rows = validation_rows.len(),
-            requested = config.validation.samples,
-            "fetched validation rows"
-        );
-
-        let validation_ids: Vec<Uuid> = validation_rows.iter().map(|r| r.audio_id).collect();
-
-        let training_rows = fetch_training_samples(database, &validation_ids, config).await?;
-        info!(rows = training_rows.len(), "fetched training rows");
-
-        let validation_bins = bins_from_rows(validation_rows, &config.plbert_languages)?;
-        let training_bins = bins_from_rows(training_rows, &config.plbert_languages)?;
-
-        // validation is one endlessly-looping set, so the plain histogram
-        // sampler serves it; training follows the batch schedule
-        let validation_sampler: Box<dyn Sampler> = Box::new(HistogramSampler::new(
-            validation_bins,
-            config.validation.max_seconds as f64,
-            config.seed,
-        ));
-        let training_sampler: Box<dyn Sampler> = Box::new(ScheduledSampler::new(
-            training_bins,
-            &config.training,
-            config.seed,
-        ));
-
-        let cache_dir = cache_dir.join(id.to_string());
-        let training_dir = cache_dir.join("data/training");
-        let validation_dir = cache_dir.join("data/validation");
-        fs::create_dir_all(&training_dir).await?;
-        fs::create_dir_all(&validation_dir).await?;
-        let cancel_token = CancellationToken::new();
-        let training_batches = Prefetcher::spawn(
-            training_sampler,
-            loader.clone(),
-            training_dir,
-            cancel_token.clone(),
-            info_span!("prefetcher", run = %id, split = "training"),
-        );
-        let validation_batches = Prefetcher::spawn(
-            validation_sampler,
-            loader,
-            validation_dir,
-            cancel_token.clone(),
-            info_span!("prefetcher", run = %id, split = "validation"),
-        );
-
-        Ok(RunState {
-            id,
-            cancel_token,
-            training_batches,
-            validation_batches,
-            run_cache_dir: cache_dir,
-        })
-    }
-
-    pub async fn next_batch(&mut self, validation: bool) -> Result<Option<LoadedBatch>> {
-        let batches = if validation {
-            &mut self.validation_batches
-        } else {
-            &mut self.training_batches
-        };
-        batches.next_batch().await
-    }
-
-    async fn handle_requests(mut self, mut rx: mpsc::Receiver<BatchRequest>) {
-        loop {
-            let BatchRequest { validation, reply } = tokio::select! {
-                biased;
-                () = self.cancel_token.cancelled() => break,
-                req = rx.recv() => match req {
-                    Some(req) => req,
-                    None => break,
-                },
-            };
-            let cancel_token = self.cancel_token.clone();
-            let batch = tokio::select! {
-                biased;
-                () = cancel_token.cancelled() => break,
-                batch = self.next_batch(validation) => batch,
-            };
-            let _ = reply.send(batch);
-        }
-
-        self.finish().await;
-    }
-
-    async fn finish(self) {
-        self.cancel_token.cancel();
-        tokio::join!(
-            self.validation_batches.finish(),
-            self.training_batches.finish(),
-        );
-        if let Err(err) = fs::remove_dir_all(&self.run_cache_dir).await
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            error!(run = %self.id, error = %err, path = %self.run_cache_dir.display(), "removing run cache failed");
-        }
-        debug!("run finished");
-    }
-}
+mod config;
+mod state;
+pub use config::DataConfig;
+use state::{BatchRequest, RunState};
 
 #[derive(Clone)]
 pub struct RunExecutor {

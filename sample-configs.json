@@ -17,7 +17,7 @@
       },
       {
         "batches": 20,
-        "max_seconds": 30
+        "max_seconds": 150
       },
       {
         "batches": 20,

@@ -6,7 +6,7 @@ use std::{
 use bytes::Bytes;
 use tokio::{fs, sync::mpsc};
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
-use tracing::{Instrument, debug, error};
+use tracing::{Instrument, debug, warn};
 
 use crate::{
     loader::Loader,
@@ -84,15 +84,18 @@ impl Prefetcher {
                                 debug!("schedule exhausted");
                                 break 'outer;
                             }
-                            Err(err) => Err(err),
+                            Err(err) => break Err(err),
                         };
 
                         match loaded {
-                            Ok(None) => continue,
+                            Ok(None) => {
+                                warn!("batch loading failed, skipping batch");
+                                continue;
+                            }
                             Ok(Some(batch)) => break Ok(batch),
                             Err(err) => {
-                                error!(error = format!("{err:#}"), "prefetching batch failed");
-                                break Err(err);
+                                warn!(error = format!("{err:#}"), "batch loading failed, skipping batch");
+                                continue;
                             }
                         }
                     };

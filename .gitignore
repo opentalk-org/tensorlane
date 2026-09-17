@@ -1,12 +1,37 @@
+# Local environment and caches
 .direnv/
-target/
 .dnvr/
 .envrc
 .env
+.env.*
+!.env.example
+!.env.template
+.venv/
 .cache/
 .client-cache/
 .tensorlane/
+
+# Rust and Python build outputs
+target/
+/build/
+/dist/
+*.egg-info/
 __pycache__/
-*.pyc
+*.py[cod]
 /client/tensorlane/_native*.so
 /client/tensorlane/_native*.pyd
+
+# Test and tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Generated plots and benchmark results
+/plots/
+/reports/
+
+# macOS metadata
+.DS_Store
