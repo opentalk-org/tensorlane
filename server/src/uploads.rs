@@ -109,9 +109,9 @@ impl UploadStore {
         &self,
         record: &crate::asset_repo::AssetRecord,
         local_path: &Path,
+        content_type: &str,
     ) -> anyhow::Result<()> {
-        self.upload(local_path, &record.path, "application/x-tar")
-            .await?;
+        self.upload(local_path, &record.path, content_type).await?;
         let mut insert = self
             .database
             .insert::<crate::asset_repo::AssetRecord>("assets")
@@ -133,7 +133,7 @@ impl UploadStore {
     ) -> anyhow::Result<()> {
         let local_path = self.staging_path(id);
         let key = format!("{}/{}", self.metrics_prefix, id);
-        self.upload(&local_path, &key, "application/x-tar").await?;
+        self.upload(&local_path, &key, &content_type).await?;
         let row = ArtifactRecord {
             id,
             run_id,

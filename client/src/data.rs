@@ -20,6 +20,7 @@ pub enum Work {
         stream: String,
         batch: (u64, usize),
         query_batch_idx: u64,
+        timings: [f64; 3],
         index: usize,
         sample_id: String,
         metadata_json: String,
@@ -88,7 +89,16 @@ pub async fn prefetch(
     .context("opening Data stream timed out")??
     .into_inner();
     let mut expected_id = 0;
-    while let Some(response) = stream.message().await.context("receiving data batch")? {
+    loop {
+        let started = std::time::Instant::now();
+        let Some(response) = stream.message().await.context("receiving data batch")? else {
+            break;
+        };
+        let timings = [
+            response.load_seconds,
+            response.server_wait_seconds,
+            started.elapsed().as_secs_f64(),
+        ];
         ensure!(
             response.stream == stream_name && response.batch_id == expected_id,
             "unexpected stream or batch ID"
@@ -100,6 +110,7 @@ pub async fn prefetch(
                 stream: stream_name.clone(),
                 batch: (response.batch_id, batch_size),
                 query_batch_idx: response.query_batch_idx,
+                timings,
                 index,
                 sample_id: sample.sample_id,
                 metadata_json: sample.metadata_json,

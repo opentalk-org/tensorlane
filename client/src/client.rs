@@ -168,6 +168,7 @@ impl Listener {
                 stream,
                 batch,
                 query_batch_idx,
+                timings,
                 index,
                 sample_id,
                 metadata_json,
@@ -177,6 +178,7 @@ impl Listener {
                 object.set_item("stream", stream)?;
                 object.set_item("batch", batch)?;
                 object.set_item("query_batch_idx", query_batch_idx)?;
+                object.set_item("timings", timings)?;
                 object.set_item("index", index)?;
                 object.set_item("sample_id", sample_id)?;
                 object.set_item("metadata_json", metadata_json)?;

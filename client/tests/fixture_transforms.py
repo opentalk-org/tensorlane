@@ -39,3 +39,8 @@ def identify_worker(sample):
 
 def invalid(sample):
     return object()
+
+
+def timed_transform(sample):
+    time.sleep(0.01)
+    return transform(sample)

@@ -33,7 +33,12 @@ struct Artifact {
     size_bytes: u64,
 }
 
-async fn assert_object(env: &TestEnv, key: &str, expected: &Bytes) -> Result<()> {
+async fn assert_object(
+    env: &TestEnv,
+    key: &str,
+    expected: &Bytes,
+    content_type: &str,
+) -> Result<()> {
     let head = env
         .s3
         .head_object()
@@ -42,7 +47,7 @@ async fn assert_object(env: &TestEnv, key: &str, expected: &Bytes) -> Result<()>
         .send()
         .await?;
     assert_eq!(head.content_length(), Some(expected.len() as i64));
-    assert_eq!(head.content_type(), Some("application/x-tar"));
+    assert_eq!(head.content_type(), Some(content_type));
     let downloaded = env.object(key).await?;
     assert_eq!(Sha256::digest(&downloaded), Sha256::digest(expected));
     assert_eq!(&downloaded, expected);
@@ -75,7 +80,7 @@ async fn multipart_checkpoint_matches_s3_and_clickhouse_metadata() -> Result<()>
     assert_eq!(row.asset_type, "custom-model-type");
     assert_eq!(row.kind, "checkpoint");
     assert_eq!(row.name, "model");
-    assert_object(&env, &row.path, &archive).await?;
+    assert_object(&env, &row.path, &archive, "application/x-tar").await?;
     let head = env
         .s3
         .head_object()
@@ -107,7 +112,7 @@ async fn metric_artifact_matches_s3_and_clickhouse_metadata() -> Result<()> {
     let dataset = env.seed_dataset(2).await?;
     let run = env.create_run(run_config(dataset, 1)).await?;
     env.init_run(&run).await?;
-    let archive = tar_file("validation/results.bin", &[37; 1024 * 1024 + 19])?;
+    let archive = Bytes::from(vec![37; 1024 * 1024 + 19]);
     let stream = env.metrics_stream(&run).await?;
     stream
         .artifact(
@@ -130,7 +135,7 @@ async fn metric_artifact_matches_s3_and_clickhouse_metadata() -> Result<()> {
     assert_eq!(row.path, format!("metrics/{}", row.id));
     assert_eq!(row.content_type, "application/octet-stream");
     assert_eq!(row.size_bytes, archive.len() as u64);
-    assert_object(&env, &row.path, &archive).await?;
+    assert_object(&env, &row.path, &archive, "application/octet-stream").await?;
     eventually("artifact staging cleanup", || async {
         Ok(crate::setup::files(&env.cache_dir.join("uploads"))?
             .is_empty()

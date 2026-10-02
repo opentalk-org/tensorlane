@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import errno
 import fcntl
 import json
+import mimetypes
 import os
 from pathlib import Path
 import socket
@@ -17,6 +19,16 @@ import torch.multiprocessing as multiprocessing
 
 from . import _native
 from .data import Batch
+from ._performance import Performance
+
+
+def _content_type(path):
+    suffix = Path(path).suffix.lower()
+    if suffix in {".pt", ".pth", ".ckpt", ".safetensors"}:
+        return "application/octet-stream"
+    if suffix == ".wav":
+        return "audio/wav"
+    return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
 
 def _root(run_id: str, ipc_dir: str | Path | None) -> Path:
@@ -51,6 +63,7 @@ class TensorLane:
         ranks: int = 1,
         num_workers: int = 5,
         prefetch_factor: int = 2,
+        performance_metrics: bool = True,
     ) -> None:
         self._root = root
         self.run_id = run_id
@@ -71,6 +84,8 @@ class TensorLane:
         self._stopped = None
         self._monitor = None
         self._uploads = None
+        self._performance = None
+        self._performance_enabled = performance_metrics
 
     @property
     def rank(self) -> int:
@@ -106,8 +121,16 @@ class TensorLane:
         if stream not in self.streams:
             raise ValueError(f"unknown stream: {stream}")
         return BatchReader(
-            self._root, self._rank, timeout, self._check, self.streams.index(stream)
+            self._root, self._rank, timeout, self._check, self.streams.index(stream),
+            stream, self._performance_collector()
         )
+
+    def _performance_collector(self):
+        if self._closed:
+            raise RuntimeError("TensorLane handle is closed")
+        if self._performance is None and self._performance_enabled:
+            self._performance = Performance(self._root, self._rank)
+        return self._performance
 
     def asset(self, name: str) -> Path:
         if self._closed:
@@ -120,13 +143,25 @@ class TensorLane:
         self._closed = True
         try:
             if self._uploads is not None:
-                self._uploads.close()
+                started = time.monotonic()
+                try:
+                    self._uploads.close()
+                finally:
+                    if self._performance is not None:
+                        self._performance.event("uploads/flush_seconds", time.monotonic() - started)
         except BaseException as error:
             self._fail(error)
             raise
         finally:
             self._uploads = None
-            self._close_daemon()
+            try:
+                if self._performance is not None:
+                    self._performance.close()
+            finally:
+                self._close_daemon()
+
+    async def close_async(self) -> None:
+        await asyncio.to_thread(self.close)
 
     def _close_daemon(self) -> None:
         if self._native is None:
@@ -171,10 +206,12 @@ class TensorLane:
         step: int,
         path: str | Path,
         name: str,
-        content_type: str = "application/octet-stream",
+        content_type: str | None = None,
     ) -> None:
+        self._performance_collector()
         self._upload_client().metric_artifact(
-            step, Path(path).absolute(), name, content_type
+            step, Path(path).absolute(), name,
+            content_type or _content_type(path)
         )
 
     def save_asset(
@@ -189,6 +226,7 @@ class TensorLane:
     ) -> str:
         if metadata is not None and not isinstance(metadata, dict):
             raise TypeError("asset metadata must be an object")
+        self._performance_collector()
         return self._upload_client().save_asset(
             name,
             Path(path).absolute(),
@@ -196,13 +234,24 @@ class TensorLane:
             kind,
             asset_type,
             json.dumps(metadata or {}, allow_nan=False),
+            _content_type(path),
         )
 
-    def flush(self, *, timeout: float = 300) -> None:
+    def flush(self, *, timeout: float | None = None) -> None:
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
         if self._uploads is not None:
-            self._uploads.flush(timeout)
+            started = time.monotonic()
+            try:
+                self._uploads.flush(timeout)
+            finally:
+                if self._performance is not None:
+                    self._performance.event("uploads/flush_seconds", time.monotonic() - started)
+        if self._performance is not None:
+            self._performance.flush()
+
+    async def flush_async(self, *, timeout: float | None = None) -> None:
+        await asyncio.to_thread(self.flush, timeout=timeout)
 
     def __enter__(self) -> TensorLane:
         return self
@@ -242,7 +291,8 @@ def init(
     collate_fn=None,
     addr: str | None = None,
     ipc_dir: str | Path | None = None,
-    timeout: float = 120,
+    timeout: float | None = None,
+    performance_metrics: bool = True,
 ) -> TensorLane:
     run_id = run_id or os.environ.get("TENSORLANE_RUN_ID")
     if not isinstance(run_id, str) or not run_id:
@@ -262,14 +312,14 @@ def init(
             raise ValueError(f"{name} must be a positive integer")
     if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
         raise ValueError("rank must be a nonnegative integer")
-    if timeout <= 0:
+    if timeout is not None and timeout <= 0:
         raise ValueError("timeout must be positive")
     root = _root(run_id, ipc_dir)
     if not start_daemon:
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         metadata_path = root / "init.json"
         while not metadata_path.exists():
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"TensorLane init did not become ready for run {run_id!r}"
                 )
@@ -291,6 +341,7 @@ def init(
             ranks=metadata["ranks"],
             num_workers=metadata["num_workers"],
             prefetch_factor=metadata["prefetch_factor"],
+            performance_metrics=performance_metrics,
         )
 
     if ranks is not None and rank >= ranks:
@@ -321,6 +372,7 @@ def init(
         ranks=native.ranks,
         num_workers=native.num_workers,
         prefetch_factor=native.prefetch_factor,
+        performance_metrics=performance_metrics,
     )
 
     ranks = daemon.ranks
@@ -365,14 +417,14 @@ def init(
             daemon=True,
         )
         daemon._monitor.start()
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         while not native.ready() or not collator_ready.is_set():
             for process in daemon._processes:
                 if process.exitcode is not None:
                     raise RuntimeError(
                         f"{process.name} exited during startup: {process.exitcode}"
                     )
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("TensorLane workers did not become ready")
             time.sleep(0.02)
         temporary = root / "init.tmp"
@@ -401,6 +453,10 @@ def init(
         raise
 
 
+async def init_async(*args, **kwargs) -> TensorLane:
+    return await asyncio.to_thread(init, *args, **kwargs)
+
+
 class BatchReader(Iterator[Batch]):
     def __init__(
         self,
@@ -409,12 +465,19 @@ class BatchReader(Iterator[Batch]):
         timeout: float,
         check: Callable[[], None],
         stream_index: int = 0,
+        stream: str = "training",
+        performance: Performance | None = None,
     ) -> None:
         if rank < 0 or timeout <= 0:
             raise ValueError("rank must be nonnegative and timeout must be positive")
         self._root = root
         self._check = check
         self._rank = rank
+        self._performance = performance
+        self._stream = stream
+        self._returned = None
+        if performance is not None:
+            performance.open(stream)
         self._closed = False
         self._connection = None
         self._listener = None
@@ -467,6 +530,8 @@ class BatchReader(Iterator[Batch]):
         connection = self._connection
         if connection is None:
             raise RuntimeError("rank reader is not connected")
+        started = time.monotonic()
+        self._record_application(started)
         try:
             while not connection.poll(0.1):
                 self._check()
@@ -480,12 +545,33 @@ class BatchReader(Iterator[Batch]):
                 raise RuntimeError(f"unexpected rank message: {kind}")
             _batch_id, batch = value
             self._semaphore.post()
+            self._returned = time.monotonic()
+            if self._performance is not None:
+                self._performance.batch(batch, self._returned - started)
             return batch
         except (EOFError, OSError) as error:
+            if self._performance is not None:
+                self._performance.error(self._stream)
             self._check()
             raise RuntimeError("TensorLane collater disconnected") from error
+        except StopIteration:
+            raise
+        except Exception:
+            if self._performance is not None:
+                self._performance.error(self._stream)
+            raise
+
+    def _record_application(self, now):
+        if self._returned is not None and self._performance is not None:
+            self._performance.application(self._stream, now - self._returned)
+        self._returned = None
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._record_application(time.monotonic())
+        if self._performance is not None:
+            self._performance.finish(self._stream)
         if self._connection is not None:
             self._connection.close()
             self._connection = None

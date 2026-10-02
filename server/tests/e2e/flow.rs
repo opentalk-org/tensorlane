@@ -320,6 +320,9 @@ async fn complete_examples_continue_through_the_native_python_pipeline() -> Resu
     let progress: Value = serde_json::from_slice(&std::fs::read(output.join("progress.json"))?)?;
     assert_eq!(progress["dataset_offset"], 9);
     assert_eq!(env.status(&run).await?, "succeeded");
+    let telemetry = env.clickhouse.query("SELECT count() FROM metrics WHERE run_id = toUUID(?) AND startsWith(name, 'tensorlane/')")
+        .bind(&run).fetch_one::<u64>().await?;
+    assert!(telemetry > 0);
     let first_asset = progress["asset_id"].as_str().unwrap();
     second["config"]["dataset_id"] = json!(dataset);
     second["config"]["num_workers"] = json!(2);

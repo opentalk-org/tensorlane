@@ -41,11 +41,14 @@ impl Prefetcher {
                         let Some(plan) = sampler.next_batch()? else {
                             return Ok(None);
                         };
+                        let started = std::time::Instant::now();
                         let mut response = LoadedBatch {
                             stream: stream.clone(),
                             batch_id,
                             query_batch_idx: plan.query_batch_idx,
                             batch: Vec::with_capacity(plan.samples.len()),
+                            load_seconds: 0.0,
+                            server_wait_seconds: 0.0,
                         };
                         for sample in plan.samples {
                             response.batch.push(loader.load_sample(sample).await?);
@@ -54,6 +57,11 @@ impl Prefetcher {
                                 "encoded batch exceeds 64 MiB"
                             );
                         }
+                        response.load_seconds = started.elapsed().as_secs_f64();
+                        ensure!(
+                            response.encoded_len() + 9 <= MAX_BATCH_BYTES,
+                            "encoded batch exceeds 64 MiB"
+                        );
                         let path = cache.join(format!("{}.batch", uuid::Uuid::new_v4()));
                         let part = path.with_extension("part");
                         let write = async {
@@ -86,13 +94,16 @@ impl Prefetcher {
         Self { rx, cancel, tasks }
     }
     pub async fn next_batch(&mut self) -> Result<Option<LoadedBatch>> {
+        let started = std::time::Instant::now();
         let Some(batch) = self.rx.recv().await else {
             return Ok(None);
         };
         let path = batch?.path;
         let result = fs::read(&path).await;
         let _ = fs::remove_file(&path).await;
-        Ok(Some(LoadedBatch::decode(result?.as_slice())?))
+        let mut response = LoadedBatch::decode(result?.as_slice())?;
+        response.server_wait_seconds = started.elapsed().as_secs_f64();
+        Ok(Some(response))
     }
     pub async fn finish(self) {
         self.tasks.close();

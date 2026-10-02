@@ -78,6 +78,7 @@ mod tests {
             stream: "evaluation".into(),
             batch: (0, 1),
             query_batch_idx: 4,
+            timings: [0.0; 3],
             index: 0,
             sample_id: "sample".into(),
             metadata_json: "{}".into(),

@@ -76,6 +76,7 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                     raise RuntimeError("unexpected or already ended stream")
                 if message["kind"] == "sample":
                     try:
+                        started = time.monotonic()
                         metadata = json.loads(message["metadata_json"])
                         if not isinstance(metadata, dict):
                             raise TypeError("sample metadata must be an object")
@@ -95,6 +96,7 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                                     message["query_batch_idx"],
                                     message["index"],
                                     transformed,
+                                    (*message["timings"], time.monotonic() - started),
                                 ),
                             )
                         )
@@ -192,7 +194,7 @@ def collate_worker(
             continue
         if kind != "sample" or ended[stream] == num_workers:
             raise RuntimeError(f"unexpected transformation message: {kind}")
-        (batch_id, batch_size), query_idx, index, sample = value
+        (batch_id, batch_size), query_idx, index, sample, timings = value
         if batch_id < next_batch[stream] or batch_id in completed[stream]:
             raise RuntimeError("message for an already completed batch")
         if batch_size <= 0 or index < 0 or index >= batch_size:
@@ -202,13 +204,16 @@ def collate_worker(
         )
         if size != batch_size or expected_query_idx != query_idx or index in parts:
             raise RuntimeError("inconsistent batch or duplicate sample position")
-        parts[index] = sample
+        parts[index] = (sample, timings)
         if len(parts) == size:
-            samples = tuple(parts[index] for index in range(size))
+            samples = tuple(parts[index][0] for index in range(size))
+            timings = (*timings[:3], sum(part[1][3] for part in parts.values()))
+            started = time.monotonic()
             collator = callback(collate_fn, stream)
             data = share(collator(samples)) if collator else samples
             completed[stream][batch_id] = Batch(
-                stream, batch_id, query_idx, samples, data
+                stream, batch_id, query_idx, samples, data,
+                (*timings, time.monotonic() - started)
             )
             del pending[stream][batch_id]
         while next_batch[stream] in completed[stream]:

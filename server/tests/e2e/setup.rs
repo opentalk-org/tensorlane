@@ -491,6 +491,7 @@ impl TestEnv {
         let mut requests = vec![proto::SaveAssetRequest {
             payload: Some(save_asset_request::Payload::Metadata(
                 proto::SaveAssetMetadata {
+                    content_type: "application/x-tar".into(),
                     run_id: id.into(),
                     asset_id: asset_id.to_string(),
                     name: name.into(),
@@ -521,7 +522,10 @@ impl TestEnv {
         sender
             .send(proto::MetricsRequest {
                 payload: Some(metrics_request::Payload::Metadata(
-                    proto::MetricsStreamMetadata { run_id: id.into() },
+                    proto::MetricsStreamMetadata {
+                        run_id: id.into(),
+                        automatic: false,
+                    },
                 )),
             })
             .await?;

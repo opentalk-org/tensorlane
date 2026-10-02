@@ -217,7 +217,9 @@ impl TensorLaneService for TensorLane {
                 Ok(Response::new(response))
             }
             Err(status) => {
-                self.runs.mark_failed(run_id).await;
+                if !metadata.automatic {
+                    self.runs.mark_failed(run_id).await;
+                }
                 error!(
                     run = %run_id,
                     error = %status,

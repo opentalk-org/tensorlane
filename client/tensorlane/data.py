@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -20,6 +20,7 @@ class Batch:
     query_batch_idx: int
     samples: tuple[Any, ...]
     data: Any
+    _timings: tuple[float, ...] = field(default=(), repr=False, compare=False)
 
     def __len__(self) -> int:
         return len(self.samples)

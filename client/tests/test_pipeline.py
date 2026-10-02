@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import importlib
+import asyncio
 import io
 import json
 import multiprocessing
@@ -27,6 +28,7 @@ from fixture_transforms import (
     slow,
     identify_worker,
     invalid,
+    timed_transform,
 )
 
 GENERATED = tempfile.TemporaryDirectory(prefix="tl-proto-")
@@ -78,6 +80,9 @@ class Fixture(rpc.TensorLaneServicer):
         self.empty_batch = False
         self.blob_size = None
         self.returned_run_id = None
+        self.asset_started = threading.Event()
+        self.asset_gate = threading.Event()
+        self.asset_gate.set()
         self.upload_started = threading.Event()
         self.upload_gate = threading.Event()
         self.upload_gate.set()
@@ -113,6 +118,8 @@ class Fixture(rpc.TensorLaneServicer):
 
     def Asset(self, request, context):
         self.asset_requests.append(request)
+        self.asset_started.set()
+        self.asset_gate.wait(20)
         asset_id, content = self.assets[request.name]
         yield pb.AssetResponse(
             metadata=pb.AssetMetadata(
@@ -236,6 +243,7 @@ class PipelineTests(unittest.TestCase):
 
     def tearDown(self):
         self.service.upload_gate.set()
+        self.service.asset_gate.set()
         self.service.end_gate.set()
         if self.daemon:
             try:
@@ -246,7 +254,7 @@ class PipelineTests(unittest.TestCase):
         self.temp.cleanup()
 
     def start(
-        self, ranks=1, factor=2, workers=2, transform_fn=transform, collate_fn=None
+        self, ranks=1, factor=2, workers=2, transform_fn=transform, collate_fn=None, performance_metrics=True
     ):
         self.daemon = tensorlane.init(
             self.run_id,
@@ -257,6 +265,7 @@ class PipelineTests(unittest.TestCase):
             start_daemon=True,
             num_workers=workers,
             collate_fn=collate_fn,
+            performance_metrics=performance_metrics,
             addr=f"localhost:{self.service.port}",
             ipc_dir=self.temp.name,
             timeout=20,
@@ -438,6 +447,28 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(follower.asset_metadata["model"]["asset_id"], asset_id)
         self.assertEqual(len(self.service.asset_requests), 2)
 
+    def test_async_init_waits_for_assets_without_blocking_event_loop(self):
+        self.service.assets = {"model": (str(uuid.uuid4()), b"weights")}
+        self.service.asset_gate.clear()
+
+        async def initialize():
+            pending = asyncio.create_task(tensorlane.init_async(
+                self.run_id, transform, ranks=1, num_workers=1,
+                addr=f"localhost:{self.service.port}", ipc_dir=self.temp.name,
+                performance_metrics=False,
+            ))
+            try:
+                await asyncio.to_thread(self.service.asset_started.wait, 10)
+                await asyncio.sleep(0.05)
+                self.assertTrue(self.service.asset_started.is_set())
+                self.assertFalse(pending.done())
+            finally:
+                self.service.asset_gate.set()
+            self.daemon = await pending
+            self.assertEqual(self.daemon.asset("model").read_bytes(), b"weights")
+
+        asyncio.run(initialize())
+
     def test_saved_files_directories_and_automatic_lineage(self):
         source_id = str(uuid.uuid4())
         self.service.assets = {"model": (source_id, b"input")}
@@ -458,8 +489,7 @@ class PipelineTests(unittest.TestCase):
             json.loads(self.service.saved[0][0].metadata_json), {"dataset_offset": 6}
         )
         self.assertEqual(
-            self.archive_contents(self.service.saved[0][2]),
-            {"weights": b"opaque bytes"},
+            self.service.saved[0][2], b"opaque bytes",
         )
         self.assertEqual(
             self.archive_contents(self.service.saved[2][2]),
@@ -506,6 +536,46 @@ class PipelineTests(unittest.TestCase):
             flushed.result(timeout=15)
         self.assertEqual(len(self.service.saved), 1)
 
+    def test_enqueue_and_batches_continue_while_flush_waits(self):
+        self.start(workers=1, performance_metrics=False)
+        self.service.upload_gate.clear()
+        self.daemon.save_asset("model", self.file())
+        self.assertTrue(self.service.upload_started.wait(5))
+        with ThreadPoolExecutor() as executor:
+            flushed = executor.submit(self.daemon.flush)
+            time.sleep(0.05)
+            queued = executor.submit(self.daemon.save_asset, "other", self.file("other"))
+            try:
+                queued.result(timeout=1)
+                with self.daemon.batches() as reader:
+                    self.assertEqual(len(list(reader)), 5)
+                self.assertFalse(flushed.done())
+            finally:
+                self.service.upload_gate.set()
+            flushed.result(timeout=15)
+        self.daemon.flush()
+        self.assertEqual(len(self.service.saved), 2)
+
+    def test_async_flush_keeps_event_loop_responsive(self):
+        self.start(workers=1, performance_metrics=False)
+        self.service.upload_gate.clear()
+        self.daemon.save_asset("model", self.file())
+        self.assertTrue(self.service.upload_started.wait(5))
+
+        async def run():
+            flushed = asyncio.create_task(self.daemon.flush_async())
+            try:
+                await asyncio.sleep(0.05)
+                self.assertFalse(flushed.done())
+                self.daemon.metric(0, "while-uploading", 1)
+            finally:
+                self.service.upload_gate.set()
+            await flushed
+
+        asyncio.run(run())
+        self.daemon.flush()
+        self.assertEqual(len(self.service.saved), 1)
+
     def test_save_failure_and_missing_source_reach_flush(self):
         self.start()
         with self.attach() as follower:
@@ -527,8 +597,74 @@ class PipelineTests(unittest.TestCase):
         self.daemon.flush()
         self.assertEqual(self.service.metrics[0][1].name, "loss")
         self.assertEqual(
-            self.archive_contents(self.service.artifacts[0][1]), {"report.json": b"{}"}
+            self.service.artifacts[0][1], b"{}"
         )
+
+    def test_file_artifacts_are_raw_and_directory_artifacts_are_tar(self):
+        self.start()
+        for filename, body, content_type in [
+            ("audio.wav", b"RIFFplain audio", "audio/wav"),
+            ("config.json", b'{"model":1}', "application/json"),
+            ("alignment.pt", b"plain tensor bytes", "application/octet-stream"),
+        ]:
+            self.daemon.metric_artifact(0, self.file(filename, body), filename)
+            self.daemon.save_asset(filename, Path(self.temp.name) / filename)
+        directory = Path(self.temp.name) / "reports"
+        directory.mkdir()
+        (directory / "config.json").write_text("{}")
+        self.daemon.metric_artifact(0, directory, "reports", "application/json")
+        self.daemon.flush()
+        for artifact, saved, (_, body, content_type) in zip(
+            self.service.artifacts, self.service.saved,
+            [("audio.wav", b"RIFFplain audio", "audio/wav"),
+             ("config.json", b'{"model":1}', "application/json"),
+             ("alignment.pt", b"plain tensor bytes", "application/octet-stream")],
+        ):
+            self.assertEqual(artifact[1], body)
+            self.assertEqual(saved[2], body)
+            self.assertEqual(artifact[0].content_type, content_type)
+            self.assertEqual(saved[0].content_type, content_type)
+        metadata, body = self.service.artifacts[-1]
+        self.assertEqual(metadata.content_type, "application/x-tar")
+        self.assertEqual(self.archive_contents(body), {"reports/config.json": b"{}"})
+
+    def test_automatic_performance_metrics_flush_during_run(self):
+        with patch("tensorlane._performance.INTERVAL", 0.05):
+            self.start(workers=1, transform_fn=timed_transform)
+            with self.daemon.batches() as reader:
+                first = next(reader)
+                time.sleep(0.03)
+                next(reader)
+                wait_for(lambda: any("/training/batches_total" in row[1].name
+                                     for row in self.service.metrics))
+            self.daemon.flush()
+        values = {metric.name: metric.value for _, metric in self.service.metrics}
+        prefix = "tensorlane/rank/0/training/"
+        self.assertEqual(values[prefix + "batches_total"], 2)
+        self.assertEqual(values[prefix + "samples_total"], len(first) + 2)
+        self.assertGreater(values[prefix + "transform_work_seconds_mean"], 0)
+        self.assertGreater(values[prefix + "application_seconds_mean"], 0)
+        self.assertFalse(self.service.end_requests)
+
+    def test_automatic_performance_metrics_can_be_disabled(self):
+        self.start(workers=1, performance_metrics=False)
+        with self.daemon.batches() as reader:
+            list(reader)
+        self.daemon.flush()
+        self.daemon.close()
+        self.assertFalse(self.service.metrics)
+
+    def test_automatic_metrics_failure_does_not_fail_training(self):
+        self.start(workers=1)
+        with self.daemon.batches() as reader:
+            next(reader)
+            self.service.fail_metrics = True
+            with self.assertLogs("tensorlane", level="WARNING"):
+                self.daemon.flush()
+            self.service.fail_metrics = False
+            list(reader)
+        self.daemon.close()
+        self.assertFalse(self.service.end_requests[-1].failed)
 
     def test_shutdown_drains_save_before_end_and_cleans_resources(self):
         self.start()
@@ -649,15 +785,17 @@ class PipelineTests(unittest.TestCase):
                     **{argument: {"missing": transform}},
                 )
 
-    def test_flush_timeout_closes_connection(self):
+    def test_flush_timeout_keeps_upload_and_connection_alive(self):
         self.start()
         self.service.upload_gate.clear()
         self.daemon.save_asset("model", self.file())
         with self.assertRaisesRegex(RuntimeError, "timed out"):
             self.daemon.flush(timeout=0.05)
         self.service.upload_gate.set()
-        with self.assertRaisesRegex(RuntimeError, "closed"):
-            self.daemon.metric(1, "after", 1)
+        self.daemon.metric(1, "after", 1)
+        self.daemon.flush()
+        self.assertEqual(len(self.service.saved), 1)
+        self.assertTrue(any(metric.name == "after" for _, metric in self.service.metrics))
 
     def test_cleaned_directory_can_be_reused(self):
         self.start()

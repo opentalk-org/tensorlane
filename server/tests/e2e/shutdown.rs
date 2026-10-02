@@ -203,6 +203,7 @@ async fn shutdown_waits_for_pending_checkpoint_and_artifact_uploads() -> Result<
     let pending_run = run.clone();
     let pending = tokio::spawn(async move {
         let metadata = proto::SaveAssetMetadata {
+            content_type: "application/x-tar".into(),
             run_id: pending_run,
             asset_id: uuid::Uuid::new_v4().to_string(),
             name: "model".into(),

@@ -341,7 +341,7 @@ async fn supervise(
         anyhow::Ok((grpc, initialized, work))
     };
     let started = tokio::select! {
-        result = tokio::time::timeout(Duration::from_mins(10), startup) => result.context("daemon startup timed out").and_then(|result| result).map(Some),
+        result = startup => result.map(Some),
         result = &mut stop => result.unwrap_or(Ok(())).map(|()| None),
     };
     let (grpc, initialized, work) = match started {
@@ -487,12 +487,8 @@ async fn end_run(
     run_id: String,
     failed: bool,
 ) -> anyhow::Result<()> {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        grpc.end(EndRequest { run_id, failed }),
-    )
-    .await
-    .context("End RPC timed out")?
-    .context("End RPC failed")?;
+    grpc.end(EndRequest { run_id, failed })
+        .await
+        .context("End RPC failed")?;
     Ok(())
 }

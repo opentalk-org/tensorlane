@@ -7,6 +7,7 @@ use crate::{
     uploads::UploadStore,
 };
 use anyhow::{Context, Result, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -111,10 +112,7 @@ impl RunExecutor {
             );
             starting.insert(id);
         }
-        let result = tokio::time::timeout(Duration::from_secs(600), self.initialize(id, lifetime))
-            .await
-            .context("run initialization timed out")
-            .and_then(|result| result);
+        let result = self.initialize(id, lifetime).await;
         self.starting.lock().await.remove(&id);
         if result.is_err() {
             let _ = fs::remove_dir_all(self.cache.join(id.to_string())).await;
@@ -125,7 +123,7 @@ impl RunExecutor {
     async fn initialize(&self, id: Uuid, lifetime: TaskTrackerToken) -> Result<RunInitialization> {
         let record = self.repo.get(id).await?.context("run not found")?;
         let config = Config::parse(&record.config)?;
-        let mut inputs = HashMap::new();
+        let mut downloads = Vec::new();
         let mut heads = HashMap::new();
         self.repo.append_status(id, RunStatus::Running).await?;
         for (index, (name, input)) in config.assets.iter().enumerate() {
@@ -143,7 +141,8 @@ impl RunExecutor {
                 .as_ref()
                 .map(|record| record.path.as_str())
                 .or(input.object.as_deref())
-                .unwrap();
+                .unwrap()
+                .to_owned();
             let metadata = AssetMetadata {
                 entrypoint: input.entrypoint.clone(),
                 asset_id: registered.as_ref().map(|asset| asset.id.to_string()),
@@ -167,27 +166,35 @@ impl RunExecutor {
                 .join(id.to_string())
                 .join("assets")
                 .join(index.to_string());
-            fs::create_dir_all(&directory).await?;
-            let path = directory.join("data");
-            let part = directory.join("download.part");
-            let mut body = self
-                .s3
-                .get_object()
-                .bucket(self.bucket)
-                .key(object)
-                .send()
-                .await?
-                .body;
-            let mut file = fs::File::create(&part).await?;
-            while let Some(bytes) = body.try_next().await? {
-                file.write_all(&bytes).await?;
-            }
-            file.sync_all().await?;
-            drop(file);
-            fs::rename(part, &path).await?;
-            inputs.insert(name.clone(), (path, metadata));
+            downloads.push(async move {
+                fs::create_dir_all(&directory).await?;
+                let path = directory.join("data");
+                let part = directory.join("download.part");
+                let mut body = self
+                    .s3
+                    .get_object()
+                    .bucket(self.bucket)
+                    .key(object)
+                    .send()
+                    .await?
+                    .body;
+                let mut file = fs::File::create(&part).await?;
+                while let Some(bytes) = body.try_next().await? {
+                    file.write_all(&bytes).await?;
+                }
+                file.sync_all().await?;
+                drop(file);
+                fs::rename(part, &path).await?;
+                anyhow::Ok((name.clone(), (path, metadata)))
+            });
             heads.insert(name.clone(), Arc::new(Mutex::new(registered)));
         }
+        let inputs = stream::iter(downloads)
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .collect();
         for asset in self.asset_repo.for_run(id, None).await? {
             heads.insert(asset.name.clone(), Arc::new(Mutex::new(Some(asset))));
         }
@@ -423,7 +430,12 @@ impl RunExecutor {
             ancestor_asset_id: head.as_ref().map(|asset| asset.id).unwrap_or(Uuid::nil()),
             deleted: false,
         };
-        if let Err(error) = uploads.save_asset(&record, path).await {
+        let content_type = if metadata.content_type.is_empty() {
+            "application/x-tar"
+        } else {
+            &metadata.content_type
+        };
+        if let Err(error) = uploads.save_asset(&record, path, content_type).await {
             let committed = self.asset_repo.get(id).await?;
             if !committed.as_ref().is_some_and(|asset| {
                 asset.content_hash == hash && asset.ancestor_asset_id == record.ancestor_asset_id

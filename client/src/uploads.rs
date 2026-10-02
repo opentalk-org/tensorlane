@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::{Seek, SeekFrom},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -22,7 +22,7 @@ use tokio::{
         UnixListener, UnixStream,
         unix::{OwnedReadHalf, OwnedWriteHalf},
     },
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::JoinSet,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -30,10 +30,10 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tonic::transport::Channel;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
-const FINISH_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Serialize, Deserialize)]
 enum Upload {
+    Automatic,
     Metric {
         step: u64,
         name: String,
@@ -53,6 +53,7 @@ enum Upload {
         kind: String,
         asset_type: Option<String>,
         metadata_json: String,
+        content_type: String,
     },
     Flush,
 }
@@ -85,28 +86,73 @@ impl Connection {
     }
 }
 
+enum Command {
+    Send(Upload),
+    Flush(oneshot::Sender<Reply>),
+    Close(oneshot::Sender<Reply>),
+}
+
 #[pyclass]
 pub struct UploadClient {
-    connection: Mutex<Option<Connection>>,
+    sender: Mutex<Option<mpsc::UnboundedSender<Command>>>,
+    failure: Arc<Mutex<Option<String>>>,
     runtime: tokio::runtime::Runtime,
 }
 
 #[pymethods]
 impl UploadClient {
     #[new]
-    fn new(py: Python<'_>, path: PathBuf) -> anyhow::Result<Self> {
+    #[pyo3(signature = (path, automatic=false))]
+    fn new(py: Python<'_>, path: PathBuf, automatic: bool) -> anyhow::Result<Self> {
         py.allow_threads(|| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()?;
             let socket = runtime.block_on(UnixStream::connect(path))?;
             let (read, write) = socket.into_split();
-            Ok(Self {
-                connection: Mutex::new(Some(Connection {
+            let (sender, mut commands) = mpsc::unbounded_channel();
+            let failure = Arc::new(Mutex::new(None));
+            let failed = failure.clone();
+            runtime.spawn(async move {
+                let mut connection = Connection {
                     sender: Sender::new(write),
                     receiver: Receiver::new(read),
                     dirty: false,
-                })),
+                };
+                let result = async {
+                    if automatic {
+                        connection.sender.send(&Upload::Automatic).await?;
+                    }
+                    while let Some(command) = commands.recv().await {
+                        match command {
+                            Command::Send(message) => {
+                                connection.sender.send(&message).await?;
+                                connection.dirty = true;
+                            }
+                            Command::Flush(reply) | Command::Close(reply) => {
+                                let result = connection
+                                    .flush()
+                                    .await
+                                    .map_err(|error| format!("{error:#}"));
+                                let failed = result.is_err();
+                                let _ = reply.send(result.clone());
+                                if failed {
+                                    return Err(anyhow!(result.unwrap_err()));
+                                }
+                            }
+                        }
+                    }
+                    anyhow::Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    *failed.lock().unwrap() = Some(format!("{error:#}"));
+                }
+            });
+            Ok(Self {
+                sender: Mutex::new(Some(sender)),
+                failure,
                 runtime,
             })
         })
@@ -136,7 +182,7 @@ impl UploadClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, path, step=0, kind="file".to_owned(), asset_type=None, metadata_json="{}".to_owned()))]
+    #[pyo3(signature = (name, path, step=0, kind="file".to_owned(), asset_type=None, metadata_json="{}".to_owned(), content_type="application/octet-stream".to_owned()))]
     fn save_asset(
         &self,
         py: Python<'_>,
@@ -146,6 +192,7 @@ impl UploadClient {
         kind: String,
         asset_type: Option<String>,
         metadata_json: String,
+        content_type: String,
     ) -> anyhow::Result<String> {
         ensure!(!name.is_empty(), "asset name must not be empty");
         ensure!(
@@ -164,61 +211,82 @@ impl UploadClient {
                 kind,
                 asset_type,
                 metadata_json,
+                content_type,
             },
         )?;
         Ok(asset_id)
     }
 
-    #[pyo3(signature = (timeout=300.0))]
-    fn flush(&self, py: Python<'_>, timeout: f64) -> anyhow::Result<()> {
-        let timeout = Duration::try_from_secs_f64(timeout)?;
+    #[pyo3(signature = (timeout=None))]
+    fn flush(&self, py: Python<'_>, timeout: Option<f64>) -> anyhow::Result<()> {
+        let timeout = timeout.map(Duration::try_from_secs_f64).transpose()?;
+        let (reply, received) = oneshot::channel();
+        self.enqueue(Command::Flush(reply))?;
         py.allow_threads(|| {
-            let mut connection = self
-                .connection
-                .lock()
-                .map_err(|_| anyhow!("upload lock poisoned"))?;
-            let result = self.runtime.block_on(async {
-                let connection = connection.as_mut().context("upload client is closed")?;
-                tokio::time::timeout(timeout, connection.flush())
-                    .await
-                    .context("upload flush timed out")?
-            });
-            if result.is_err() {
-                connection.take();
-            }
-            result
+            self.runtime.block_on(async {
+                let result = match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, received)
+                        .await
+                        .context("upload flush timed out")?,
+                    None => received.await,
+                };
+                let result = result
+                    .map_err(|_| self.error())
+                    .and_then(|reply| reply.map_err(|error| anyhow!(error)));
+                if result.is_err() {
+                    self.sender.lock().unwrap().take();
+                }
+                result
+            })
         })
     }
 
     fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
-        py.allow_threads(|| {
-            let connection = self
-                .connection
-                .lock()
-                .map_err(|_| anyhow!("upload lock poisoned"))?
-                .take();
-            if let Some(mut connection) = connection {
+        let (reply, received) = oneshot::channel();
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| anyhow!("upload lock poisoned"))?
+            .take();
+        if let Some(sender) = sender {
+            sender
+                .send(Command::Close(reply))
+                .map_err(|_| self.error())?;
+            drop(sender);
+            py.allow_threads(|| {
                 self.runtime.block_on(async {
-                    tokio::time::timeout(FINISH_TIMEOUT, connection.flush()).await
-                })??;
-            }
-            Ok(())
-        })
+                    received
+                        .await
+                        .map_err(|_| self.error())?
+                        .map_err(|error| anyhow!(error))
+                })
+            })?;
+        }
+        Ok(())
     }
 }
 
 impl UploadClient {
-    fn send(&self, py: Python<'_>, message: Upload) -> anyhow::Result<()> {
-        py.allow_threads(|| {
-            let mut connection = self
-                .connection
+    fn error(&self) -> anyhow::Error {
+        anyhow!(
+            self.failure
                 .lock()
-                .map_err(|_| anyhow!("upload lock poisoned"))?;
-            let connection = connection.as_mut().context("upload client is closed")?;
-            self.runtime.block_on(connection.sender.send(&message))?;
-            connection.dirty = true;
-            Ok(())
-        })
+                .ok()
+                .and_then(|error| error.clone())
+                .unwrap_or_else(|| "upload connection closed".into())
+        )
+    }
+    fn enqueue(&self, command: Command) -> anyhow::Result<()> {
+        self.sender
+            .lock()
+            .map_err(|_| anyhow!("upload lock poisoned"))?
+            .as_ref()
+            .context("upload client is closed")?
+            .send(command)
+            .map_err(|_| self.error())
+    }
+    fn send(&self, _py: Python<'_>, message: Upload) -> anyhow::Result<()> {
+        self.enqueue(Command::Send(message))
     }
 }
 
@@ -252,16 +320,11 @@ pub async fn serve(
         }
     }
     drop(listener);
-    tokio::time::timeout(FINISH_TIMEOUT, async {
-        while let Some(result) = connections.join_next().await {
-            if let Err(error) = result? {
-                failure = Some(error);
-            }
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result? {
+            failure = Some(error);
         }
-        anyhow::Ok(())
-    })
-    .await
-    .context("uploads did not finish during shutdown")??;
+    }
     failure.map_or(Ok(()), Err)
 }
 
@@ -290,10 +353,12 @@ async fn receive(
         drop(jobs);
         anyhow::Ok(())
     };
+    let mut automatic = false;
     let processing = async {
         let mut metrics: Option<Metrics> = None;
         while let Some(job) = queue.recv().await {
             match job {
+                Upload::Automatic => automatic = true,
                 Upload::SaveAsset {
                     asset_id,
                     name,
@@ -302,6 +367,7 @@ async fn receive(
                     kind,
                     asset_type,
                     metadata_json,
+                    content_type,
                 } => {
                     save_asset(
                         grpc.clone(),
@@ -313,6 +379,7 @@ async fn receive(
                             kind,
                             asset_type,
                             metadata_json,
+                            content_type,
                         },
                         path,
                     )
@@ -325,8 +392,9 @@ async fn receive(
                     replies.send(&Ok(())).await?;
                 }
                 Upload::Metric { step, name, value } => {
-                    let stream =
-                        metrics.get_or_insert_with(|| Metrics::new(grpc.clone(), run_id.clone()));
+                    let stream = metrics.get_or_insert_with(|| {
+                        Metrics::new(grpc.clone(), run_id.clone(), automatic)
+                    });
                     stream
                         .send(metrics_request::Payload::Metric(ScalarMetric {
                             step,
@@ -342,8 +410,9 @@ async fn receive(
                     name,
                     content_type,
                 } => {
-                    let stream =
-                        metrics.get_or_insert_with(|| Metrics::new(grpc.clone(), run_id.clone()));
+                    let stream = metrics.get_or_insert_with(|| {
+                        Metrics::new(grpc.clone(), run_id.clone(), automatic)
+                    });
                     stream.artifact(step, path, name, content_type).await?;
                 }
             }
@@ -357,7 +426,14 @@ async fn receive(
     if let Err(error) = &result {
         let _ = replies.send(&Err(format!("{error:#}"))).await;
     }
-    result
+    if automatic {
+        if let Err(error) = &result {
+            eprintln!("TensorLane performance metrics failed: {error:#}");
+        }
+        Ok(())
+    } else {
+        result
+    }
 }
 
 fn timestamp() -> anyhow::Result<i64> {
@@ -373,12 +449,13 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(mut grpc: TensorLaneClient<Channel>, run_id: String) -> Self {
+    fn new(mut grpc: TensorLaneClient<Channel>, run_id: String, automatic: bool) -> Self {
         let (sender, receiver) = mpsc::channel(4);
         let stream = tokio_stream::StreamExt::chain(
             tokio_stream::once(MetricsRequest {
                 payload: Some(metrics_request::Payload::Metadata(MetricsStreamMetadata {
                     run_id,
+                    automatic,
                 })),
             }),
             ReceiverStream::new(receiver),
@@ -412,7 +489,7 @@ impl Metrics {
         name: String,
         content_type: String,
     ) -> anyhow::Result<()> {
-        let mut file = archive(path.clone())
+        let (mut file, is_directory) = upload_source(path.clone())
             .await
             .with_context(|| format!("opening artifact {}", path.display()))?;
         let metadata = file.metadata().await?;
@@ -420,7 +497,11 @@ impl Metrics {
         self.send(metrics_request::Payload::Artifact(ArtifactMetric {
             step,
             name,
-            content_type,
+            content_type: if is_directory {
+                "application/x-tar".into()
+            } else {
+                content_type
+            },
             size_bytes,
             timestamp_unix_ms: timestamp()?,
         }))
@@ -446,22 +527,23 @@ impl Metrics {
 
     async fn finish(self) -> anyhow::Result<()> {
         drop(self.sender);
-        tokio::time::timeout(FINISH_TIMEOUT, self.request)
-            .await
-            .context("metrics RPC finish timed out")???;
+        self.request.await??;
         Ok(())
     }
 }
 
 async fn save_asset(
     mut grpc: TensorLaneClient<Channel>,
-    metadata: SaveAssetMetadata,
+    mut metadata: SaveAssetMetadata,
     path: PathBuf,
 ) -> anyhow::Result<()> {
     let expected_id = metadata.asset_id.clone();
-    let mut file = archive(path.clone())
+    let (mut file, is_directory) = upload_source(path.clone())
         .await
         .with_context(|| format!("opening asset {}", path.display()))?;
+    if is_directory {
+        metadata.content_type = "application/x-tar".into();
+    }
     let (sender, receiver) = mpsc::channel(4);
     let sending = async {
         sender
@@ -496,32 +578,29 @@ async fn save_asset(
         );
         Ok::<_, anyhow::Error>(())
     };
-    tokio::time::timeout(FINISH_TIMEOUT, async { tokio::try_join!(request, sending) })
-        .await
-        .context("asset upload timed out")??;
+    tokio::try_join!(request, sending)?;
     Ok(())
 }
 
-async fn archive(path: PathBuf) -> anyhow::Result<File> {
-    let file = tokio::task::spawn_blocking(move || {
+async fn upload_source(path: PathBuf) -> anyhow::Result<(File, bool)> {
+    let (file, is_directory) = tokio::task::spawn_blocking(move || {
         let metadata = std::fs::symlink_metadata(&path)?;
         ensure!(
             metadata.is_file() || metadata.is_dir(),
             "upload path must be a file or directory"
         );
+        if metadata.is_file() {
+            return anyhow::Ok((std::fs::File::open(path)?, false));
+        }
         let name = path.file_name().context("upload path must have a name")?;
         let mut archive = tar::Builder::new(tempfile::tempfile()?);
         archive.follow_symlinks(false);
-        if metadata.is_dir() {
-            archive.append_dir_all(name, &path)?;
-        } else {
-            archive.append_path_with_name(&path, name)?;
-        }
+        archive.append_dir_all(name, &path)?;
         let mut file = archive.into_inner()?;
         file.seek(SeekFrom::Start(0))?;
-        anyhow::Ok(file)
+        anyhow::Ok((file, true))
     })
     .await
-    .context("archive task failed")??;
-    Ok(File::from_std(file))
+    .context("preparing upload failed")??;
+    Ok((File::from_std(file), is_directory))
 }

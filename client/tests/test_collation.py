@@ -51,10 +51,10 @@ class CollationTests(unittest.TestCase):
 
     def test_order_sparse_query_indices_and_custom_collation(self):
         messages = [
-            ("sample", "training", ((1, 2), 40, 1, 3)),
-            ("sample", "training", ((0, 1), 7, 0, 1)),
-            ("sample", "training", ((1, 2), 40, 0, 2)),
-            ("sample", "evaluation", ((0, 1), 90, 0, 4)),
+            ("sample", "training", ((1, 2), 40, 1, 3, (0, 0, 0, 0))),
+            ("sample", "training", ((0, 1), 7, 0, 1, (0, 0, 0, 0))),
+            ("sample", "training", ((1, 2), 40, 0, 2, (0, 0, 0, 0))),
+            ("sample", "evaluation", ((0, 1), 90, 0, 4, (0, 0, 0, 0))),
         ]
         messages.extend(
             ("end", stream, None) for stream in ("training", "validation", "evaluation")
@@ -79,15 +79,15 @@ class CollationTests(unittest.TestCase):
             ):
                 self.run_collator(
                     [
-                        ("sample", "training", ((0, 2), 1, 0, 1)),
-                        ("sample", "training", second),
+                        ("sample", "training", ((0, 2), 1, 0, 1, (0, 0, 0, 0))),
+                        ("sample", "training", (*second, (0, 0, 0, 0))),
                     ]
                 )
 
     def test_incomplete_batch_on_end_fails(self):
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
             self.run_collator(
-                [("sample", "training", ((0, 2), 1, 0, 1)), ("end", "training", None)]
+                [("sample", "training", ((0, 2), 1, 0, 1, (0, 0, 0, 0))), ("end", "training", None)]
             )
 
     def test_nested_tensors_are_detached_and_shared(self):

@@ -81,3 +81,30 @@ async fn metrics_buffer_independently_flush_at_1000_and_flush_tails_on_close() -
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn automatic_metrics_failure_does_not_fail_the_run() -> Result<()> {
+    let env = TestEnv::start().await?;
+    let dataset = env.seed_dataset(1).await?;
+    let run = env.create_run(run_config(dataset, 1)).await?;
+    env.init_run(&run).await?;
+    env.clickhouse.query("DROP TABLE metrics").execute().await?;
+    let metadata = crate::proto::MetricsRequest {
+        payload: Some(crate::proto::metrics_request::Payload::Metadata(
+            crate::proto::MetricsStreamMetadata {
+                run_id: run.clone(),
+                automatic: true,
+            },
+        )),
+    };
+    assert!(
+        env.grpc
+            .clone()
+            .metrics(tokio_stream::iter(vec![metadata, scalar(0)]))
+            .await
+            .is_err()
+    );
+    env.end_run(&run).await?;
+    assert_eq!(env.status(&run).await?, "succeeded");
+    Ok(())
+}

@@ -121,13 +121,23 @@ saved_id = lane.save_asset(
 lane.flush()
 ```
 
-Files and directories use TAR packaging and multipart upload. `kind` defaults to `"file"` and `step` to zero. The type resolves from an explicit `asset_type`, then `config.asset_type`, then the parent asset, then `"generic"`. Saving allocates and returns a UUID immediately. Keep the source unchanged until flush completes. Successful flush guarantees both the S3 object and database row exist; failures reach flush.
+Files upload as their original bytes; only directories use TAR packaging. Both use multipart upload when needed. `kind` defaults to `"file"` and `step` to zero. The type resolves from an explicit `asset_type`, then `config.asset_type`, then the parent asset, then `"generic"`. Saving allocates and returns a UUID immediately. Uploads are queued in the background and do not hold up batch delivery or later saves, including while another thread is flushing. Keep the source unchanged until flush completes. `lane.flush()` and close wait for completion without a transfer deadline. An explicit `lane.flush(timeout=...)` limits only that caller's wait and leaves uploads running. Async applications can use `await lane.flush_async()`, `await lane.close_async()`, and `await tensorlane.init_async(...)` without blocking the event loop. Initialization still returns with all input assets ready; asset downloads run concurrently. Successful flush guarantees both the S3 object and database row exist; failures reach flush.
 
 Commits serialize per `(run_id, name)` and attach the previous committed ID as `ancestor_asset_id`: loading A, saving B, and saving C produces A → B → C. A later run loading C and saving D produces C → D. The first save without a registered input uses the null UUID. Different names have independent chains. Failed saves preserve the head; reinitialization recovers it from persisted rows. Retries of committed IDs return the same ID, while conflicting retries fail. All earlier rows remain available.
 
 `GET /assets/{asset_id}` returns the parent, run, name, step, kind, metadata, type, object path, size, hash, and timestamp. `GET /runs/{run_id}/assets` reads run history, optionally filtered by `?name=model`. Scalar metrics, array metrics, and metric artifacts retain their existing protobuf API and tables; Python's `metric` and `metric_artifact` APIs remain separate from asset saves.
 
 Run completion records `succeeded` on a clean close and `failed` on initialization, worker, upload, or application-context errors. The daemon sends a heartbeat every 10 seconds; a run without a heartbeat for 60 seconds is failed and its server cache is removed. Server shutdown drains live runs and expires abandoned ones. On restart, the server marks previously running runs failed. One server owns the run database; rebuild both server and client for the heartbeat protocol.
+
+## Automatic performance metrics
+
+Performance metrics are enabled by default and written to the existing ClickHouse `metrics` table every 10 seconds, on `lane.flush()`, and on close. No training-loop changes are needed. Pass `performance_metrics=False` to `tensorlane.init` to disable collection for that rank. Automatic telemetry is best effort: upload failures are logged and do not fail the run.
+
+Names use `tensorlane/rank/{rank}/{stream}/{metric}`, with stream names URL-escaped. Metrics include cumulative batches, samples and reader errors; batches and samples per second; seconds since the last batch; mean application and consumption-loop time; mean and maximum data-wait time; and the fraction of measured time spent waiting for data. Timings also cover server sample loading, server cache wait and read, client gRPC response wait, worker transform work summed across the batch, and collation. Each report uses the latest delivered batch ID as its step. Rates describe the reporting window and are per rank; sum matching rank rates for aggregate throughput. Initial windows include reader startup. gRPC wait includes client credit/backpressure delays. Transform work is summed across workers, not elapsed batch latency.
+
+Application time is the interval from returning a batch until the next batch request or reader close. Consumption speed includes application work, validation, pauses, and data waits; it does not count optimizer updates or synchronize asynchronous GPU execution. `tensorlane/rank/{rank}/uploads/flush_seconds` measures how long application upload flushes wait. Automatic metrics use a separate connection so they do not flush application uploads.
+
+Metric artifact files also upload unchanged, with inferred MIME types unless `content_type` is supplied. Directory artifacts are TAR archives and use `application/x-tar`. Existing stored TAR files remain readable through automatic extraction; new uploads do not rewrite old objects.
 
 ## Storage and verification
 

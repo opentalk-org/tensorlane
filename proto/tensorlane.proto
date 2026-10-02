@@ -32,6 +32,8 @@ message DataResponse {
   string stream = 2;
   uint64 batch_id = 3;
   uint64 query_batch_idx = 4;
+  double load_seconds = 5;
+  double server_wait_seconds = 6;
 }
 message AssetRequest { string run_id = 1; string name = 2; }
 message AssetMetadata {
@@ -52,6 +54,7 @@ message SaveAssetMetadata {
   string kind = 5;
   optional string asset_type = 6;
   string metadata_json = 7;
+  string content_type = 8;
 }
 message SaveAssetRequest {
   oneof payload { SaveAssetMetadata metadata = 1; bytes chunk = 2; }
@@ -60,6 +63,7 @@ message SaveAssetResponse { string asset_id = 1; }
 
 message MetricsStreamMetadata {
   string run_id = 1;
+  bool automatic = 2;
 }
 
 message ScalarMetric {
