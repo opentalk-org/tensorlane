@@ -1,7 +1,6 @@
 from contextlib import nullcontext
 import json
 from pathlib import Path
-import tarfile
 
 import torch
 from accelerate import Accelerator
@@ -30,14 +29,9 @@ def main():
         ) as lane:
             set_seed(lane.config["seed"])
             model = torch.nn.Linear(1, 1)
-            with tarfile.open(lane.asset("model")) as archive:
-                model.load_state_dict(
-                    torch.load(
-                        archive.extractfile("weights.pt"),
-                        map_location="cpu",
-                        weights_only=True,
-                    )
-                )
+            model.load_state_dict(
+                torch.load(lane.asset("model"), map_location="cpu", weights_only=True)
+            )
             optimizer = torch.optim.SGD(
                 model.parameters(), lr=lane.config["optimizer"]["learning_rate"]
             )

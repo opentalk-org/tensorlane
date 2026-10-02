@@ -103,6 +103,9 @@ class Fixture(rpc.TensorLaneServicer):
             streams=list(self.streams),
         )
 
+    def Heartbeat(self, request, context):
+        return pb.HeartbeatResponse()
+
     def End(self, request, context):
         self.end_gate.wait(20)
         self.end_requests.append(request)
@@ -411,6 +414,20 @@ class PipelineTests(unittest.TestCase):
                 process.join()
             output.close()
 
+    def test_end_reports_success_and_application_failure(self):
+        self.start()
+        self.daemon.close()
+        self.assertFalse(self.service.end_requests[-1].failed)
+        with self.assertRaisesRegex(ValueError, "training failed"):
+            with self.start():
+                raise ValueError("training failed")
+        self.assertTrue(self.service.end_requests[-1].failed)
+        with self.start():
+            with self.assertRaisesRegex(ValueError, "follower failed"):
+                with self.attach():
+                    raise ValueError("follower failed")
+        self.assertTrue(self.service.end_requests[-1].failed)
+
     def test_assets_are_prefetched_once_and_shared(self):
         asset_id = str(uuid.uuid4())
         self.service.assets = {"model": (asset_id, b"weights"), "empty": (None, b"")}
@@ -448,6 +465,27 @@ class PipelineTests(unittest.TestCase):
             self.archive_contents(self.service.saved[2][2]),
             {"bundle/config.json": b"{}"},
         )
+
+    def test_saved_assets_are_automatically_extracted_on_load(self):
+        self.start()
+        directory = Path(self.temp.name) / "bundle"
+        directory.mkdir()
+        (directory / "config.json").write_text("{}")
+        self.daemon.save_asset("model", self.file())
+        self.daemon.save_asset("bundle", directory)
+        self.daemon.flush()
+        self.service.assets = {
+            row[0].name: (row[0].asset_id, row[2]) for row in self.service.saved
+        }
+        self.daemon.close()
+        self.daemon = None
+        self.start()
+        self.assertEqual(self.daemon.asset("model").read_bytes(), b"opaque bytes")
+        self.assertEqual(
+            (self.daemon.asset("bundle") / "config.json").read_text(), "{}"
+        )
+        with self.attach() as follower:
+            self.assertEqual(follower.asset("bundle"), self.daemon.asset("bundle"))
 
     def test_saves_queue_promptly_and_flush_waits_for_commit(self):
         self.start()
@@ -582,6 +620,7 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fixture asset failure"):
             self.start()
         self.assertEqual(len(self.service.end_requests), 1)
+        self.assertTrue(self.service.end_requests[0].failed)
         self.assertFalse(list(Path(self.temp.name).rglob("init.json")))
         self.service.fail_asset = False
         self.service.fail_init = True
@@ -672,6 +711,7 @@ class PipelineTests(unittest.TestCase):
         self.daemon.save_asset("model", self.file())
         with self.assertRaisesRegex(RuntimeError, "fixture save failure"):
             self.daemon.close()
+        self.assertTrue(self.service.end_requests[-1].failed)
         follower.close()
         self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
         self.assertEqual(len(self.service.end_requests), 1)

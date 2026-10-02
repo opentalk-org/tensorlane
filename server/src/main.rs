@@ -173,6 +173,14 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&uploads_cache_dir).await?;
 
     let run_repo = run_repo::RunRepo::new(database.clone());
+    for run in run_repo.list().await? {
+        if run.status == Some(run_repo::RunStatus::Running) {
+            run_repo
+                .append_status(run.id, run_repo::RunStatus::Failed)
+                .await?;
+            let _ = fs::remove_dir_all(runs_cache_dir.join(run.id.to_string())).await;
+        }
+    }
     let shutdown = CancellationToken::new();
     let http_shutdown = CancellationToken::new();
     tokio::spawn(watch_shutdown_signals(shutdown.clone()));

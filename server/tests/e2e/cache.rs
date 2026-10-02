@@ -64,6 +64,7 @@ async fn missing_blob_fails_instead_of_skipping_a_batch() -> Result<()> {
     env.init_run(&id).await?;
     assert!(env.batches(&id, false, 1).await.is_err());
     env.end_run(&id).await?;
+    assert_eq!(env.status(&id).await?, "failed");
     Ok(())
 }
 

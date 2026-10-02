@@ -123,6 +123,7 @@ pub struct TestEnv {
     pub cache_dir: PathBuf,
     pub bucket: &'static str,
     pub server: Child,
+    pub server_command: Command,
     services: Services,
     _temp: TempDir,
 }
@@ -279,7 +280,8 @@ impl TestEnv {
         let cache_dir = temp.path().join("cache");
         let http_url = format!("http://127.0.0.1:{}", port()?);
         let grpc_url = format!("http://127.0.0.1:{}", port()?);
-        let server = Command::new(env!("CARGO_BIN_EXE_tensorlane"))
+        let mut server_command = Command::new(env!("CARGO_BIN_EXE_tensorlane"));
+        server_command
             .args([
                 "--clickhouse-url",
                 &clickhouse_url,
@@ -309,8 +311,8 @@ impl TestEnv {
             .env("RUST_LOG", "tensorlane=warn")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        let server = server_command.spawn()?;
         let endpoint = Endpoint::from_shared(grpc_url.clone())?;
         let mut env = Self {
             clickhouse,
@@ -323,6 +325,7 @@ impl TestEnv {
             cache_dir,
             bucket,
             server,
+            server_command,
             services,
             _temp: temp,
         };
@@ -381,7 +384,10 @@ impl TestEnv {
     pub async fn end_run(&self, id: &str) -> Result<()> {
         self.grpc
             .clone()
-            .end(proto::EndRequest { run_id: id.into() })
+            .end(proto::EndRequest {
+                run_id: id.into(),
+                failed: false,
+            })
             .await?;
         Ok(())
     }

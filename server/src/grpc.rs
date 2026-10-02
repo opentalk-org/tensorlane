@@ -82,10 +82,10 @@ impl TensorLaneService for TensorLane {
         let request = request.into_inner();
         let run_id = parse_run_id(&request.run_id)?;
         debug!(run = %run_id, "init request");
-        let init = self
-            .runs
-            .start(run_id)
+        let runs = self.runs.clone();
+        let init = tokio::spawn(async move { runs.start(run_id).await })
             .await
+            .map_err(|err| Status::internal(err.to_string()))?
             .map_err(|err| Status::internal(format!("{err:#}")))?;
         info!(run = %run_id, "run initialized");
 
@@ -167,7 +167,11 @@ impl TensorLaneService for TensorLane {
             .map_err(|err| Status::failed_precondition(err.to_string()))?;
         let path = self.uploads.staging_path(Uuid::new_v4());
         let result = async {
-            let (size, hash) = receive_asset(&path, &mut stream).await?;
+            let (size, hash) = receive_asset(&path, &mut stream).await.inspect_err(|_| {
+                context
+                    .failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            })?;
             self.runs
                 .save_asset(context, metadata, &path, size, hash, &self.uploads)
                 .await
@@ -213,6 +217,7 @@ impl TensorLaneService for TensorLane {
                 Ok(Response::new(response))
             }
             Err(status) => {
+                self.runs.mark_failed(run_id).await;
                 error!(
                     run = %run_id,
                     error = %status,
@@ -223,11 +228,28 @@ impl TensorLaneService for TensorLane {
         }
     }
 
+    async fn heartbeat(
+        &self,
+        request: Request<crate::proto::HeartbeatRequest>,
+    ) -> Result<Response<crate::proto::HeartbeatResponse>, Status> {
+        self.runs
+            .heartbeat(parse_run_id(&request.into_inner().run_id)?)
+            .await
+            .map_err(|err| Status::not_found(err.to_string()))?;
+        Ok(Response::new(crate::proto::HeartbeatResponse {}))
+    }
+
     async fn end(&self, request: Request<EndRequest>) -> Result<Response<EndResponse>, Status> {
-        let run_id = parse_run_id(&request.into_inner().run_id)?;
+        let request = request.into_inner();
+        let run_id = parse_run_id(&request.run_id)?;
+        let status = if request.failed {
+            crate::run_repo::RunStatus::Failed
+        } else {
+            crate::run_repo::RunStatus::Succeeded
+        };
         info!(run = %run_id, "ending run");
         self.runs
-            .finish(run_id)
+            .finish(run_id, status)
             .await
             .map_err(|err| Status::internal(format!("{err:#}")))?;
 

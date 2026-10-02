@@ -229,6 +229,7 @@ pub async fn serve(
     stopping: CancellationToken,
 ) -> anyhow::Result<()> {
     let mut connections = JoinSet::new();
+    let mut failure = None;
     loop {
         tokio::select! {
             _ = stopping.cancelled() => break,
@@ -238,24 +239,30 @@ pub async fn serve(
                 let run_id = run_id.clone();
                 let stopping = stopping.clone();
                 connections.spawn(async move {
-                    if let Err(error) = receive(socket, grpc, run_id, stopping).await {
+                    let result = receive(socket, grpc, run_id, stopping).await;
+                    if let Err(error) = &result {
                         eprintln!("TensorLane upload failed: {error:#}");
                     }
+                    result
                 });
             }
-            Some(result) = connections.join_next() => { result?; }
+            Some(result) = connections.join_next() => {
+                if let Err(error) = result? { failure = Some(error); }
+            }
         }
     }
     drop(listener);
     tokio::time::timeout(FINISH_TIMEOUT, async {
         while let Some(result) = connections.join_next().await {
-            result?;
+            if let Err(error) = result? {
+                failure = Some(error);
+            }
         }
         anyhow::Ok(())
     })
     .await
     .context("uploads did not finish during shutdown")??;
-    Ok(())
+    failure.map_or(Ok(()), Err)
 }
 
 async fn receive(

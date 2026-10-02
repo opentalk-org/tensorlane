@@ -1,7 +1,10 @@
 use crate::{
     data::{Work, prefetch},
     ipc::Sender,
-    proto::{EndRequest, InitRequest, InitResponse, tensor_lane_client::TensorLaneClient},
+    proto::{
+        EndRequest, HeartbeatRequest, InitRequest, InitResponse,
+        tensor_lane_client::TensorLaneClient,
+    },
     semaphore::BatchBudget,
 };
 use anyhow::{Context, anyhow, ensure};
@@ -274,6 +277,7 @@ async fn supervise(
         format!("http://{}", options.addr)
     };
     let mut remote = None;
+    let mut heartbeat = None;
     let startup = async {
         let channel = Endpoint::from_shared(url)?
             .connect_timeout(Duration::from_secs(10))
@@ -289,6 +293,9 @@ async fn supervise(
             .await?
             .into_inner();
         remote = Some((grpc.clone(), initialized.run_id.clone()));
+        heartbeat = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
+            send_heartbeats(grpc.clone(), initialized.run_id.clone()),
+        )));
         let settings = Settings::resolve(&options, &initialized.config)?;
         std::fs::write(options.root.join("ranks"), settings.ranks.to_string())?;
         ensure!(
@@ -341,12 +348,20 @@ async fn supervise(
         Ok(Some(started)) => started,
         result => {
             let ended = match remote {
-                Some((grpc, run_id)) => end_run(grpc, run_id).await,
+                Some((grpc, run_id)) => {
+                    end_run(
+                        grpc,
+                        run_id,
+                        result.is_err() || options.root.join("failed").exists(),
+                    )
+                    .await
+                }
                 None => Ok(()),
             };
             return result.map(|_| ()).and(ended);
         }
     };
+    let mut heartbeat = heartbeat.context("heartbeat task was not started")?;
     let uploads_stopping = CancellationToken::new();
     let mut uploads = tokio::spawn(crate::uploads::serve(
         upload_listener,
@@ -402,6 +417,10 @@ async fn supervise(
         loop {
             tokio::select! {
                 result = &mut stop => return result.unwrap_or(Ok(())),
+                result = &mut heartbeat => {
+                    result.context("heartbeat task panicked")??;
+                    return Err(anyhow!("heartbeat stopped unexpectedly"));
+                },
                 result = &mut uploads => {
                     uploads_complete = true;
                     result.context("upload task panicked")??;
@@ -441,14 +460,39 @@ async fn supervise(
     } else {
         result
     };
-    let ended = end_run(grpc, initialized.run_id).await;
+    let failed = result.is_err() || options.root.join("failed").exists();
+    let ended = end_run(grpc, initialized.run_id, failed).await;
     result.and(ended)
 }
 
-async fn end_run(mut grpc: TensorLaneClient<Channel>, run_id: String) -> anyhow::Result<()> {
-    tokio::time::timeout(Duration::from_secs(30), grpc.end(EndRequest { run_id }))
+async fn send_heartbeats(
+    mut grpc: TensorLaneClient<Channel>,
+    run_id: String,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            grpc.heartbeat(HeartbeatRequest {
+                run_id: run_id.clone(),
+            }),
+        )
         .await
-        .context("End RPC timed out")?
-        .context("End RPC failed")?;
+        .context("heartbeat timed out")??;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+}
+
+async fn end_run(
+    mut grpc: TensorLaneClient<Channel>,
+    run_id: String,
+    failed: bool,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        grpc.end(EndRequest { run_id, failed }),
+    )
+    .await
+    .context("End RPC timed out")?
+    .context("End RPC failed")?;
     Ok(())
 }

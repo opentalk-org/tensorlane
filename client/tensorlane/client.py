@@ -121,6 +121,9 @@ class TensorLane:
         try:
             if self._uploads is not None:
                 self._uploads.close()
+        except BaseException as error:
+            self._fail(error)
+            raise
         finally:
             self._uploads = None
             self._close_daemon()
@@ -204,7 +207,12 @@ class TensorLane:
     def __enter__(self) -> TensorLane:
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def _fail(self, error: BaseException) -> None:
+        (self._root / "failed").write_text(str(error))
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if exc_type is not None:
+            self._fail(exc_value)
         self.close()
 
 
@@ -387,7 +395,8 @@ def init(
         temporary.replace(root / "init.json")
         native.check()
         return daemon
-    except BaseException:
+    except BaseException as error:
+        daemon._fail(error)
         daemon.close()
         raise
 

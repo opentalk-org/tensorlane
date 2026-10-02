@@ -256,3 +256,84 @@ async fn shutdown_waits_for_pending_checkpoint_and_artifact_uploads() -> Result<
     assert!(files(&env.cache_dir.join("uploads"))?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn failed_end_is_terminal_and_retry_does_not_overwrite_it() -> Result<()> {
+    let env = TestEnv::start().await?;
+    let dataset = env.seed_dataset(1).await?;
+    let run = env.create_run(run_config(dataset, 1)).await?;
+    env.init_run(&run).await?;
+    env.grpc
+        .clone()
+        .end(proto::EndRequest {
+            run_id: run.clone(),
+            failed: true,
+        })
+        .await?;
+    assert_eq!(env.status(&run).await?, "failed");
+    assert!(!env.run_cache(&run).exists());
+    env.end_run(&run).await?;
+    assert_eq!(env.status(&run).await?, "failed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn heartbeat_keeps_live_run_and_abandoned_run_expires() -> Result<()> {
+    let mut env = TestEnv::start().await?;
+    let dataset = env.seed_dataset(1).await?;
+    let lost = env.create_run(run_config(dataset, 1)).await?;
+    let live = env.create_run(run_config(dataset, 1)).await?;
+    env.init_run(&lost).await?;
+    env.init_run(&live).await?;
+    env.signal("-TERM")?;
+    env.wait_shutdown().await?;
+    tokio::time::timeout(Duration::from_secs(80), async {
+        loop {
+            env.grpc
+                .clone()
+                .heartbeat(proto::HeartbeatRequest {
+                    run_id: live.clone(),
+                })
+                .await?;
+            if env.status(&lost).await? == "failed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await??;
+    assert!(!env.run_cache(&lost).exists());
+    assert_eq!(env.status(&live).await?, "running");
+    env.end_run(&lost).await?;
+    assert_eq!(env.status(&lost).await?, "failed");
+    env.end_run(&live).await?;
+    assert_eq!(env.status(&live).await?, "succeeded");
+    assert!(env.wait_exit().await?.success());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_fails_stranded_runs_and_preserves_queued_runs() -> Result<()> {
+    let mut env = TestEnv::start().await?;
+    let dataset = env.seed_dataset(1).await?;
+    let active = env.create_run(run_config(dataset, 1)).await?;
+    let queued = env.create_run(run_config(dataset, 1)).await?;
+    env.init_run(&active).await?;
+    env.server.kill()?;
+    env.server.wait()?;
+    env.server = env.server_command.spawn()?;
+    eventually("restart recovery", || async {
+        Ok(env
+            .status(&active)
+            .await
+            .ok()
+            .filter(|status| status == "failed"))
+    })
+    .await?;
+    assert!(!env.run_cache(&active).exists());
+    assert_eq!(env.status(&queued).await?, "queued");
+    env.signal("-TERM")?;
+    assert!(env.wait_exit().await?.success());
+    Ok(())
+}

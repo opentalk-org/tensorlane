@@ -6,6 +6,7 @@ service TensorLane {
   rpc Asset (AssetRequest) returns (stream AssetResponse);
   rpc SaveAsset (stream SaveAssetRequest) returns (SaveAssetResponse);
   rpc Metrics (stream MetricsRequest) returns (MetricsResponse);
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse);
   rpc End (EndRequest) returns (EndResponse);
 }
 message InitRequest { string run_id = 1; }
@@ -104,8 +105,12 @@ message MetricsResponse {
   uint64 array_metrics_received = 4;
 }
 
+message HeartbeatRequest { string run_id = 1; }
+message HeartbeatResponse {}
+
 message EndRequest {
   string run_id = 1;
+  bool failed = 2;
 }
 
 message EndResponse {}

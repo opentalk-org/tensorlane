@@ -10,7 +10,11 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 use tokio::{
     fs,
@@ -51,6 +55,8 @@ struct Run {
     heads: Arc<Mutex<HashMap<String, AssetHead>>>,
     asset_type: Option<String>,
     saves: TaskTracker,
+    last_seen: tokio::time::Instant,
+    failed: Arc<AtomicBool>,
     _lifetime: TaskTrackerToken,
 }
 pub struct RunInitialization {
@@ -60,6 +66,7 @@ pub struct RunInitialization {
 }
 pub struct SaveContext {
     pub run_id: Uuid,
+    pub failed: Arc<AtomicBool>,
     head: AssetHead,
     asset_type: Option<String>,
     _lifetime: TaskTrackerToken,
@@ -88,13 +95,13 @@ impl RunExecutor {
         }
     }
     pub async fn start(&self, id: Uuid) -> Result<RunInitialization> {
-        let lifetime = {
+        let (lifetime, _initializing) = {
             let tracker = self.lifecycle.lock().await;
             ensure!(
                 !tracker.is_closed(),
                 "server is shutting down; new runs are not accepted"
             );
-            tracker.token()
+            (tracker.token(), tracker.token())
         };
         {
             let mut starting = self.starting.lock().await;
@@ -104,7 +111,10 @@ impl RunExecutor {
             );
             starting.insert(id);
         }
-        let result = self.initialize(id, lifetime).await;
+        let result = tokio::time::timeout(Duration::from_secs(600), self.initialize(id, lifetime))
+            .await
+            .context("run initialization timed out")
+            .and_then(|result| result);
         self.starting.lock().await.remove(&id);
         if result.is_err() {
             let _ = fs::remove_dir_all(self.cache.join(id.to_string())).await;
@@ -197,9 +207,29 @@ impl RunExecutor {
                 heads: Arc::new(Mutex::new(heads)),
                 asset_type: config.asset_type,
                 saves: TaskTracker::new(),
+                last_seen: tokio::time::Instant::now(),
+                failed: Arc::new(AtomicBool::new(false)),
                 _lifetime: lifetime,
             },
         );
+        let executor = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let expired = {
+                    let mut runs = executor.runs.write().await;
+                    let Some(run) = runs.get(&id) else { return };
+                    if run.last_seen.elapsed() < Duration::from_secs(60) {
+                        continue;
+                    }
+                    runs.remove(&id).unwrap()
+                };
+                if let Err(error) = executor.complete(id, expired, RunStatus::Failed).await {
+                    tracing::error!(%id, %error, "expiring disconnected run failed");
+                }
+                return;
+            }
+        });
         Ok(RunInitialization {
             config: serde_json::to_string(&record.config)?,
             assets,
@@ -218,16 +248,60 @@ impl RunExecutor {
             .context("unknown stream")?
             .clone();
         let (reply, result) = oneshot::channel();
-        sender.send(BatchRequest { reply }).await?;
-        result.await?
+        let outcome = async {
+            sender.send(BatchRequest { reply }).await?;
+            result.await?
+        }
+        .await;
+        if outcome.is_err() {
+            self.mark_failed(id).await;
+        }
+        outcome
     }
-    pub async fn finish(&self, id: Uuid) -> Result<()> {
-        let run = self.runs.write().await.remove(&id).context("unknown run")?;
+    pub async fn heartbeat(&self, id: Uuid) -> Result<()> {
+        let mut runs = self.runs.write().await;
+        runs.get_mut(&id).context("unknown run")?.last_seen = tokio::time::Instant::now();
+        Ok(())
+    }
+    pub async fn mark_failed(&self, id: Uuid) {
+        if let Some(run) = self.runs.read().await.get(&id) {
+            run.failed.store(true, Ordering::Release);
+        }
+    }
+    pub async fn finish(&self, id: Uuid, status: RunStatus) -> Result<()> {
+        let run = self.runs.write().await.remove(&id);
+        match run {
+            Some(run) => {
+                let executor = self.clone();
+                tokio::spawn(async move { executor.complete(id, run, status).await })
+                    .await
+                    .context("run completion task panicked")?
+            }
+            None => {
+                let record = self.repo.get(id).await?.context("unknown run")?;
+                ensure!(
+                    matches!(
+                        record.status,
+                        Some(RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled)
+                    ),
+                    "run is not active"
+                );
+                Ok(())
+            }
+        }
+    }
+    async fn complete(&self, id: Uuid, run: Run, status: RunStatus) -> Result<()> {
         run.saves.close();
         run.cancel.cancel();
-        run.handle.await?;
+        let joined = run.handle.await;
         run.saves.wait().await;
-        self.repo.append_status(id, RunStatus::Succeeded).await?;
+        let status = if joined.is_err() || run.failed.load(Ordering::Acquire) {
+            RunStatus::Failed
+        } else {
+            status
+        };
+        self.repo.append_status(id, status).await?;
+        joined?;
         Ok(())
     }
     pub async fn asset(&self, id: Uuid, name: &str) -> Result<(PathBuf, AssetMetadata)> {
@@ -255,6 +329,7 @@ impl RunExecutor {
             .clone();
         Ok(SaveContext {
             run_id,
+            failed: run.failed.clone(),
             head,
             asset_type: run.asset_type.clone(),
             _lifetime: run.saves.token(),
@@ -263,6 +338,23 @@ impl RunExecutor {
     pub async fn save_asset(
         &self,
         context: SaveContext,
+        metadata: SaveAssetMetadata,
+        path: &Path,
+        size: u64,
+        hash: [u8; 64],
+        uploads: &UploadStore,
+    ) -> Result<Uuid> {
+        let outcome = self
+            .commit_asset(&context, metadata, path, size, hash, uploads)
+            .await;
+        if outcome.is_err() {
+            context.failed.store(true, Ordering::Release);
+        }
+        outcome
+    }
+    async fn commit_asset(
+        &self,
+        context: &SaveContext,
         metadata: SaveAssetMetadata,
         path: &Path,
         size: u64,
@@ -323,7 +415,7 @@ impl RunExecutor {
             content_hash: hash,
             asset_type: metadata
                 .asset_type
-                .or(context.asset_type)
+                .or_else(|| context.asset_type.clone())
                 .or_else(|| head.as_ref().map(|asset| asset.asset_type.clone()))
                 .unwrap_or_else(|| "generic".into()),
             metadata: metadata.metadata_json,

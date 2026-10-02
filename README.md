@@ -111,7 +111,7 @@ The data-pipeline load benchmark is [client/benchmarks/load_test.py](client/benc
 
 ## Assets and history
 
-Input assets accept exactly one source: `{"asset_id":"registered-uuid"}` or `{"object":"inputs/model","entrypoint":"weights"}`. Registered IDs resolve to the current nondeleted row. Inputs download once before workers start; followers receive the same paths. `lane.asset("model")` returns the unchanged file, and `lane.asset_metadata["model"]` exposes its registered ID, kind, type, metadata, and optional entrypoint.
+Input assets accept exactly one source: `{"asset_id":"registered-uuid"}` or `{"object":"inputs/model","entrypoint":"weights"}`. Registered IDs resolve to the current nondeleted row. Inputs download once before workers start; followers receive the same paths. TAR inputs are automatically extracted. `lane.asset("model")` returns the original file or directory for archives saved by TensorLane, the extraction directory for archives with multiple top-level entries, or the selected relative `entrypoint` when supplied. Raw inputs remain unchanged. Archive links and paths outside the extraction directory are rejected. `lane.asset_metadata["model"]` exposes its registered ID, kind, type, metadata, and optional entrypoint.
 
 ```python
 saved_id = lane.save_asset(
@@ -126,6 +126,8 @@ Files and directories use TAR packaging and multipart upload. `kind` defaults to
 Commits serialize per `(run_id, name)` and attach the previous committed ID as `ancestor_asset_id`: loading A, saving B, and saving C produces A → B → C. A later run loading C and saving D produces C → D. The first save without a registered input uses the null UUID. Different names have independent chains. Failed saves preserve the head; reinitialization recovers it from persisted rows. Retries of committed IDs return the same ID, while conflicting retries fail. All earlier rows remain available.
 
 `GET /assets/{asset_id}` returns the parent, run, name, step, kind, metadata, type, object path, size, hash, and timestamp. `GET /runs/{run_id}/assets` reads run history, optionally filtered by `?name=model`. Scalar metrics, array metrics, and metric artifacts retain their existing protobuf API and tables; Python's `metric` and `metric_artifact` APIs remain separate from asset saves.
+
+Run completion records `succeeded` on a clean close and `failed` on initialization, worker, upload, or application-context errors. The daemon sends a heartbeat every 10 seconds; a run without a heartbeat for 60 seconds is failed and its server cache is removed. Server shutdown drains live runs and expires abandoned ones. On restart, the server marks previously running runs failed. One server owns the run database; rebuild both server and client for the heartbeat protocol.
 
 ## Storage and verification
 
