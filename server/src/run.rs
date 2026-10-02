@@ -1,284 +1,356 @@
+use crate::{
+    asset_repo::{AssetRecord, AssetRepo, kind_name, kind_value},
+    loader::Loader,
+    prefetch::LoadedBatch,
+    proto::{AssetMetadata, SaveAssetMetadata},
+    run_repo::{RunRepo, RunStatus},
+    uploads::UploadStore,
+};
+use anyhow::{Context, Result, ensure};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-use anyhow::{Context, Result, anyhow, bail};
 use tokio::{
     fs,
     io::AsyncWriteExt,
-    sync::{
-        Mutex, RwLock,
-        mpsc::{self, Sender},
-        oneshot,
-    },
+    sync::{Mutex, RwLock, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::{
     sync::CancellationToken,
     task::{TaskTracker, task_tracker::TaskTrackerToken},
 };
-use tracing::{Instrument, info, info_span};
 use uuid::Uuid;
-
-use crate::{
-    loader::Loader,
-    prefetch::LoadedBatch,
-    run_repo::{RunRepo, RunStatus},
-};
-
 mod config;
 mod state;
-pub use config::DataConfig;
+pub use config::Config;
 use state::{BatchRequest, RunState};
 
+type AssetHead = Arc<Mutex<Option<AssetRecord>>>;
 #[derive(Clone)]
 pub struct RunExecutor {
     runs: Arc<RwLock<HashMap<Uuid, Run>>>,
+    starting: Arc<Mutex<HashSet<Uuid>>>,
+    save_ids: Arc<Mutex<HashMap<Uuid, std::sync::Weak<Mutex<()>>>>>,
     lifecycle: Arc<Mutex<TaskTracker>>,
     repo: RunRepo,
-    data_source: clickhouse::Client,
+    database: clickhouse::Client,
     loader: Arc<dyn Loader>,
-    cache_dir: &'static Path,
-    assets: AssetStore,
+    cache: &'static Path,
+    s3: aws_sdk_s3::Client,
+    bucket: &'static str,
+    asset_repo: AssetRepo,
 }
-
-pub struct Run {
-    tx: Sender<BatchRequest>,
+struct Run {
+    senders: HashMap<String, mpsc::Sender<BatchRequest>>,
     cancel: CancellationToken,
     handle: JoinHandle<()>,
-    config: DataConfig,
+    inputs: HashMap<String, (PathBuf, AssetMetadata)>,
+    heads: Arc<Mutex<HashMap<String, AssetHead>>>,
+    asset_type: Option<String>,
+    saves: TaskTracker,
     _lifetime: TaskTrackerToken,
 }
-
 pub struct RunInitialization {
-    pub train_config: String,
+    pub config: String,
     pub assets: Vec<String>,
+    pub streams: Vec<String>,
 }
-
+pub struct SaveContext {
+    pub run_id: Uuid,
+    head: AssetHead,
+    asset_type: Option<String>,
+    _lifetime: TaskTrackerToken,
+}
 impl RunExecutor {
     pub fn new(
         repo: RunRepo,
-        data_source: clickhouse::Client,
+        database: clickhouse::Client,
         loader: Arc<dyn Loader>,
-        root_cache_dir: &'static Path,
-        s3_client: aws_sdk_s3::Client,
+        cache: &'static Path,
+        s3: aws_sdk_s3::Client,
         bucket: &'static str,
     ) -> Self {
         Self {
             runs: Default::default(),
+            starting: Default::default(),
+            save_ids: Default::default(),
             lifecycle: Default::default(),
             repo,
-            data_source,
-            cache_dir: root_cache_dir,
+            asset_repo: AssetRepo::new(database.clone()),
+            database,
             loader,
-            assets: AssetStore {
-                s3_client,
-                bucket,
-                root: root_cache_dir,
-            },
+            cache,
+            s3,
+            bucket,
         }
     }
-
-    /// Starts a new run and returns its train config.
     pub async fn start(&self, id: Uuid) -> Result<RunInitialization> {
-        let lifetime = self.admit().await?;
-        if self.runs.read().await.contains_key(&id) {
-            bail!("run is already active");
+        let lifetime = {
+            let tracker = self.lifecycle.lock().await;
+            ensure!(
+                !tracker.is_closed(),
+                "server is shutting down; new runs are not accepted"
+            );
+            tracker.token()
+        };
+        {
+            let mut starting = self.starting.lock().await;
+            ensure!(
+                !starting.contains(&id) && !self.runs.read().await.contains_key(&id),
+                "run is already active"
+            );
+            starting.insert(id);
         }
-        let run_record = self
-            .repo
-            .get(id)
-            .await?
-            .ok_or_else(|| anyhow!("run not found"))?;
-        let train_config = serde_json::to_string(&run_record.train_config)?;
-        let run_span = info_span!("run", run = %id);
-
-        let state = RunState::new(
-            id,
-            &self.data_source,
-            self.loader.clone(),
-            self.cache_dir,
-            &run_record.data_config,
-        )
-        .instrument(run_span)
-        .await?;
-
-        let setup: Result<()> = async {
-            self.repo.append_status(id, RunStatus::Running).await?;
-            let assets = futures::future::join_all(
-                run_record
-                    .data_config
-                    .assets
-                    .iter()
-                    .map(|(name, asset)| self.assets.ensure(id, name, &asset.object)),
-            )
-            .await;
-            for asset in assets {
-                asset?;
+        let result = self.initialize(id, lifetime).await;
+        self.starting.lock().await.remove(&id);
+        if result.is_err() {
+            let _ = fs::remove_dir_all(self.cache.join(id.to_string())).await;
+            let _ = self.repo.append_status(id, RunStatus::Failed).await;
+        }
+        result
+    }
+    async fn initialize(&self, id: Uuid, lifetime: TaskTrackerToken) -> Result<RunInitialization> {
+        let record = self.repo.get(id).await?.context("run not found")?;
+        let config = Config::parse(&record.config)?;
+        let mut inputs = HashMap::new();
+        let mut heads = HashMap::new();
+        self.repo.append_status(id, RunStatus::Running).await?;
+        for (index, (name, input)) in config.assets.iter().enumerate() {
+            let registered = if let Some(id) = input.asset_id {
+                Some(
+                    self.asset_repo
+                        .get(id)
+                        .await?
+                        .context("input asset not found or deleted")?,
+                )
+            } else {
+                None
+            };
+            let object = registered
+                .as_ref()
+                .map(|record| record.path.as_str())
+                .or(input.object.as_deref())
+                .unwrap();
+            let metadata = AssetMetadata {
+                entrypoint: input.entrypoint.clone(),
+                asset_id: registered.as_ref().map(|asset| asset.id.to_string()),
+                metadata_json: registered
+                    .as_ref()
+                    .map(|asset| asset.metadata.clone())
+                    .unwrap_or_else(|| "{}".into()),
+                kind: registered
+                    .as_ref()
+                    .map(|asset| kind_name(asset.kind))
+                    .transpose()?
+                    .unwrap_or("file")
+                    .into(),
+                asset_type: registered
+                    .as_ref()
+                    .map(|asset| asset.asset_type.clone())
+                    .unwrap_or_else(|| "generic".into()),
+            };
+            let directory = self
+                .cache
+                .join(id.to_string())
+                .join("assets")
+                .join(index.to_string());
+            fs::create_dir_all(&directory).await?;
+            let path = directory.join("data");
+            let part = directory.join("download.part");
+            let mut body = self
+                .s3
+                .get_object()
+                .bucket(self.bucket)
+                .key(object)
+                .send()
+                .await?
+                .body;
+            let mut file = fs::File::create(&part).await?;
+            while let Some(bytes) = body.try_next().await? {
+                file.write_all(&bytes).await?;
             }
-            Ok(())
+            file.sync_all().await?;
+            drop(file);
+            fs::rename(part, &path).await?;
+            inputs.insert(name.clone(), (path, metadata));
+            heads.insert(name.clone(), Arc::new(Mutex::new(registered)));
         }
-        .await;
-
-        if let Err(err) = setup {
-            state.finish().await;
-            return Err(err);
+        for asset in self.asset_repo.for_run(id, None).await? {
+            heads.insert(asset.name.clone(), Arc::new(Mutex::new(Some(asset))));
         }
-
-        let cancel = state.cancel_token.clone();
-
-        let (tx, rx) = mpsc::channel(1);
-        let actor_lifetime = lifetime.clone();
-        let handle = tokio::spawn(async move {
-            let _lifetime = actor_lifetime;
-            state.handle_requests(rx).await;
-        });
-
-        let mut runs = self.runs.write().await;
-        runs.insert(
+        let state =
+            RunState::new(id, &self.database, self.loader.clone(), self.cache, &config).await?;
+        let cancel = state.cancel.clone();
+        let (senders, handle) = state.start();
+        let streams = config.queries.keys().cloned().collect();
+        let assets = config.assets.keys().cloned().collect();
+        self.runs.write().await.insert(
             id,
             Run {
-                tx,
+                senders,
                 cancel,
                 handle,
-                config: run_record.data_config.clone(),
+                inputs,
+                heads: Arc::new(Mutex::new(heads)),
+                asset_type: config.asset_type,
+                saves: TaskTracker::new(),
                 _lifetime: lifetime,
             },
         );
-
         Ok(RunInitialization {
-            train_config,
-            assets: run_record.data_config.assets.keys().cloned().collect(),
+            config: serde_json::to_string(&record.config)?,
+            assets,
+            streams,
         })
     }
-
-    pub async fn next_batch(&self, id: Uuid, validation: bool) -> Result<Option<LoadedBatch>> {
-        let sender = {
-            let runs = self.runs.read().await;
-            runs.get(&id)
-                .ok_or_else(|| anyhow!("unknown run"))?
-                .tx
-                .clone()
-        };
-
-        let (tx, rx) = oneshot::channel();
-        sender
-            .send(BatchRequest {
-                validation,
-                reply: tx,
-            })
-            .await?;
-
-        rx.await?
+    pub async fn next_batch(&self, id: Uuid, stream: &str) -> Result<Option<LoadedBatch>> {
+        let sender = self
+            .runs
+            .read()
+            .await
+            .get(&id)
+            .context("unknown run")?
+            .senders
+            .get(stream)
+            .context("unknown stream")?
+            .clone();
+        let (reply, result) = oneshot::channel();
+        sender.send(BatchRequest { reply }).await?;
+        result.await?
     }
-
-    /// Finish a single run.
     pub async fn finish(&self, id: Uuid) -> Result<()> {
-        let mut runs = self.runs.write().await;
-        let Some(run) = runs.remove(&id) else {
-            bail!("unknown run");
-        };
-        drop(runs);
-
+        let run = self.runs.write().await.remove(&id).context("unknown run")?;
+        run.saves.close();
         run.cancel.cancel();
         run.handle.await?;
-
+        run.saves.wait().await;
         self.repo.append_status(id, RunStatus::Succeeded).await?;
-
         Ok(())
     }
-
-    pub async fn asset(&self, id: Uuid, name: &str) -> Result<(PathBuf, Option<String>)> {
-        let runs = self.runs.read().await;
-
-        let Some(run) = runs.get(&id) else {
-            bail!("unknown run");
-        };
-        let Some(asset) = run.config.assets.get(name) else {
-            bail!("unknown asset");
-        };
-
-        self.assets.ensure(id, name, &asset.object).await?;
-        let path = self.assets.path(id, name);
-        let entrypoint = asset.entrypoint.clone();
-
-        Ok((path, entrypoint))
-    }
-
-    pub async fn asset_type(&self, id: Uuid) -> Result<String> {
-        let runs = self.runs.read().await;
-        let Some(run) = runs.get(&id) else {
-            bail!("unknown run");
-        };
-
-        return Ok(run.config.asset_type.clone());
-    }
-
-    pub async fn is_running(&self, id: Uuid) -> bool {
-        let runs = self.runs.read().await;
-        return runs.contains_key(&id);
-    }
-
-    async fn admit(&self) -> Result<TaskTrackerToken> {
-        let lifecycle = self.lifecycle.lock().await;
-        if lifecycle.is_closed() {
-            bail!("server is shutting down; new runs are not accepted");
-        }
-        Ok(lifecycle.token())
-    }
-
-    pub async fn shutdown(&self) {
-        let lifecycle = {
-            let lifecycle = self.lifecycle.lock().await;
-            lifecycle.close();
-            lifecycle.clone()
-        };
-        info!(
-            pending = lifecycle.len(),
-            "waiting for active runs before shutdown"
-        );
-        lifecycle.wait().await;
-    }
-}
-
-#[derive(Clone)]
-struct AssetStore {
-    s3_client: aws_sdk_s3::Client,
-    bucket: &'static str,
-    root: &'static Path,
-}
-
-impl AssetStore {
-    pub fn path(&self, run_id: Uuid, name: &str) -> PathBuf {
-        self.root.join(run_id.to_string()).join("assets").join(name)
-    }
-
-    pub async fn ensure(&self, run_id: Uuid, name: &str, key: &str) -> anyhow::Result<PathBuf> {
-        let run_dir = self.root.join(run_id.to_string()).join("assets");
-        fs::create_dir_all(&run_dir).await?;
-        let path = run_dir.join(name);
-        if fs::try_exists(&path).await? {
-            return Ok(path);
-        }
-
-        let part = run_dir.join(format!("{name}.part"));
-        info!(run = %run_id, asset = name, key, "downloading asset");
-        let mut object = self
-            .s3_client
-            .get_object()
-            .bucket(self.bucket)
-            .key(key)
-            .send()
+    pub async fn asset(&self, id: Uuid, name: &str) -> Result<(PathBuf, AssetMetadata)> {
+        Ok(self
+            .runs
+            .read()
             .await
-            .with_context(|| format!("fetching asset {name} from {key}"))?;
-        let mut file = fs::File::create(&part).await?;
-        while let Some(bytes) = object.body.try_next().await? {
-            file.write_all(&bytes).await?;
+            .get(&id)
+            .context("unknown run")?
+            .inputs
+            .get(name)
+            .context("unknown asset")?
+            .clone())
+    }
+    pub async fn admit_save(&self, run_id: Uuid, name: &str) -> Result<SaveContext> {
+        ensure!(!name.is_empty(), "asset name must not be empty");
+        let runs = self.runs.read().await;
+        let run = runs.get(&run_id).context("unknown run")?;
+        let head = run
+            .heads
+            .lock()
+            .await
+            .entry(name.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        Ok(SaveContext {
+            run_id,
+            head,
+            asset_type: run.asset_type.clone(),
+            _lifetime: run.saves.token(),
+        })
+    }
+    pub async fn save_asset(
+        &self,
+        context: SaveContext,
+        metadata: SaveAssetMetadata,
+        path: &Path,
+        size: u64,
+        hash: [u8; 64],
+        uploads: &UploadStore,
+    ) -> Result<Uuid> {
+        let id: Uuid = metadata.asset_id.parse().context("invalid asset ID")?;
+        ensure!(!id.is_nil(), "asset ID must not be nil");
+        let kind = kind_value(&metadata.kind)?;
+        let _: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&metadata.metadata_json)
+                .context("asset metadata must be a JSON object")?;
+        let id_lock = {
+            let mut locks = self.save_ids.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&id).and_then(std::sync::Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(id, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        let _id_guard = id_lock.lock().await;
+        let mut head = context.head.lock().await;
+        if let Some(existing) = self.asset_repo.get(id).await? {
+            ensure!(
+                existing.run_id == context.run_id
+                    && existing.name == metadata.name
+                    && existing.content_hash == hash
+                    && existing.kind == kind
+                    && existing.step == metadata.step
+                    && existing.metadata == metadata.metadata_json
+                    && metadata
+                        .asset_type
+                        .as_ref()
+                        .is_none_or(|value| value == &existing.asset_type),
+                "conflicting retry of asset ID"
+            );
+            return Ok(id);
         }
-        file.sync_all().await?;
-        fs::rename(&part, &path).await?;
-        Ok(path)
+        let now = time::OffsetDateTime::now_utc();
+        let mut updated_at = now.replace_nanosecond(now.nanosecond() / 1000 * 1000)?;
+        if let Some(parent) = head.as_ref()
+            && updated_at <= parent.updated_at
+        {
+            updated_at = parent.updated_at + time::Duration::microseconds(1);
+        }
+        let record = AssetRecord {
+            id,
+            updated_at,
+            kind,
+            name: metadata.name,
+            step: metadata.step,
+            path: uploads.asset_key(id),
+            size,
+            content_hash: hash,
+            asset_type: metadata
+                .asset_type
+                .or(context.asset_type)
+                .or_else(|| head.as_ref().map(|asset| asset.asset_type.clone()))
+                .unwrap_or_else(|| "generic".into()),
+            metadata: metadata.metadata_json,
+            run_id: context.run_id,
+            ancestor_asset_id: head.as_ref().map(|asset| asset.id).unwrap_or(Uuid::nil()),
+            deleted: false,
+        };
+        if let Err(error) = uploads.save_asset(&record, path).await {
+            let committed = self.asset_repo.get(id).await?;
+            if !committed.as_ref().is_some_and(|asset| {
+                asset.content_hash == hash && asset.ancestor_asset_id == record.ancestor_asset_id
+            }) {
+                return Err(error);
+            }
+        }
+        *head = Some(record);
+        Ok(id)
+    }
+    pub async fn is_running(&self, id: Uuid) -> bool {
+        self.runs.read().await.contains_key(&id)
+    }
+    pub async fn shutdown(&self) {
+        let tracker = {
+            let tracker = self.lifecycle.lock().await;
+            tracker.close();
+            tracker.clone()
+        };
+        tracker.wait().await;
     }
 }

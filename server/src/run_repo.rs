@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::run::DataConfig;
+use crate::run::Config;
 
 const SELECT_RUNS: &str = "
 select ?fields from runs
@@ -48,8 +48,7 @@ pub struct Run {
     pub id: Uuid,
     pub project_id: Uuid,
     pub name: String,
-    pub data_config: DataConfig,
-    pub train_config: Map<String, Value>,
+    pub config: Map<String, Value>,
     pub status: Option<RunStatus>,
     pub status_timestamp: Option<OffsetDateTime>,
 }
@@ -61,8 +60,7 @@ struct RunConfigRow {
     #[serde(with = "clickhouse::serde::uuid")]
     project_id: Uuid,
     name: String,
-    data_config: String,
-    train_config: String,
+    config: String,
 }
 
 #[derive(clickhouse::Row, Serialize)]
@@ -81,8 +79,7 @@ struct RunRow {
     #[serde(with = "clickhouse::serde::uuid")]
     project_id: Uuid,
     name: String,
-    data_config: String,
-    train_config: String,
+    config: String,
     status: Option<i8>,
     #[serde(with = "clickhouse::serde::time::datetime64::nanos::option")]
     status_timestamp: Option<OffsetDateTime>,
@@ -96,8 +93,7 @@ impl TryFrom<RunRow> for Run {
             id: row.id,
             project_id: row.project_id,
             name: row.name,
-            data_config: serde_json::from_str(&row.data_config)?,
-            train_config: serde_json::from_str(&row.train_config)?,
+            config: serde_json::from_str(&row.config)?,
             status: row.status.map(RunStatus::try_from).transpose()?,
             status_timestamp: row.status_timestamp,
         })
@@ -118,21 +114,24 @@ impl RunRepo {
         &self,
         project_id: Uuid,
         name: &str,
-        data_config: &DataConfig,
-        train_config: &Map<String, Value>,
+        config: &Map<String, Value>,
     ) -> Result<Uuid> {
+        Config::parse(config)?;
         let row = RunConfigRow {
             id: Uuid::new_v4(),
             project_id,
             name: name.to_owned(),
-            data_config: serde_json::to_string(data_config)?,
-            train_config: serde_json::to_string(train_config)?,
+            config: serde_json::to_string(config)?,
         };
         let mut insert = self.client.insert::<RunConfigRow>("runs").await?;
         insert.write(&row).await?;
         insert.end().await?;
         self.append_status(row.id, RunStatus::Queued).await?;
         Ok(row.id)
+    }
+
+    pub fn assets(&self) -> crate::asset_repo::AssetRepo {
+        crate::asset_repo::AssetRepo::new(self.client.clone())
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Run>> {

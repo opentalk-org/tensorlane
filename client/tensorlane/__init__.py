@@ -1,6 +1,4 @@
-"""Public Python API for TensorLane."""
-
 from .client import BatchReader, TensorLane, init
-from .data import Batch, Sample
+from .data import Batch, RawSample
 
-__all__ = ["init", "TensorLane", "BatchReader", "Sample", "Batch"]
+__all__ = ["init", "TensorLane", "BatchReader", "RawSample", "Batch"]

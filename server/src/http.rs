@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        Path, Query, State,
         rejection::{JsonRejection, PathRejection},
     },
     http::StatusCode,
@@ -19,7 +19,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    run::DataConfig,
+    run::Config,
     run_repo::{Run, RunRepo, RunStatus},
 };
 
@@ -27,8 +27,7 @@ use crate::{
 struct CreateRunRequest {
     project_id: Uuid,
     name: String,
-    data_config: DataConfig,
-    train_config: Map<String, Value>,
+    config: Map<String, Value>,
 }
 
 #[derive(Serialize)]
@@ -85,8 +84,7 @@ struct RunResponse {
     run_id: Uuid,
     project_id: Uuid,
     name: String,
-    data_config: DataConfig,
-    train_config: Map<String, Value>,
+    config: Map<String, Value>,
     status: Option<RunStatus>,
     #[serde(with = "time::serde::rfc3339::option")]
     status_timestamp: Option<OffsetDateTime>,
@@ -100,6 +98,8 @@ pub async fn serve(
     let app = Router::new()
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run))
+        .route("/runs/{run_id}/assets", get(run_assets))
+        .route("/assets/{asset_id}", get(get_asset))
         .fallback(async || AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Route not found")))
         .method_not_allowed_fallback(async || {
             AppError::new(
@@ -123,13 +123,9 @@ async fn create_run(
     request: Result<Json<CreateRunRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), AppError> {
     let Json(request) = request.map_err(|err| AppError::new(err.status(), err))?;
+    Config::parse(&request.config).map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err))?;
     let run_id = run_repo
-        .create(
-            request.project_id,
-            &request.name,
-            &request.data_config,
-            &request.train_config,
-        )
+        .create(request.project_id, &request.name, &request.config)
         .await?;
     info!(run = %run_id, "run created");
     Ok((
@@ -168,10 +164,44 @@ impl From<Run> for RunResponse {
             run_id: run.id,
             project_id: run.project_id,
             name: run.name,
-            data_config: run.data_config,
-            train_config: run.train_config,
+            config: run.config,
             status: run.status,
             status_timestamp: run.status_timestamp,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct AssetFilter {
+    name: Option<String>,
+}
+async fn get_asset(
+    State(repo): State<RunRepo>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<crate::asset_repo::AssetInfo>, AppError> {
+    let asset =
+        repo.assets().get(id).await?.ok_or_else(|| {
+            AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Asset not found"))
+        })?;
+    Ok(Json(asset.info()?))
+}
+async fn run_assets(
+    State(repo): State<RunRepo>,
+    Path(id): Path<Uuid>,
+    Query(filter): Query<AssetFilter>,
+) -> Result<Json<Vec<crate::asset_repo::AssetInfo>>, AppError> {
+    if repo.get(id).await?.is_none() {
+        return Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            anyhow::anyhow!("Run not found"),
+        ));
+    }
+    let assets = repo
+        .assets()
+        .for_run(id, filter.name.as_deref())
+        .await?
+        .into_iter()
+        .map(|asset| asset.info())
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Json(assets))
 }

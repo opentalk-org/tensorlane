@@ -17,21 +17,34 @@ pub struct Daemon {
     #[pyo3(get)]
     run_id: String,
     #[pyo3(get)]
-    train_config: String,
+    config: String,
     #[pyo3(get)]
     assets: HashMap<String, PathBuf>,
+    #[pyo3(get)]
+    streams: Vec<String>,
+    #[pyo3(get)]
+    asset_metadata: HashMap<String, String>,
+    #[pyo3(get)]
+    ranks: usize,
+    #[pyo3(get)]
+    num_workers: usize,
+    #[pyo3(get)]
+    prefetch_factor: usize,
 }
 #[pymethods]
 impl Daemon {
     #[new]
+    #[pyo3(signature=(run_id, addr, root, ranks=None, prefetch_factor=None, num_workers=None, rank=0))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         run_id: String,
         addr: String,
         root: PathBuf,
-        ranks: usize,
-        prefetch_factor: usize,
-        num_workers: usize,
+        ranks: Option<usize>,
+        prefetch_factor: Option<usize>,
+        num_workers: Option<usize>,
+        rank: usize,
     ) -> anyhow::Result<Self> {
         py.allow_threads(|| {
             let (worker, initialized) = Worker::start(Options {
@@ -41,12 +54,18 @@ impl Daemon {
                 ranks,
                 factor: prefetch_factor,
                 num_workers,
+                rank,
             })?;
             Ok(Self {
                 worker: Mutex::new(Some(worker)),
                 run_id: initialized.response.run_id,
-                train_config: initialized.response.train_config,
+                config: initialized.response.config,
                 assets: initialized.assets,
+                streams: initialized.response.streams,
+                asset_metadata: initialized.asset_metadata,
+                ranks: initialized.settings.ranks,
+                num_workers: initialized.settings.num_workers,
+                prefetch_factor: initialized.settings.factor,
             })
         })
     }
@@ -146,28 +165,30 @@ impl Listener {
         let object = PyDict::new(py);
         match message {
             Work::Sample {
-                validation,
+                stream,
                 batch,
+                query_batch_idx,
                 index,
-                wave,
-                text,
-                duration,
-                speaker_id,
-                language_id,
+                sample_id,
+                metadata_json,
+                blobs,
             } => {
                 object.set_item("kind", "sample")?;
-                object.set_item("validation", validation)?;
+                object.set_item("stream", stream)?;
                 object.set_item("batch", batch)?;
+                object.set_item("query_batch_idx", query_batch_idx)?;
                 object.set_item("index", index)?;
-                object.set_item("wave", PyBytes::new(py, &wave))?;
-                object.set_item("text", PyBytes::new(py, &text))?;
-                object.set_item("duration", duration)?;
-                object.set_item("speaker_id", speaker_id)?;
-                object.set_item("language_id", language_id)?;
+                object.set_item("sample_id", sample_id)?;
+                object.set_item("metadata_json", metadata_json)?;
+                let values = PyDict::new(py);
+                for (name, value) in blobs {
+                    values.set_item(name, PyBytes::new(py, &value))?;
+                }
+                object.set_item("blobs", values)?;
             }
-            Work::End { validation } => {
+            Work::End { stream } => {
                 object.set_item("kind", "end")?;
-                object.set_item("validation", validation)?;
+                object.set_item("stream", stream)?;
             }
         }
         Ok(Some(object.into_any().unbind()))

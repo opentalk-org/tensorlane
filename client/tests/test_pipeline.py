@@ -4,28 +4,30 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import importlib
 import io
-import fcntl
 import json
 import multiprocessing
-import os
-import re
-import signal
 from pathlib import Path
-import struct
-import subprocess
+from unittest.mock import patch
 import sys
 import tarfile
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
 import uuid
 
 import grpc
 from grpc_tools import protoc
 import tensorlane
-from fixture_transforms import double, fail, slow, invalid, identify_worker
+from fixture_transforms import (
+    transform,
+    collate,
+    fail,
+    fail_collate,
+    slow,
+    identify_worker,
+    invalid,
+)
 
 GENERATED = tempfile.TemporaryDirectory(prefix="tl-proto-")
 PROTO = Path(__file__).resolve().parents[2] / "proto"
@@ -43,416 +45,362 @@ pb = importlib.import_module("tensorlane_pb2")
 rpc = importlib.import_module("tensorlane_pb2_grpc")
 
 
+def wait_for(check, timeout=15):
+    deadline = time.monotonic() + timeout
+    while not check():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("condition did not become true")
+        time.sleep(0.02)
+
+
 class Fixture(rpc.TensorLaneServicer):
-    def __init__(self, count=5, empty=False):
-        self.count = count
-        self.empty = empty
-        self.fail_data = False
-        self.requests = []
+    def __init__(self):
+        self.streams = {"training": 5, "validation": 3, "evaluation": 2}
+        self.config = {
+            "queries": {name: "SELECT ..." for name in self.streams},
+            "optimizer": {"lr": 0.1},
+            "assets": {},
+        }
+        self.requests = {name: [] for name in self.streams}
         self.init_requests = []
         self.end_requests = []
-        self.end_gate = threading.Event()
-        self.end_gate.set()
-        self.uploads_at_end = []
-        self.fail_init = False
-        self.returned_run_id = None
-        self.train_config = "opaque config"
         self.assets = {}
         self.asset_requests = []
-        self.fail_asset = False
-        self.validation_count = 0
-        self.validation_requests = []
-        self.fail_validation = False
         self.metrics = []
         self.artifacts = []
-        self.checkpoints = []
-        self.metric_streams = 0
+        self.saved = []
+        self.heads = {}
+        self.fail_init = False
+        self.fail_asset = False
+        self.fail_save = False
         self.fail_metrics = False
-        self.fail_checkpoint = False
+        self.fail_stream = None
+        self.empty_batch = False
+        self.blob_size = None
+        self.returned_run_id = None
         self.upload_started = threading.Event()
         self.upload_gate = threading.Event()
         self.upload_gate.set()
+        self.end_gate = threading.Event()
+        self.end_gate.set()
         self.lock = threading.Lock()
-        self.server = grpc.server(ThreadPoolExecutor(max_workers=8))
+        self.server = grpc.server(
+            ThreadPoolExecutor(max_workers=12),
+            options=[("grpc.max_send_message_length", 80 * 1024 * 1024)],
+        )
         rpc.add_TensorLaneServicer_to_server(self, self.server)
         self.port = self.server.add_insecure_port("127.0.0.1:0")
         self.server.start()
 
     def Init(self, request, context):
-        with self.lock:
-            self.init_requests.append(request)
+        self.init_requests.append(request)
         if self.fail_init:
             context.abort(grpc.StatusCode.INTERNAL, "fixture init failure")
         return pb.InitResponse(
             run_id=self.returned_run_id or request.run_id,
-            train_config=self.train_config,
+            config=json.dumps(self.config),
             assets=list(self.assets),
+            streams=list(self.streams),
         )
 
     def End(self, request, context):
-        self.end_requests.append(request)
         self.end_gate.wait(20)
-        self.uploads_at_end.append(
-            (len(self.metrics), len(self.artifacts), len(self.checkpoints))
-        )
+        self.end_requests.append(request)
         return pb.EndResponse()
 
     def Asset(self, request, context):
-        with self.lock:
-            self.asset_requests.append(request)
-        entrypoint, data = self.assets[request.name]
-        yield pb.AssetResponse(metadata=pb.AssetMetadata(entrypoint=entrypoint))
-        for offset in range(0, len(data), 127):
-            if self.fail_asset and offset > 0:
+        self.asset_requests.append(request)
+        asset_id, content = self.assets[request.name]
+        yield pb.AssetResponse(
+            metadata=pb.AssetMetadata(
+                asset_id=asset_id, metadata_json="{}", kind="file", asset_type="generic"
+            )
+        )
+        for offset in range(0, len(content), 127):
+            if self.fail_asset:
                 context.abort(grpc.StatusCode.INTERNAL, "fixture asset failure")
-            yield pb.AssetResponse(chunk=data[offset : offset + 127])
+            yield pb.AssetResponse(chunk=content[offset : offset + 127])
 
     def Data(self, requests, context):
         for index, request in enumerate(requests):
-            validation = request.split == pb.VALIDATION
             with self.lock:
-                (self.validation_requests if validation else self.requests).append(
-                    request
-                )
-            if self.fail_validation if validation else self.fail_data:
-                context.abort(grpc.StatusCode.INTERNAL, "fixture gRPC failure")
-            if index >= (self.validation_count if validation else self.count):
+                self.requests[request.stream].append(request)
+            if request.stream == self.fail_stream:
+                context.abort(grpc.StatusCode.INTERNAL, "fixture data failure")
+            if index >= self.streams[request.stream]:
                 return
-            value = index + (1000 if validation else 0)
+            value = index + 1000 * list(self.streams).index(request.stream)
             samples = (
                 []
-                if self.empty and index == 1
+                if self.empty_batch
                 else [
                     pb.Sample(
-                        wave=struct.pack("<hh", value, -value),
-                        text=struct.pack("<q", sample),
-                        duration=0.5,
-                        speaker_id=value,
-                        language_id=3,
+                        sample_id=f"sample-{value}-{part}",
+                        metadata_json=json.dumps(
+                            {"position": value, "label": f"label-{part}"}
+                        ),
+                        blobs={
+                            "payload": b"x" * self.blob_size
+                            if self.blob_size is not None
+                            else bytes([part, index % 256]),
+                            "context": b"arbitrary bytes",
+                        },
                     )
-                    for sample in range(index % 3 + 1)
+                    for part in range(index % 3 + 1)
                 ]
             )
-            yield pb.DataResponse(batch=samples)
+            yield pb.DataResponse(
+                batch=samples,
+                stream=request.stream,
+                batch_id=index,
+                query_batch_idx=index * 4 + 7,
+            )
 
-    def close(self):
-        self.upload_gate.set()
-        self.server.stop(0).wait()
-
-    def Metrics(self, requests, context):
+    def SaveAsset(self, requests, context):
         first = next(requests)
         if first.WhichOneof("payload") != "metadata":
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "missing metrics metadata")
-        run_id = first.metadata.run_id
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "missing metadata")
+        self.upload_started.set()
+        self.upload_gate.wait(20)
+        metadata = first.metadata
+        content = b"".join(message.chunk for message in requests)
+        if self.fail_save:
+            context.abort(grpc.StatusCode.INTERNAL, "fixture save failure")
         with self.lock:
-            self.metric_streams += 1
+            parent = self.heads.get(
+                metadata.name, self.assets.get(metadata.name, (None, b""))[0]
+            )
+            self.saved.append((metadata, parent, content))
+            self.heads[metadata.name] = metadata.asset_id
+        return pb.SaveAssetResponse(asset_id=metadata.asset_id)
+
+    def Metrics(self, requests, context):
+        iterator = iter(requests)
+        first = next(iterator)
         self.upload_started.set()
         self.upload_gate.wait(20)
         if self.fail_metrics:
             context.abort(grpc.StatusCode.INTERNAL, "fixture metrics failure")
         pending = None
-        data = bytearray()
-        response = pb.MetricsResponse()
-        for request in requests:
-            kind = request.WhichOneof("payload")
-            if kind == "metric":
-                self.metrics.append((run_id, request.metric))
-                response.metrics_received += 1
-            elif kind == "artifact":
-                pending = request.artifact
-                data = bytearray()
-            elif kind == "artifact_chunk":
-                data.extend(request.artifact_chunk.data)
-            else:
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT, "unexpected metrics payload"
-                )
-            if pending is not None and len(data) == pending.size_bytes:
-                self.artifacts.append((run_id, pending, bytes(data)))
-                response.artifacts_received += 1
-                response.artifact_bytes_received += len(data)
-                pending = None
-        if pending is not None:
-            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "incomplete artifact")
-        return response
-
-    def Checkpoint(self, requests, context):
-        first = next(requests)
-        if first.WhichOneof("payload") != "metadata":
-            context.abort(
-                grpc.StatusCode.INVALID_ARGUMENT, "missing checkpoint metadata"
-            )
-        self.upload_started.set()
-        self.upload_gate.wait(20)
-        if self.fail_checkpoint:
-            context.abort(grpc.StatusCode.INTERNAL, "fixture checkpoint failure")
         chunks = []
-        for request in requests:
-            if request.WhichOneof("payload") != "chunk":
-                context.abort(
-                    grpc.StatusCode.INVALID_ARGUMENT, "expected checkpoint chunk"
-                )
-            chunks.append(request.chunk)
-        self.checkpoints.append((first.metadata, b"".join(chunks)))
-        return pb.CheckpointResponse()
+        received = 0
+        for message in iterator:
+            kind = message.WhichOneof("payload")
+            if kind == "metric":
+                self.metrics.append((first.metadata.run_id, message.metric))
+            elif kind == "artifact":
+                pending = message.artifact
+                chunks = []
+            elif kind == "artifact_chunk":
+                chunks.append(message.artifact_chunk.data)
+                received += len(message.artifact_chunk.data)
+                if sum(map(len, chunks)) == pending.size_bytes:
+                    self.artifacts.append((pending, b"".join(chunks)))
+                    pending = None
+        return pb.MetricsResponse(
+            metrics_received=len(self.metrics),
+            artifacts_received=len(self.artifacts),
+            artifact_bytes_received=received,
+        )
+
+    def close(self):
+        self.upload_gate.set()
+        self.end_gate.set()
+        self.server.stop(0).wait()
 
 
-def upload_rank(run_id, root, rank, path, output):
+def read_rank(run_id, rank, root, output, stream="training"):
     try:
         with tensorlane.init(
-            run_id, double, 2, rank=rank, start_daemon=False, ipc_dir=root
+            run_id, ranks=2, rank=rank, start_daemon=False, ipc_dir=root, timeout=20
         ) as lane:
-            lane.metric(rank, f"rank/{rank}", rank + 0.5)
-            lane.metric_artifact(rank, path, f"artifact/{rank}")
-            lane.checkpoint(rank, path)
-        output.put(None)
+            with lane.batches(stream, timeout=20) as batches:
+                result = [
+                    (batch.batch_id, batch.samples[0]["value"].tolist())
+                    for batch in batches
+                ]
+            output.put((rank, result, None))
     except Exception as error:
-        output.put(repr(error))
-
-
-def read_rank(run_id, rank, root, output, validation=False):
-    try:
-        with (
-            tensorlane.init(
-                run_id,
-                double,
-                2,
-                rank=rank,
-                start_daemon=False,
-                ipc_dir=root,
-                timeout=20,
-            ) as lane,
-            lane.batches(validation=validation, timeout=20) as reader,
-        ):
-            result = []
-            for batch in reader:
-                if any(
-                    not sample.wave.is_shared() or not sample.text.is_shared()
-                    for sample in batch
-                ):
-                    raise AssertionError("expected shared CPU tensor storage")
-                result.append(
-                    [
-                        (
-                            sample.wave.tolist(),
-                            sample.text.tolist(),
-                            sample.speaker_id,
-                            sample.language_id,
-                            sample.duration,
-                        )
-                        for sample in batch
-                    ]
-                )
-        output.put((rank, result, None))
-    except Exception as error:
-        output.put((rank, None, repr(error)))
-
-
-def wait_for(predicate, timeout=10):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(0.02)
-    raise AssertionError("condition timed out")
-
-
-def initialize_rank(run_id, rank, addr, root, output, finished):
-    try:
-        with tensorlane.init(
-            run_id,
-            double,
-            2,
-            rank=rank,
-            start_daemon=rank == 1,
-            addr=addr,
-            ipc_dir=root,
-            num_workers=1,
-            timeout=20,
-        ) as lane:
-            output.put((rank, lane.run_id, lane.train_config, None))
-            if not finished.wait(20):
-                raise TimeoutError("test did not release ranks")
-    except Exception as error:
-        output.put((rank, None, None, repr(error)))
+        output.put((rank, None, str(error)))
 
 
 class PipelineTests(unittest.TestCase):
-    def test_owner_sends_end_once_using_returned_run_id(self):
-        self.service.returned_run_id = str(uuid.uuid4())
-        self.start()
-        follower = self.attach(1)
-        follower.close()
-        self.assertEqual(self.service.end_requests, [])
-        self.daemon.close()
-        self.daemon.close()
-        self.assertEqual(
-            [request.run_id for request in self.service.end_requests],
-            [self.service.returned_run_id],
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="tlt-", dir="/tmp")
+        self.run_id = str(uuid.uuid4())
+        self.service = Fixture()
+        self.daemon = None
+
+    def tearDown(self):
+        self.service.upload_gate.set()
+        self.service.end_gate.set()
+        if self.daemon:
+            try:
+                self.daemon.close()
+            except RuntimeError:
+                pass
+        self.service.close()
+        self.temp.cleanup()
+
+    def start(
+        self, ranks=1, factor=2, workers=2, transform_fn=transform, collate_fn=None
+    ):
+        self.daemon = tensorlane.init(
+            self.run_id,
+            transform_fn,
+            ranks,
+            factor,
+            rank=0,
+            start_daemon=True,
+            num_workers=workers,
+            collate_fn=collate_fn,
+            addr=f"localhost:{self.service.port}",
+            ipc_dir=self.temp.name,
+            timeout=20,
+        )
+        return self.daemon
+
+    def attach(self, rank=0):
+        return tensorlane.init(
+            self.run_id, ranks=1, rank=rank, start_daemon=False, ipc_dir=self.temp.name
         )
 
-    def test_end_waits_for_daemon_to_drain_rank_uploads(self):
-        from tensorlane import _native
+    def file(self, name="weights", content=b"opaque bytes"):
+        path = Path(self.temp.name) / name
+        path.write_bytes(content)
+        return path
 
-        self.start()
-        rank = _native.UploadClient(self.daemon._root / "uploads.sock")
-        path = Path(self.temp.name) / "checkpoint"
-        path.write_bytes(b"raw data" * 200_000)
-        self.service.upload_gate.clear()
-        try:
-            rank.checkpoint(1, path)
-            rank.metric(1, "loss", 0.5)
-            rank.metric_artifact(1, path, "artifact", "application/octet-stream")
-            self.assertTrue(self.service.upload_started.wait(5))
-            with ThreadPoolExecutor() as executor:
-                closed = executor.submit(self.daemon.close)
-                try:
-                    time.sleep(0.1)
-                    self.assertFalse(closed.done())
-                    self.assertEqual(self.service.end_requests, [])
-                finally:
-                    self.service.upload_gate.set()
-                closed.result(timeout=15)
-        finally:
-            self.service.upload_gate.set()
-        self.assertEqual(self.service.uploads_at_end, [(1, 1, 1)])
-        self.assertEqual(
-            self.archive_contents(self.service.checkpoints[0][1]),
-            {path.name: path.read_bytes()},
-        )
+    @staticmethod
+    def archive_contents(content):
+        with tarfile.open(fileobj=io.BytesIO(content), mode="r:") as archive:
+            return {
+                item.name: archive.extractfile(item).read()
+                for item in archive.getmembers()
+                if item.isfile()
+            }
 
-    def test_failed_asset_startup_still_ends_initialized_run(self):
-        self.service.assets = {"asset": (None, b"data" * 128)}
-        self.service.fail_asset = True
-        with self.assertRaisesRegex(RuntimeError, "fixture asset failure"):
-            self.start()
-        self.assertEqual(
-            [request.run_id for request in self.service.end_requests], [self.run_id]
-        )
+    def test_config_callbacks_and_three_streams(self):
+        self.start(collate_fn={"training": collate})
+        self.assertEqual(self.daemon.config, self.service.config)
+        self.assertEqual(self.daemon.streams, tuple(self.service.streams))
+        for stream, count in self.service.streams.items():
+            with self.daemon.batches(stream) as reader:
+                batches = list(reader)
+            self.assertEqual(len(batches), count)
+            for index, batch in enumerate(batches):
+                self.assertEqual(
+                    (batch.stream, batch.batch_id, batch.query_batch_idx),
+                    (stream, index, index * 4 + 7),
+                )
+                self.assertEqual(len(batch), index % 3 + 1)
+                if stream == "training":
+                    self.assertEqual(batch.data["values"].shape[0], len(batch))
+                else:
+                    self.assertEqual(batch.data, batch.samples)
 
-    def test_failed_init_does_not_send_end(self):
-        self.service.fail_init = True
-        with self.assertRaisesRegex(RuntimeError, "fixture init failure"):
-            self.start()
-        self.assertEqual(self.service.end_requests, [])
-
-    def test_metrics_and_files_are_uploaded_and_flushed(self):
-        self.service.returned_run_id = str(uuid.uuid4())
-        self.start()
-        path = Path(self.temp.name) / "raw.dat"
-        data = bytes(range(256)) * 9000
-        path.write_bytes(data)
-        empty = Path(self.temp.name) / "empty"
-        empty.touch()
-        before = time.time_ns() // 1_000_000
-        self.daemon.metric(2, "loss", 0.25)
-        self.daemon.metric_artifact(2, path, "audio", content_type="audio/wav")
-        self.daemon.metric(3, "accuracy", 0.5)
-        self.daemon.metric_artifact(3, empty, "empty")
-        self.daemon.checkpoint(3, path)
-        self.daemon.flush()
-        after = time.time_ns() // 1_000_000
-        self.assertEqual(self.service.metric_streams, 1)
-        self.assertEqual(
-            [
-                (metric.step, metric.name, metric.value)
-                for _, metric in self.service.metrics
-            ],
-            [(2, "loss", 0.25), (3, "accuracy", 0.5)],
+    def test_runtime_parameters_from_json_are_shared_with_followers(self):
+        self.service.config.update(ranks=2, num_workers=2, prefetch_factor=1)
+        self.daemon = tensorlane.init(
+            self.run_id, addr=f"localhost:{self.service.port}", ipc_dir=self.temp.name
         )
-        for run_id, metric in self.service.metrics:
-            self.assertEqual(run_id, self.service.returned_run_id)
-            self.assertTrue(before <= metric.timestamp_unix_ms <= after)
         self.assertEqual(
-            [self.archive_contents(item[2]) for item in self.service.artifacts],
-            [{"raw.dat": data}, {"empty": b""}],
+            (
+                self.daemon.rank,
+                self.daemon.ranks,
+                self.daemon.num_workers,
+                self.daemon.prefetch_factor,
+            ),
+            (0, 2, 2, 1),
         )
-        for _, metadata, received in self.service.artifacts:
-            self.assertEqual(metadata.size_bytes, len(received))
-        self.assertEqual(self.service.artifacts[0][1].content_type, "audio/wav")
-        self.assertEqual(
-            self.service.artifacts[1][1].content_type, "application/octet-stream"
-        )
-        metadata, received = self.service.checkpoints[0]
-        self.assertEqual(
-            (metadata.run_id, metadata.step),
-            (self.service.returned_run_id, 3),
-        )
-        self.assertEqual(self.archive_contents(received), {"raw.dat": data})
-        self.daemon.metric(4, "next", 1)
-        self.daemon.close()
-        self.assertEqual(self.service.metrics[-1][1].name, "next")
-        self.assertEqual(self.service.metric_streams, 2)
-
-    def test_slow_uploads_do_not_block_rank_or_data(self):
-        self.start(ranks=1)
-        path = Path(self.temp.name) / "checkpoint"
-        path.write_bytes(b"checkpoint bytes" * 700_000)
-        self.service.upload_gate.clear()
-        try:
-            started = time.monotonic()
-            self.daemon.checkpoint(0, path)
-            self.assertLess(time.monotonic() - started, 1)
-            self.assertTrue(self.service.upload_started.wait(5))
-            self.daemon.metric(1, "queued", 1)
-            with self.daemon.batches() as batches:
-                self.assertEqual(len(list(batches)), 5)
-            with ThreadPoolExecutor() as executor:
-                finished = executor.submit(self.daemon.flush)
-                try:
-                    time.sleep(0.1)
-                    self.assertFalse(finished.done())
-                finally:
-                    self.service.upload_gate.set()
-                finished.result(timeout=10)
-        finally:
-            self.service.upload_gate.set()
-        self.assertEqual(
-            self.archive_contents(self.service.checkpoints[0][1]),
-            {path.name: path.read_bytes()},
-        )
-
-    def test_directories_are_uploaded_as_tar_archives(self):
-        self.start()
-        path = Path(self.temp.name) / "bundle"
-        (path / "nested").mkdir(parents=True)
-        (path / "empty").mkdir()
-        (path / "config.yaml").write_bytes(b"config")
-        (path / "nested" / "weights.pth").write_bytes(b"weights")
-        self.daemon.metric_artifact(1, path, "bundle")
-        self.daemon.checkpoint(1, path)
-        self.daemon.flush()
-        _, metadata, artifact = self.service.artifacts[0]
-        self.assertEqual(metadata.size_bytes, len(artifact))
-        for received in (artifact, self.service.checkpoints[0][1]):
+        self.assertEqual(len(self.daemon._processes), 3)
+        with tensorlane.init(self.run_id, rank=1, ipc_dir=self.temp.name) as follower:
             self.assertEqual(
-                self.archive_contents(received),
-                {
-                    "bundle/config.yaml": b"config",
-                    "bundle/nested/weights.pth": b"weights",
-                },
+                (
+                    follower.rank,
+                    follower.ranks,
+                    follower.num_workers,
+                    follower.prefetch_factor,
+                ),
+                (1, 2, 2, 1),
             )
-            with tarfile.open(fileobj=io.BytesIO(received), mode="r:") as archive:
-                self.assertTrue(archive.getmember("bundle/empty").isdir())
 
-    def test_each_rank_process_can_upload(self):
-        self.start()
-        path = Path(self.temp.name) / "weights"
-        path.write_bytes(b"opaque weights")
+    def test_explicit_runtime_parameters_override_json(self):
+        self.service.config.update(ranks=2, num_workers=2, prefetch_factor=1)
+        self.start(workers=1)
+        self.assertEqual(
+            (self.daemon.ranks, self.daemon.num_workers, self.daemon.prefetch_factor),
+            (1, 1, 2),
+        )
+        self.assertEqual(self.daemon.config, self.service.config)
+
+    def test_existing_run_id_from_environment_needs_no_argument(self):
+        self.service.config.update(num_workers=1)
+        with patch.dict("os.environ", {"TENSORLANE_RUN_ID": self.run_id}):
+            self.daemon = tensorlane.init(
+                addr=f"localhost:{self.service.port}", ipc_dir=self.temp.name
+            )
+        self.assertEqual(self.daemon.run_id, self.run_id)
+
+    def test_raw_samples_and_mapping_defaults(self):
+        self.start(transform_fn={"training": transform})
+        with self.daemon.batches("evaluation") as reader:
+            sample = next(reader).samples[0]
+            self.assertIsInstance(sample, tensorlane.RawSample)
+            self.assertEqual(sample.blobs["context"], b"arbitrary bytes")
+            self.assertEqual(sample.metadata["position"], 2000)
+
+    def test_other_streams_drain_while_training_is_full(self):
+        self.start(factor=1, workers=3)
+        wait_for(lambda: len(self.service.requests["training"]) == 1)
+        for name in ("validation", "evaluation"):
+            with self.daemon.batches(name) as reader:
+                self.assertEqual(len(list(reader)), self.service.streams[name])
+        self.assertEqual(len(self.service.requests["training"]), 1)
+        with self.daemon.batches() as reader:
+            self.assertEqual(len(list(reader)), 5)
+
+    def test_credit_budget_covers_unconsumed_batches(self):
+        self.start(factor=1)
+        wait_for(lambda: len(self.service.requests["training"]) == 1)
+        time.sleep(0.1)
+        self.assertEqual(len(self.service.requests["training"]), 1)
+        with self.daemon.batches() as reader:
+            next(reader)
+            wait_for(lambda: len(self.service.requests["training"]) == 2)
+            time.sleep(0.1)
+            self.assertEqual(len(self.service.requests["training"]), 2)
+
+    def test_multiple_workers_preserve_order(self):
+        self.service.streams["training"] = 10
+        self.start(factor=4, workers=3, transform_fn=identify_worker)
+        with self.daemon.batches() as reader:
+            batches = list(reader)
+        self.assertEqual(
+            [batch.samples[0]["value"][0].item() for batch in batches], list(range(10))
+        )
+        self.assertEqual(
+            len({sample["value"][1].item() for batch in batches for sample in batch}), 3
+        )
+
+    def test_independent_ranks_attach_before_owner(self):
         context = multiprocessing.get_context("spawn")
         output = context.Queue()
         processes = [
             context.Process(
-                target=upload_rank,
-                args=(self.run_id, self.temp.name, rank, path, output),
+                target=read_rank, args=(self.run_id, rank, self.temp.name, output)
             )
             for rank in range(2)
         ]
         try:
             for process in processes:
                 process.start()
+            self.start(ranks=2, workers=3)
             for _ in processes:
-                self.assertIsNone(output.get(timeout=30))
+                rank, batches, error = output.get(timeout=30)
+                self.assertIsNone(error)
+                self.assertEqual(
+                    [batch[0] for batch in batches], list(range(rank, 5, 2))
+                )
             for process in processes:
                 process.join(10)
                 self.assertEqual(process.exitcode, 0)
@@ -461,984 +409,307 @@ class PipelineTests(unittest.TestCase):
                 if process.is_alive():
                     process.kill()
                 process.join()
-                process.close()
             output.close()
-            output.join_thread()
-        self.assertEqual(
-            {metric.name for _, metric in self.service.metrics}, {"rank/0", "rank/1"}
+
+    def test_assets_are_prefetched_once_and_shared(self):
+        asset_id = str(uuid.uuid4())
+        self.service.assets = {"model": (asset_id, b"weights"), "empty": (None, b"")}
+        self.start()
+        with self.attach() as follower:
+            self.assertEqual(follower.asset("model"), self.daemon.asset("model"))
+            self.assertEqual(follower.asset("model").read_bytes(), b"weights")
+            self.assertEqual(follower.asset_metadata["model"]["asset_id"], asset_id)
+        self.assertEqual(len(self.service.asset_requests), 2)
+
+    def test_saved_files_directories_and_automatic_lineage(self):
+        source_id = str(uuid.uuid4())
+        self.service.assets = {"model": (source_id, b"input")}
+        self.start()
+        path = self.file()
+        a = self.daemon.save_asset(
+            "model", path, step=1, kind="checkpoint", metadata={"dataset_offset": 6}
         )
-        self.assertEqual(len(self.service.artifacts), 2)
-        self.assertEqual(len(self.service.checkpoints), 2)
+        b = self.daemon.save_asset("model", path, step=2)
+        directory = Path(self.temp.name) / "bundle"
+        directory.mkdir()
+        (directory / "config.json").write_text("{}")
+        other = self.daemon.save_asset("other", directory)
+        self.daemon.flush()
+        self.assertEqual([row[0].asset_id for row in self.service.saved], [a, b, other])
+        self.assertEqual([row[1] for row in self.service.saved], [source_id, a, None])
+        self.assertEqual(
+            json.loads(self.service.saved[0][0].metadata_json), {"dataset_offset": 6}
+        )
+        self.assertEqual(
+            self.archive_contents(self.service.saved[0][2]),
+            {"weights": b"opaque bytes"},
+        )
+        self.assertEqual(
+            self.archive_contents(self.service.saved[2][2]),
+            {"bundle/config.json": b"{}"},
+        )
 
-    def test_upload_errors_reach_flush(self):
+    def test_saves_queue_promptly_and_flush_waits_for_commit(self):
         self.start()
-        with self.attach(0) as lane:
-            lane.metric_artifact(0, Path(self.temp.name) / "missing", "missing")
-            with self.assertRaisesRegex(RuntimeError, "opening artifact"):
-                lane.flush()
-        self.service.fail_metrics = True
-        with self.attach(0) as lane:
-            lane.metric(0, "error", 1)
-            with self.assertRaisesRegex(RuntimeError, "fixture metrics failure"):
-                lane.flush()
-        self.service.fail_metrics = False
-        self.service.fail_checkpoint = True
-        path = Path(self.temp.name) / "checkpoint"
-        path.write_bytes(b"weights")
-        with self.attach(0) as lane:
-            lane.checkpoint(0, path)
-            with self.assertRaisesRegex(RuntimeError, "fixture checkpoint failure"):
-                lane.flush()
+        path = self.file()
+        self.service.upload_gate.clear()
+        started = time.monotonic()
+        self.daemon.save_asset("model", path)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertTrue(self.service.upload_started.wait(5))
+        with self.daemon.batches() as reader:
+            self.assertEqual(len(list(reader)), 5)
+        with ThreadPoolExecutor() as executor:
+            flushed = executor.submit(self.daemon.flush)
+            time.sleep(0.1)
+            self.assertFalse(flushed.done())
+            self.assertEqual(self.service.saved, [])
+            self.service.upload_gate.set()
+            flushed.result(timeout=15)
+        self.assertEqual(len(self.service.saved), 1)
 
-    def test_close_reports_upload_failure_and_still_cleans_up(self):
+    def test_save_failure_and_missing_source_reach_flush(self):
         self.start()
-        self.daemon.checkpoint(0, Path(self.temp.name) / "missing")
-        with self.assertRaisesRegex(RuntimeError, "opening checkpoint"):
-            self.daemon.close()
-        self.assertFalse(list(self.daemon._root.glob("*.sock")))
-        self.daemon.close()
+        with self.attach() as follower:
+            follower.save_asset("model", Path(self.temp.name) / "missing")
+            with self.assertRaisesRegex(RuntimeError, "opening asset"):
+                follower.flush()
+        self.service.fail_save = True
+        with self.attach() as follower:
+            follower.save_asset("model", self.file())
+            with self.assertRaisesRegex(RuntimeError, "fixture save failure"):
+                follower.flush()
 
-    def test_flush_timeout_closes_the_upload_connection(self):
+    def test_metrics_and_artifacts_still_work(self):
+        self.start()
+        self.daemon.metric(3, "loss", 0.25)
+        self.daemon.metric_artifact(
+            3, self.file("report.json", b"{}"), "report", "application/json"
+        )
+        self.daemon.flush()
+        self.assertEqual(self.service.metrics[0][1].name, "loss")
+        self.assertEqual(
+            self.archive_contents(self.service.artifacts[0][1]), {"report.json": b"{}"}
+        )
+
+    def test_shutdown_drains_save_before_end_and_cleans_resources(self):
         self.start()
         self.service.upload_gate.clear()
-        try:
-            self.daemon.metric(0, "slow", 1)
-            self.assertTrue(self.service.upload_started.wait(5))
-            with self.assertRaisesRegex(RuntimeError, "upload flush timed out"):
-                self.daemon.flush(timeout=0.05)
-            with self.assertRaisesRegex(RuntimeError, "upload client is closed"):
-                self.daemon.metric(1, "after timeout", 1)
-        finally:
+        self.daemon.save_asset("model", self.file())
+        self.assertTrue(self.service.upload_started.wait(5))
+        with ThreadPoolExecutor() as executor:
+            closed = executor.submit(self.daemon.close)
+            time.sleep(0.1)
+            self.assertFalse(closed.done())
+            self.assertEqual(self.service.end_requests, [])
             self.service.upload_gate.set()
+            closed.result(timeout=15)
+        self.assertEqual(len(self.service.saved), 1)
+        self.assertEqual(len(self.service.end_requests), 1)
+        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
 
-    def test_flushed_follower_can_close_after_owner(self):
+    def test_follower_close_does_not_end_run(self):
         self.start()
-        follower = self.attach(1)
-        follower.metric(0, "flushed", 1)
-        follower.flush()
-        self.daemon.close()
+        follower = self.attach()
         follower.close()
-        self.assertEqual(self.service.metrics[0][1].name, "flushed")
-
-    @staticmethod
-    def archive_contents(data):
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
-            return {
-                member.name: archive.extractfile(member).read()
-                for member in archive.getmembers()
-                if member.isfile()
-            }
-
-    @staticmethod
-    def archive(files):
-        output = io.BytesIO()
-        with tarfile.open(fileobj=output, mode="w") as archive:
-            for name, content in files.items():
-                info = tarfile.TarInfo(name)
-                info.size = len(content)
-                archive.addfile(info, io.BytesIO(content))
-        return output.getvalue()
-
-    def test_assets_are_prefetched_once_and_shared_with_followers(self):
-        self.service.returned_run_id = str(uuid.uuid4())
-        self.service.assets = {
-            "asr": (
-                "../ignored-entrypoint.pth",
-                b"synthetic asset asr\n" * 1024,
-            ),
-            "checkpoint": (
-                None,
-                self.archive({"config.yml": b"config", "model.pth": b"model"}),
-            ),
-            "binary": (None, bytes(range(256)) * 5),
-            "empty": (None, b""),
-        }
-        original = multiprocessing.process.BaseProcess.start
-
-        def start(process):
-            self.assertEqual(len(self.service.asset_requests), 4)
-            self.assertEqual(len(list(Path(self.temp.name).rglob("assets/*/data"))), 4)
-            original(process)
-
-        with patch.object(multiprocessing.process.BaseProcess, "start", start):
-            self.start()
-        with self.attach(1) as follower:
-            for lane in (self.daemon, follower):
-                for name, (_, data) in self.service.assets.items():
-                    self.assertIsInstance(lane.asset(name), Path)
-                    self.assertTrue(lane.asset(name).is_file())
-                    self.assertEqual(lane.asset(name).read_bytes(), data)
-                    self.assertEqual(lane.asset(name), self.daemon.asset(name))
-                with self.assertRaises(KeyError):
-                    lane.asset("missing")
-        self.assertEqual(len(self.service.asset_requests), 4)
-        self.assertTrue(
-            all(
-                request.run_id == self.service.returned_run_id
-                for request in self.service.asset_requests
-            )
-        )
-        self.assertFalse(list(self.daemon._root.rglob("*.part")))
-        self.assertFalse(list(self.daemon._root.rglob("model.pth")))
+        self.assertEqual(self.service.end_requests, [])
         self.daemon.close()
-        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
-
-    def test_asset_failure_does_not_publish_readiness_and_cleans_downloads(self):
-        data = b"weights" * 128
-        self.service.assets = {"model": (None, data)}
-        self.service.fail_asset = True
-        with self.assertRaisesRegex(RuntimeError, "fixture asset failure"):
-            self.start()
-        self.assertFalse(list(Path(self.temp.name).rglob("init.json")))
-        self.assertFalse(list(Path(self.temp.name).rglob("*.part")))
-        self.service.fail_asset = False
-        self.start()
-        self.assertEqual(self.daemon.asset("model").read_bytes(), data)
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="tlt-", dir="/tmp")
-        self.run_id = str(uuid.uuid4())
-        self.service = Fixture()
-        self.daemon = None
-
-    def tearDown(self):
-        if self.daemon:
-            self.daemon.close()
-            self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
-        self.service.close()
-        self.temp.cleanup()
-
-    def start(self, ranks=2, factor=2, transform=double, workers=1):
-        self.daemon = tensorlane.init(
-            self.run_id,
-            transform,
-            ranks,
-            factor,
-            rank=0,
-            start_daemon=True,
-            addr=f"localhost:{self.service.port}",
-            ipc_dir=self.temp.name,
-            **({"num_workers": workers} if workers is not None else {}),
-        )
-        return self.daemon
-
-    def attach(self, rank):
-        return tensorlane.init(
-            self.run_id,
-            double,
-            2,
-            rank=rank,
-            start_daemon=False,
-            ipc_dir=self.temp.name,
-        )
-
-    def test_independent_ranks_attach_before_init(self):
-        context = multiprocessing.get_context("spawn")
-        output = context.Queue()
-        ranks = [
-            context.Process(
-                target=read_rank, args=(self.run_id, rank, self.temp.name, output)
-            )
-            for rank in range(2)
-        ]
-        try:
-            for rank in ranks:
-                rank.start()
-            self.start(workers=3)
-            self.assertEqual(self.daemon.train_config, "opaque config")
-            results = [output.get(timeout=30) for _ in ranks]
-            for rank, batches, error in results:
-                self.assertIsNone(error, error)
-                expected = list(range(rank, 5, 2))
-                self.assertEqual(len(batches), len(expected))
-                for index, batch in zip(expected, batches):
-                    self.assertEqual(len(batch), index % 3 + 1)
-                    for sample_index, sample in enumerate(batch):
-                        self.assertEqual(
-                            sample,
-                            (
-                                [index * 2, -index * 2],
-                                [sample_index],
-                                index,
-                                3,
-                                0.5,
-                            ),
-                        )
-            for rank in ranks:
-                rank.join(5)
-                self.assertEqual(rank.exitcode, 0)
-        finally:
-            for rank in ranks:
-                if rank.is_alive():
-                    rank.kill()
-                rank.join(5)
-            output.close()
-
-    def test_nonzero_rank_owns_daemon_and_publishes_config(self):
-        self.service.returned_run_id = str(uuid.uuid4())
-        self.service.train_config = 'name: "hello 🦀"\nsteps: 5\n'
-        context = multiprocessing.get_context("spawn")
-        output = context.Queue()
-        finished = context.Event()
-        ranks = [
-            context.Process(
-                target=initialize_rank,
-                args=(
-                    self.run_id,
-                    rank,
-                    f"localhost:{self.service.port}",
-                    self.temp.name,
-                    output,
-                    finished,
-                ),
-            )
-            for rank in (0, 1)
-        ]
-        try:
-            ranks[0].start()
-            time.sleep(0.2)
-            self.assertEqual(self.service.init_requests, [])
-            ranks[1].start()
-            for _ in ranks:
-                rank, run_id, config, error = output.get(timeout=30)
-                self.assertIsNone(error, error)
-                self.assertEqual(run_id, self.service.returned_run_id)
-                self.assertEqual(config, self.service.train_config)
-            self.assertEqual(len(self.service.init_requests), 1)
-            finished.set()
-            for rank in ranks:
-                rank.join(10)
-                self.assertEqual(rank.exitcode, 0)
-            self.assertEqual(list(Path(self.temp.name).rglob("init.json")), [])
-        finally:
-            finished.set()
-            for rank in ranks:
-                if rank.is_alive():
-                    rank.kill()
-                rank.join(5)
-            output.close()
-
-    def test_follower_reads_metadata_once_without_starting_anything(self):
-        from tensorlane.client import _root
-
-        root = _root(self.run_id, self.temp.name)
-        root.mkdir()
-        metadata = {
-            "run_id": "returned-run-id",
-            "train_config": 'opaque\n"config"',
-            "assets": {},
-        }
-        (root / "init.json").write_text(json.dumps(metadata))
-        (root / "ranks").write_text("2")
-        with (root / "lock").open("w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            with (
-                patch("tensorlane.client.json.loads", wraps=json.loads) as decode,
-                patch(
-                    "tensorlane._native.Daemon",
-                    side_effect=AssertionError("daemon was started"),
-                ),
-                tensorlane.init(
-                    self.run_id,
-                    None,
-                    0,
-                    rank=0,
-                    start_daemon=False,
-                    ipc_dir=self.temp.name,
-                ) as lane,
-            ):
-                self.assertIsInstance(lane, tensorlane.TensorLane)
-                decode.assert_called_once_with(json.dumps(metadata))
-                self.assertEqual(lane.run_id, metadata["run_id"])
-                self.assertEqual(lane.train_config, metadata["train_config"])
-        self.assertTrue((root / "init.json").exists())
-
-    def test_nonowner_close_does_not_stop_daemon_and_preserves_directory(self):
-        self.service.returned_run_id = str(uuid.uuid4())
-        self.start(ranks=1)
-        follower = tensorlane.init(
-            self.run_id, double, 1, rank=0, start_daemon=False, ipc_dir=self.temp.name
-        )
-        self.assertEqual(follower.run_id, self.daemon.run_id)
-        self.assertEqual(follower.train_config, self.daemon.train_config)
-        with follower.batches() as reader:
-            follower.close()
-            follower.close()
-            self.assertEqual(len(list(reader)), 5)
-        self.assertTrue((self.daemon._root / "init.json").exists())
-        self.assertEqual(len(self.service.init_requests), 1)
-        self.daemon.close()
-        self.assertFalse((self.daemon._root / "init.json").exists())
-
-    def test_stale_metadata_is_rejected_and_replaced(self):
-        from tensorlane.client import _root
-
-        root = _root(self.run_id, self.temp.name)
-        root.mkdir()
-        (root / "lock").touch()
-        (root / "init.json").write_text(
-            json.dumps({"run_id": "stale", "train_config": "stale"})
-        )
-        with self.assertRaisesRegex(RuntimeError, "stopped unexpectedly"):
-            tensorlane.init(
-                self.run_id,
-                double,
-                2,
-                rank=0,
-                start_daemon=False,
-                ipc_dir=self.temp.name,
-            )
-        self.start()
-        self.assertEqual(
-            json.loads((root / "init.json").read_text()),
-            {
-                "run_id": self.run_id,
-                "train_config": self.service.train_config,
-                "assets": {},
-            },
-        )
-
-    def test_failed_startup_never_publishes_readiness(self):
-        from tensorlane.client import _root
-
-        with patch.object(
-            multiprocessing.process.BaseProcess,
-            "start",
-            side_effect=OSError("spawn failed"),
-        ):
-            with self.assertRaisesRegex(OSError, "spawn failed"):
-                self.start()
-        root = _root(self.run_id, self.temp.name)
-        self.assertFalse((root / "init.json").exists())
-        with patch.object(
-            Path, "read_text", side_effect=AssertionError("waiting read a file")
-        ):
-            with self.assertRaises(TimeoutError):
-                tensorlane.init(
-                    self.run_id,
-                    double,
-                    2,
-                    rank=0,
-                    start_daemon=False,
-                    ipc_dir=self.temp.name,
-                    timeout=0.05,
-                )
-
-    def test_metadata_is_published_only_after_workers_are_ready(self):
-        original = multiprocessing.process.BaseProcess.start
-        observations = []
-
-        def start(process):
-            from tensorlane.client import _root
-
-            observations.append(
-                (_root(self.run_id, self.temp.name) / "init.json").exists()
-            )
-            original(process)
-
-        with patch.object(multiprocessing.process.BaseProcess, "start", start):
-            self.start()
-        self.assertEqual(observations, [False, False])
-        self.assertTrue((self.daemon._root / "init.json").exists())
-        self.assertFalse((self.daemon._root / "init.tmp").exists())
-        self.assertEqual(
-            {path.name for path in self.daemon._root.iterdir()},
-            {
-                "init.json",
-                "auth",
-                "ranks",
-                "lock",
-                "semaphore",
-                "validation-semaphore",
-                "work.sock",
-                "uploads.sock",
-            },
-        )
-        self.daemon.close()
-        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
-
-    def test_load_example_drains_training_across_ranks(self):
-        example = Path(__file__).resolve().parents[1] / "examples" / "load_test.py"
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(example),
-                self.run_id,
-                "--ranks",
-                "2",
-                "--workers",
-                "1",
-                "--prefetch-factor",
-                "1",
-                "--addr",
-                f"localhost:{self.service.port}",
-                "--ipc-dir",
-                "load-ipc",
-            ],
-            cwd=self.temp.name,
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("rank=0 batches=3 ", result.stdout)
-        self.assertIn("rank=1 batches=2 ", result.stdout)
-        self.assertIn("total batches=5 ", result.stdout)
-        self.assertIn("samples/s=", result.stdout)
-        self.assertEqual(len(self.service.init_requests), 1)
         self.assertEqual(len(self.service.end_requests), 1)
-        self.assertEqual(self.service.metrics, [])
-        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
 
-    def test_load_example_ctrl_c_finishes_run_and_workers(self):
-        self.service.count = 100_000
-        self.service.end_gate.clear()
-        example = Path(__file__).resolve().parents[1] / "examples" / "load_test.py"
-        output = Path(self.temp.name) / "load.log"
-        with output.open("w") as log:
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(example),
-                    self.run_id,
-                    "--ranks",
-                    "2",
-                    "--workers",
-                    "2",
-                    "--addr",
-                    f"localhost:{self.service.port}",
-                    "--ipc-dir",
-                    "load-ipc",
-                ],
-                cwd=self.temp.name,
-                stdout=log,
-                stderr=log,
-                start_new_session=True,
-            )
-            try:
-                deadline = time.monotonic() + 30
-                while " batch=" not in output.read_text():
-                    self.assertIsNone(process.poll(), output.read_text())
-                    self.assertLess(time.monotonic(), deadline, output.read_text())
-                    time.sleep(0.05)
-                os.killpg(process.pid, signal.SIGINT)
-                deadline = time.monotonic() + 15
-                while not self.service.end_requests:
-                    self.assertIsNone(process.poll(), output.read_text())
-                    self.assertLess(time.monotonic(), deadline, output.read_text())
-                    time.sleep(0.05)
-                os.killpg(process.pid, signal.SIGINT)
-                time.sleep(0.1)
-                self.assertIsNone(process.poll(), output.read_text())
-                self.service.end_gate.set()
-                self.assertEqual(process.wait(timeout=15), 130, output.read_text())
-            finally:
-                self.service.end_gate.set()
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-        self.assertEqual(len(self.service.end_requests), 1)
-        self.assertIn("Workers stopped; run closed.", output.read_text())
-        self.assertNotIn("KeyboardInterrupt", output.read_text())
-        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
+    def test_empty_streams_and_partial_transform(self):
+        self.service.streams = {name: 0 for name in self.service.streams}
+        self.start(transform_fn=partial(transform))
+        for stream in self.daemon.streams:
+            with self.daemon.batches(stream) as reader:
+                self.assertEqual(list(reader), [])
 
-    def test_cpu_example_uses_custom_ipc_dir_for_every_rank(self):
-        self.service.validation_count = self.service.count
-        example = Path(__file__).resolve().parents[1] / "examples" / "cpu.py"
-        result = subprocess.run(
-            [sys.executable, str(example), self.run_id, "--ipc-dir", "custom-ipc"],
-            cwd=self.temp.name,
-            env={**os.environ, "TENSORLANE_ADDR": f"localhost:{self.service.port}"},
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        lines = [
-            line for line in result.stdout.splitlines() if line.startswith("rank=")
-        ]
-        self.assertEqual(len(lines), self.service.count * 2)
-        for split in ("training", "validation"):
-            split_lines = [line for line in lines if f"split={split} " in line]
-            self.assertEqual(len(split_lines), self.service.count)
-            self.assertEqual(sum(line.startswith("rank=0 ") for line in split_lines), 3)
-            self.assertEqual(sum(line.startswith("rank=1 ") for line in split_lines), 2)
-        self.assertTrue((Path(self.temp.name) / "custom-ipc").is_dir())
-        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
-
-    @unittest.skipUnless(importlib.util.find_spec("accelerate"), "requires accelerate")
-    def test_accelerate_cpu_example_initializes_once_for_two_ranks(self):
-        self.service.validation_count = self.service.count
-        self.service.assets = {"asr": (None, b"synthetic asset asr")}
-        example = Path(__file__).resolve().parents[1] / "examples" / "accelerate_cpu.py"
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                "--rdzv-backend=c10d",
-                "--rdzv-endpoint=127.0.0.1:0",
-                "--local-addr=127.0.0.1",
-                "--nproc_per_node=2",
-                str(example),
-                self.run_id,
-                "--ipc-dir",
-                "custom-ipc",
-            ],
-            cwd=self.temp.name,
-            env={**os.environ, "TENSORLANE_ADDR": f"localhost:{self.service.port}"},
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(len(self.service.init_requests), 1)
-        for rank in range(2):
-            self.assertIn(
-                f"rank={rank} run_id={self.run_id} train_config='opaque config'",
-                result.stdout,
-            )
-        lines = re.findall(
-            r"rank=\d+ device=cpu(?::\d+)? split=(?:training|validation) batch=\d+ samples=\d+",
-            result.stdout,
-        )
-        self.assertEqual(len(lines), self.service.count * 2, result.stdout)
-        for split in ("training", "validation"):
-            for rank, count in ((0, 3), (1, 2)):
-                self.assertEqual(
-                    sum(
-                        f"rank={rank} device=cpu" in line and f"split={split} " in line
-                        for line in lines
-                    ),
-                    count,
-                )
-        self.assertEqual(list(Path(self.temp.name).rglob("*.sock")), [])
-
-    def test_prefetch_credits_cover_unconsumed_batches(self):
-        self.start(factor=1)
-        wait_for(lambda: len(self.service.requests) == 2)
-        time.sleep(0.2)
-        self.assertEqual(len(self.service.requests), 2)
-        with self.daemon.batches() as reader:
-            self.assertEqual(next(reader).samples[0].speaker_id, 0)
-            wait_for(lambda: len(self.service.requests) == 3)
-            time.sleep(0.2)
-            self.assertEqual(len(self.service.requests), 3)
-            self.daemon.close()
-
-    def test_validation_drains_while_training_buffer_is_full(self):
-        self.service.validation_count = 4
-        self.start(ranks=1, factor=1, workers=3)
-        wait_for(lambda: len(self.service.requests) == 1)
-        with self.daemon.batches(validation=True) as reader:
-            batches = list(reader)
-        self.assertEqual(
-            [batch.samples[0].speaker_id for batch in batches], list(range(1000, 1004))
-        )
-        self.assertEqual(
-            [batch.samples[0].wave.tolist() for batch in batches],
-            [[value * 2, -value * 2] for value in range(1000, 1004)],
-        )
-        self.assertEqual(len(self.service.requests), 1)
-        with self.daemon.batches() as reader:
-            self.assertEqual(
-                [batch.samples[0].speaker_id for batch in reader], list(range(5))
-            )
-
-    def test_training_drains_while_validation_buffer_is_full(self):
-        self.service.validation_count = 4
-        self.start(ranks=1, factor=1, workers=3)
-        wait_for(lambda: len(self.service.validation_requests) == 1)
-        with self.daemon.batches() as reader:
-            self.assertEqual(
-                [batch.samples[0].speaker_id for batch in reader], list(range(5))
-            )
-        self.assertEqual(len(self.service.validation_requests), 1)
-        with self.daemon.batches(validation=True) as reader:
-            self.assertEqual(
-                [batch.samples[0].speaker_id for batch in reader],
-                list(range(1000, 1004)),
-            )
-
-    def test_training_and_validation_readers_can_alternate(self):
-        self.service.validation_count = 3
-        self.start(ranks=1, factor=2, workers=3)
-        with (
-            self.daemon.batches() as training,
-            self.daemon.batches(validation=True) as validation,
-        ):
-            for index in range(3):
-                self.assertEqual(next(training).samples[0].speaker_id, index)
-                self.assertEqual(next(validation).samples[0].speaker_id, 1000 + index)
-            self.assertEqual(list(validation), [])
-            self.assertEqual(
-                [batch.samples[0].speaker_id for batch in training], [3, 4]
-            )
-
-    def test_validation_is_distributed_between_independent_ranks(self):
-        self.service.validation_count = 5
-        self.start(workers=3)
-        context = multiprocessing.get_context("spawn")
-        output = context.Queue()
-        ranks = [
-            context.Process(
-                target=read_rank, args=(self.run_id, rank, self.temp.name, output, True)
-            )
-            for rank in range(2)
-        ]
-        try:
-            for rank in ranks:
-                rank.start()
-            for _ in ranks:
-                rank, batches, error = output.get(timeout=30)
-                self.assertIsNone(error, error)
-                self.assertEqual(
-                    [batch[0][2] for batch in batches],
-                    list(range(1000 + rank, 1005, 2)),
-                )
-            for rank in ranks:
-                rank.join(5)
-                self.assertEqual(rank.exitcode, 0)
-        finally:
-            for rank in ranks:
-                if rank.is_alive():
-                    rank.kill()
-                rank.join(5)
-            output.close()
-
-    def test_validation_rpc_failure_reaches_reader(self):
-        self.service.fail_validation = True
-        with self.assertRaisesRegex(RuntimeError, "fixture gRPC failure"):
-            self.start(ranks=1)
-            with self.daemon.batches(validation=True) as reader:
-                next(reader)
-
-    def test_global_budget_allows_one_rank_to_release_any_slot(self):
-        self.service.count = 20
-        self.start(factor=1, workers=3)
-        wait_for(lambda: len(self.service.requests) == 2)
-        with self.daemon.batches() as reader:
-            self.assertEqual(next(reader).samples[0].speaker_id, 0)
-            wait_for(lambda: len(self.service.requests) == 3)
-            self.assertEqual(next(reader).samples[0].speaker_id, 2)
-            wait_for(lambda: len(self.service.requests) == 4)
-            time.sleep(0.2)
-            self.assertEqual(len(self.service.requests), 4)
-            self.daemon.close()
-
-    def test_shutdown_cancels_sem_wait_and_unlinks_semaphore(self):
-        self.service.count = 20
-        self.start(ranks=1, factor=1)
-        wait_for(lambda: len(self.service.requests) == 1)
-        names = [path.read_text() for path in Path(self.temp.name).rglob("*semaphore")]
-        self.assertEqual(len(names), 2)
-        started = time.monotonic()
-        self.daemon.close()
-        self.assertLess(time.monotonic() - started, 8)
-        for name in names:
-            with self.assertRaises(RuntimeError):
-                tensorlane._native.Semaphore(name)
-
-    def test_duplicate_init_and_rank_are_rejected(self):
+    def test_unknown_stream_and_duplicate_reader_are_rejected(self):
         self.start()
-        with self.assertRaisesRegex(Exception, "already active"):
-            tensorlane.init(
-                self.run_id,
-                double,
-                2,
-                rank=0,
-                start_daemon=True,
-                ipc_dir=self.temp.name,
-            )
+        with self.assertRaisesRegex(ValueError, "unknown stream"):
+            self.daemon.batches("missing")
         reader = self.daemon.batches()
         try:
             with self.assertRaisesRegex(RuntimeError, "already connected"):
                 self.daemon.batches()
-            with self.assertRaisesRegex(ValueError, "invalid"):
-                self.attach(2)
         finally:
             self.daemon.close()
             reader.close()
 
-    def test_transform_failure_reaches_rank(self):
-        with self.assertRaisesRegex(RuntimeError, "tensorlane-transform-0 exited"):
-            self.start(transform=fail)
-            with self.daemon.batches() as reader:
-                next(reader)
-
-    def test_invalid_transform_output_reaches_rank(self):
-        with self.assertRaisesRegex(RuntimeError, "tensorlane-transform-0 exited"):
-            self.start(transform=invalid)
-            with self.daemon.batches() as reader:
-                next(reader)
-
-    def test_startup_timeout_and_callable_validation(self):
-        with self.assertRaises(TimeoutError):
+    def test_duplicate_daemon_is_rejected(self):
+        self.start()
+        with self.assertRaisesRegex(RuntimeError, "already active"):
             tensorlane.init(
-                self.run_id,
-                double,
-                2,
-                rank=0,
-                start_daemon=False,
-                ipc_dir=self.temp.name,
-                timeout=0.1,
+                self.run_id, ranks=1, rank=0, start_daemon=True, ipc_dir=self.temp.name
             )
-        with self.assertRaises(AttributeError):
-            self.start(transform=lambda wave: wave)
 
-    def test_init_rejects_invalid_rank_before_starting_or_waiting(self):
-        for owner in (False, True):
-            for rank in (-1, True, 1.5):
-                with self.subTest(owner=owner, rank=rank):
-                    with self.assertRaisesRegex(ValueError, "rank"):
-                        tensorlane.init(
-                            self.run_id,
-                            double,
-                            2,
-                            rank=rank,
-                            start_daemon=owner,
-                            ipc_dir=self.temp.name,
-                        )
-        with self.assertRaisesRegex(ValueError, "invalid rank"):
-            tensorlane.init(
-                self.run_id,
-                double,
-                2,
-                rank=2,
-                start_daemon=True,
-                ipc_dir=self.temp.name,
-            )
-        self.assertEqual(self.service.init_requests, [])
-
-    def test_handle_uses_its_initialized_rank_for_both_readers(self):
-        self.service.validation_count = 5
-        self.start(factor=3)
-        with self.attach(1) as lane:
-            self.assertEqual(lane._rank, 1)
-            self.assertEqual(self.daemon._rank, 0)
+    def test_callback_and_stream_errors_reach_readers(self):
+        for transform_fn, collate_fn, error in [
+            (fail, None, "transform"),
+            (invalid, None, "transform"),
+            (transform, fail_collate, "collate"),
+        ]:
             with (
-                lane.batches() as training,
-                lane.batches(validation=True) as validation,
+                self.subTest(error=error),
+                self.assertRaisesRegex(RuntimeError, "exited|disconnected"),
             ):
-                self.assertEqual(
-                    [batch.samples[0].speaker_id for batch in training], [1, 3]
-                )
-                self.assertEqual(
-                    [batch.samples[0].speaker_id for batch in validation], [1001, 1003]
-                )
+                self.start(transform_fn=transform_fn, collate_fn=collate_fn)
+                with self.daemon.batches() as reader:
+                    next(reader)
+            if self.daemon:
+                self.daemon.close()
+        self.service.fail_stream = "evaluation"
+        with self.assertRaisesRegex(RuntimeError, "fixture data failure"):
+            self.start()
+            with self.daemon.batches("evaluation") as reader:
+                next(reader)
 
-    def test_close_interrupts_busy_transform_and_is_idempotent(self):
-        self.start(transform=slow)
-        wait_for(lambda: len(self.service.requests) > 0)
-        started = time.monotonic()
-        self.daemon.close()
-        self.assertLess(time.monotonic() - started, 8)
-        self.daemon.close()
-
-    def test_new_init_reuses_cleaned_directory(self):
-        self.start()
-        self.daemon.close()
-        self.start()
-        self.daemon.close()
-
-    def test_empty_stream(self):
-        self.service.count = 0
-        self.start()
-        for rank in range(2):
-            with self.attach(rank).batches() as reader:
-                self.assertEqual(list(reader), [])
-
-    def test_empty_batch_fails_without_leaking_prefetch_slots(self):
-        self.service.empty = True
-        with self.assertRaisesRegex(RuntimeError, "empty batches are unsupported"):
-            self.start(ranks=1, factor=2)
+    def test_worker_and_collator_crashes_wake_readers(self):
+        for name in ("tensorlane-transform-0", "tensorlane-collate"):
+            self.start(transform_fn=slow)
             with self.daemon.batches() as reader:
-                list(reader)
+                next(
+                    process
+                    for process in self.daemon._processes
+                    if process.name == name
+                ).kill()
+                with self.assertRaisesRegex(RuntimeError, "exited|disconnected"):
+                    next(reader)
+            self.daemon.close()
 
-    def test_grpc_error_reaches_rank_without_retry(self):
-        self.service.fail_data = True
-        with self.assertRaisesRegex(RuntimeError, "fixture gRPC failure"):
+    def test_asset_and_init_failures_clean_up(self):
+        self.service.assets = {"model": (None, b"weights")}
+        self.service.fail_asset = True
+        with self.assertRaisesRegex(RuntimeError, "fixture asset failure"):
+            self.start()
+        self.assertEqual(len(self.service.end_requests), 1)
+        self.assertFalse(list(Path(self.temp.name).rglob("init.json")))
+        self.service.fail_asset = False
+        self.service.fail_init = True
+        with self.assertRaisesRegex(RuntimeError, "fixture init failure"):
+            self.start()
+        self.assertEqual(len(self.service.end_requests), 1)
+
+    def test_invalid_worker_count_and_callback_mapping(self):
+        for workers in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                self.start(workers=workers)
+        with self.assertRaisesRegex(ValueError, "unknown stream"):
+            self.start(transform_fn={"missing": transform})
+        with self.assertRaises(TypeError):
+            self.start(transform_fn="invalid")
+
+    def test_follower_callback_names_are_validated(self):
+        self.start()
+        for argument in ("transform", "collate_fn"):
+            with self.assertRaisesRegex(ValueError, "unknown stream"):
+                tensorlane.init(
+                    self.run_id,
+                    rank=0,
+                    start_daemon=False,
+                    ipc_dir=self.temp.name,
+                    **{argument: {"missing": transform}},
+                )
+
+    def test_flush_timeout_closes_connection(self):
+        self.start()
+        self.service.upload_gate.clear()
+        self.daemon.save_asset("model", self.file())
+        with self.assertRaisesRegex(RuntimeError, "timed out"):
+            self.daemon.flush(timeout=0.05)
+        self.service.upload_gate.set()
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            self.daemon.metric(1, "after", 1)
+
+    def test_cleaned_directory_can_be_reused(self):
+        self.start()
+        self.daemon.close()
+        self.start()
+        self.daemon.close()
+
+    def test_large_raw_payload_and_empty_batch_failure(self):
+        self.service.streams = {"training": 1, "validation": 0, "evaluation": 0}
+        self.service.blob_size = 9 * 1024 * 1024
+        self.start(transform_fn=None)
+        with self.daemon.batches() as reader:
+            self.assertEqual(
+                len(next(reader).samples[0].blobs["payload"]), self.service.blob_size
+            )
+            self.assertEqual(list(reader), [])
+        self.daemon.close()
+        self.service.empty_batch = True
+        with self.assertRaisesRegex(RuntimeError, "empty batches"):
             self.start()
             with self.daemon.batches() as reader:
                 next(reader)
-        self.assertEqual(len(self.service.requests), 1)
 
-    def test_collater_crash_wakes_reader(self):
-        self.start(transform=slow)
-        reader = self.daemon.batches()
-        try:
-            collater = next(
-                process
-                for process in self.daemon._processes
-                if process.name == "tensorlane-collate"
-            )
-            collater.kill()
-            with self.assertRaisesRegex(RuntimeError, "disconnected|exited"):
-                next(reader)
-        finally:
-            reader.close()
+    def test_nonzero_owner_and_returned_run_id(self):
+        self.service.returned_run_id = str(uuid.uuid4())
+        self.daemon = tensorlane.init(
+            self.run_id,
+            ranks=2,
+            rank=1,
+            start_daemon=True,
+            num_workers=1,
+            addr=f"localhost:{self.service.port}",
+            ipc_dir=self.temp.name,
+        )
+        with self.daemon.batches() as reader:
+            self.assertEqual([batch.batch_id for batch in reader], [1, 3])
+        self.assertEqual(self.daemon.run_id, self.service.returned_run_id)
+        self.daemon.close()
+        self.daemon.close()
+        self.assertEqual(
+            [message.run_id for message in self.service.end_requests],
+            [self.service.returned_run_id],
+        )
 
-    def test_rank_disconnect_fails_pipeline(self):
-        self.service.count = 100
+    def test_close_surfaces_upload_failure_and_follower_can_close_after_owner(self):
         self.start()
-        reader = self.daemon.batches()
-        with self.attach(1) as lane:
-            reader.close()
-            with self.assertRaises(RuntimeError):
-                with lane.batches() as other:
-                    list(other)
+        follower = self.attach()
+        follower.save_asset("other", self.file())
+        follower.flush()
+        self.service.fail_save = True
+        self.daemon.save_asset("model", self.file())
+        with self.assertRaisesRegex(RuntimeError, "fixture save failure"):
+            self.daemon.close()
+        follower.close()
+        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
+        self.assertEqual(len(self.service.end_requests), 1)
 
-    def test_collator_crash_stops_daemon_before_ranks_attach(self):
-        self.service.count = 20
-        self.start(ranks=1, factor=1)
-        wait_for(lambda: len(self.service.requests) == 1)
-        collator = next(
-            process
-            for process in self.daemon._processes
-            if process.name == "tensorlane-collate"
-        )
-        collator.kill()
-        wait_for(self.daemon._stopped.is_set)
-        wait_for(lambda: not (self.daemon._root / "init.json").exists())
-        with self.assertRaisesRegex(RuntimeError, "tensorlane-collate exited"):
-            self.daemon.batches()
-        self.assertEqual(len(self.service.requests), 1)
-
-    def test_worker_connection_is_ready_without_control_messages(self):
-        from tensorlane.client import TensorLane, _root
-
-        root = _root(self.run_id, self.temp.name)
-        native = tensorlane._native.Daemon(
-            self.run_id, f"localhost:{self.service.port}", root, 1, 1, 1
-        )
-        self.daemon = TensorLane(root, native.run_id, native.train_config, 0, native)
-        receiver = tensorlane._native.Listener(root / "work.sock")
-        try:
-            self.assertFalse(hasattr(receiver, "ready"))
-            self.assertFalse(hasattr(receiver, "error"))
-            message = receiver.recv()
-            if message["kind"] == "end":
-                self.assertTrue(message["validation"])
-                message = receiver.recv()
-            self.assertEqual(message["kind"], "sample")
-            self.assertFalse(message["validation"])
-            self.assertEqual(message["batch"], (0, 1))
-            self.assertEqual(message["index"], 0)
-        finally:
-            del receiver
-
-    def test_native_listener_reports_connection_failure(self):
-        with self.assertRaisesRegex(RuntimeError, "No such file or directory"):
-            tensorlane._native.Listener(Path(self.temp.name) / "missing.sock")
-
-    def test_transform_from_callers_search_path(self):
-        module_path = Path(self.temp.name) / "custom_transform.py"
-        module_path.write_text("def transform(wave):\n    return wave.clone()\n")
-        sys.path.insert(0, self.temp.name)
-        try:
-            transform = importlib.import_module("custom_transform").transform
-            self.service.count = 1
-            self.start(ranks=1, transform=transform)
-            with self.daemon.batches() as reader:
-                batch = next(reader)
-                self.assertEqual(batch.samples[0].wave.tolist(), [0, 0])
-                self.assertEqual(list(reader), [])
-        finally:
-            sys.path.remove(self.temp.name)
-            sys.modules.pop("custom_transform", None)
-
-    def test_transform_defined_in_main_script(self):
-        self.service.count = 1
-        script = Path(self.temp.name) / "train.py"
-        script.write_text(
-            "import tensorlane\n"
-            "def transform(wave):\n"
-            "    return wave.float() + 7\n"
-            "if __name__ == '__main__':\n"
-            f"    with tensorlane.init({self.run_id!r}, transform, 1, rank=0, start_daemon=True, "
-            f"addr='localhost:{self.service.port}', ipc_dir={self.temp.name!r}) as lane:\n"
-            "        with lane.batches() as reader:\n"
-            "            batches = list(reader)\n"
-            "            assert len(batches) == 1\n"
-            "            assert batches[0].samples[0].wave.tolist() == [7, 7]\n"
-        )
-        subprocess.run([sys.executable, str(script)], check=True, timeout=40)
-
-    def test_multiple_workers_preserve_order(self):
-        self.service.count = 6
-        self.start(ranks=1, factor=4, transform=identify_worker, workers=3)
-        with self.daemon.batches() as reader:
-            batches = list(reader)
-        self.assertEqual(
-            [[int(sample.wave[0]) for sample in batch] for batch in batches],
-            [[batch_id] * (batch_id % 3 + 1) for batch_id in range(6)],
-        )
-        self.assertEqual(
-            len({int(sample.wave[1]) for batch in batches for sample in batch}), 3
-        )
-
-    def test_default_five_workers(self):
-        self.service.count = 6
-        self.start(ranks=1, factor=4, transform=identify_worker, workers=None)
-        workers = [
-            process
-            for process in self.daemon._processes
-            if process.name.startswith("tensorlane-transform-")
-        ]
-        self.assertEqual(len(workers), 5)
-        self.assertEqual(
-            {path.name for path in Path(self.temp.name).rglob("*.sock")},
-            {"work.sock", "uploads.sock"},
-        )
-        with self.daemon.batches() as reader:
-            batches = list(reader)
-        self.assertEqual(
-            len({int(sample.wave[1]) for batch in batches for sample in batch}), 5
-        )
-
-    def test_invalid_worker_count(self):
-        for workers in (0, -1, 1.5, True):
-            with (
-                self.subTest(workers=workers),
-                self.assertRaisesRegex(ValueError, "num_workers"),
-            ):
-                self.start(workers=workers)
-
-    def test_transformation_worker_crash_wakes_reader(self):
-        self.start(transform=slow, workers=3)
-        with self.daemon.batches() as reader:
-            self.daemon._processes[1].kill()
-            with self.assertRaisesRegex(RuntimeError, "disconnected|exited"):
-                next(reader)
-
-    def test_empty_stream_with_multiple_workers(self):
-        self.service.count = 0
-        self.start(ranks=1, workers=3)
-        with self.daemon.batches() as reader:
-            self.assertEqual(list(reader), [])
-
-    def test_partial_transform(self):
-        self.service.count = 1
-        self.start(ranks=1, transform=partial(double))
-        with self.daemon.batches() as reader:
-            self.assertEqual(len(list(reader)), 1)
-
-    def test_second_process_start_failure_cleans_up(self):
+    def test_second_process_start_failure_does_not_publish_readiness(self):
         original = multiprocessing.process.BaseProcess.start
-        started = []
+        count = 0
 
         def start(process):
-            if started:
-                raise OSError("fixture spawn failure")
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise RuntimeError("injected start failure")
             original(process)
-            started.append(process)
 
-        with patch.object(multiprocessing.process.BaseProcess, "start", start):
-            with self.assertRaisesRegex(OSError, "fixture spawn failure"):
+        with patch("multiprocessing.process.BaseProcess.start", start):
+            with self.assertRaisesRegex(RuntimeError, "injected start failure"):
                 self.start()
-        self.assertEqual(len(started), 1)
-        self.assertTrue(started[0]._closed)
-        self.start()
+        self.assertFalse(list(Path(self.temp.name).rglob("init.json")))
+        self.assertFalse(list(Path(self.temp.name).rglob("work.sock")))
+        self.assertEqual(len(self.service.end_requests), 1)
+
+    def test_default_five_workers_and_busy_close(self):
+        self.daemon = tensorlane.init(
+            self.run_id,
+            slow,
+            rank=0,
+            start_daemon=True,
+            addr=f"localhost:{self.service.port}",
+            ipc_dir=self.temp.name,
+        )
+        self.assertEqual(len(self.daemon._processes), 6)
+        with self.daemon.batches() as reader:
+            started = time.monotonic()
+            self.daemon.close()
+            self.assertLess(time.monotonic() - started, 10)
+            with self.assertRaises((StopIteration, RuntimeError)):
+                next(reader)
 
 
 if __name__ == "__main__":

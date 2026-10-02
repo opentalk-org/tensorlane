@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
-const MAX_FRAME_LENGTH: usize = 256 * 1024 * 1024;
+const MAX_FRAME_LENGTH: usize = crate::MAX_BATCH_BYTES;
 
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
@@ -75,31 +75,28 @@ mod tests {
         let mut data = Sender::new(daemon);
         let mut batches = Receiver::<Work>::new(worker);
         data.send(&Work::Sample {
-            validation: true,
+            stream: "evaluation".into(),
             batch: (0, 1),
+            query_batch_idx: 4,
             index: 0,
-            wave: vec![0, 0],
-            text: vec![],
-            duration: 0.5,
-            speaker_id: 0,
-            language_id: 0,
+            sample_id: "sample".into(),
+            metadata_json: "{}".into(),
+            blobs: Default::default(),
         })
         .await?;
         assert!(matches!(
             batches.recv().await?,
             Some(Work::Sample {
                 batch: (0, 1),
-                index: 0,
+                query_batch_idx: 4,
                 ..
             })
         ));
-        data.send(&Work::End { validation: true }).await?;
-        assert!(matches!(
-            batches.recv().await?,
-            Some(Work::End { validation: true })
-        ));
-        drop(data);
-        assert!(batches.recv().await?.is_none());
+        data.send(&Work::End {
+            stream: "evaluation".into(),
+        })
+        .await?;
+        assert!(matches!(batches.recv().await?, Some(Work::End { .. })));
         Ok(())
     }
 

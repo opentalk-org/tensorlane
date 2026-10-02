@@ -34,3 +34,15 @@ nix develop -c atlas-migrate-prod
 The production command prompts for the database URL without echoing it, asks
 for confirmation, and then applies the committed migration directory. Atlas
 flags such as `--dry-run` or `--baseline <version>` can be appended.
+
+Run configurations use the single `runs.config` string column. Apply the ordered
+`20261002120000`, `20261002120100`, and `20261002120200` migrations before starting
+the updated server. Pause run creation while backfilling and retiring the legacy
+columns. The backfill retains both legacy JSON sections in a lossless snapshot;
+it does not make historical multi-stage runs executable. The retirement migration
+checks completion before dropping either old column.
+
+Application dataset tables are excluded from active schema management. Historical
+migrations remain intact and no dataset contents are dropped. Automatic schema
+application skips table and column drops; the configuration retirement must run
+through the committed, ordered migrations.

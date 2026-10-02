@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
-use serde_json::json;
 
-use crate::setup::{TIMESTAMP_MS, TestEnv, array, data_config, scalar};
+use crate::setup::{TIMESTAMP_MS, TestEnv, array, run_config, scalar};
 
 #[derive(clickhouse::Row, Deserialize)]
 struct ArrayMetric {
@@ -20,7 +19,7 @@ struct ArrayMetric {
 async fn metrics_buffer_independently_flush_at_1000_and_flush_tails_on_close() -> Result<()> {
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
-    let run = env.create_run(data_config(dataset, 1), json!({})).await?;
+    let run = env.create_run(run_config(dataset, 1)).await?;
     env.init_run(&run).await?;
     let stream = env.metrics_stream(&run).await?;
     for step in 0..999 {

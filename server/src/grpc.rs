@@ -4,25 +4,24 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::loader::S3Loader;
+use crate::proto::asset_response;
 use crate::proto::{
-    AssetRequest, AssetResponse, CheckpointRequest, CheckpointResponse, DataRequest, DataResponse,
-    EndRequest, EndResponse, InitRequest, InitResponse, MetricsRequest, MetricsResponse,
-    checkpoint_request, metrics_request,
+    AssetRequest, AssetResponse, DataRequest, DataResponse, EndRequest, EndResponse, InitRequest,
+    InitResponse, MetricsRequest, MetricsResponse, SaveAssetRequest, SaveAssetResponse,
+    metrics_request, save_asset_request,
     tensor_lane_server::{TensorLane as TensorLaneService, TensorLaneServer},
 };
-use crate::proto::{Split, asset_response};
 use crate::run::RunExecutor;
 use crate::run_repo::RunRepo;
 use crate::uploads::UploadStore;
-use crate::{metrics, proto};
+use crate::{MAX_BATCH_BYTES, metrics};
 use bytes::BytesMut;
 use clickhouse::Client;
 use futures::Stream;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -80,7 +79,8 @@ impl TensorLaneService for TensorLane {
                 "server is shutting down; new runs are not accepted",
             ));
         }
-        let run_id = parse_run_id(&request.into_inner().run_id)?;
+        let request = request.into_inner();
+        let run_id = parse_run_id(&request.run_id)?;
         debug!(run = %run_id, "init request");
         let init = self
             .runs
@@ -91,12 +91,13 @@ impl TensorLaneService for TensorLane {
 
         Ok(Response::new(InitResponse {
             run_id: run_id.to_string(),
-            train_config: init.train_config,
+            config: init.config,
             assets: init.assets,
+            streams: init.streams,
         }))
     }
 
-    type DataStream = UnboundedReceiverStream<Result<DataResponse, Status>>;
+    type DataStream = tokio_stream::wrappers::ReceiverStream<Result<DataResponse, Status>>;
 
     async fn data(
         &self,
@@ -104,18 +105,18 @@ impl TensorLaneService for TensorLane {
     ) -> Result<Response<Self::DataStream>, Status> {
         let mut stream = request.into_inner();
 
-        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (out_tx, out_rx) = mpsc::channel(1);
         tokio::spawn({
             let runs = self.runs.clone();
             async move {
                 if let Err(err) = data_handler(runs, &mut stream, &out_tx).await {
                     error!(error = format!("{err:#}"), "data stream failed");
-                    let _ = out_tx.send(Err(Status::internal(format!("{err:#}"))));
+                    let _ = out_tx.send(Err(Status::internal(format!("{err:#}")))).await;
                 }
             }
         });
 
-        Ok(UnboundedReceiverStream::new(out_rx).into())
+        Ok(tokio_stream::wrappers::ReceiverStream::new(out_rx).into())
     }
 
     type AssetStream = Pin<Box<dyn Stream<Item = Result<AssetResponse, Status>> + Send>>;
@@ -126,65 +127,58 @@ impl TensorLaneService for TensorLane {
     ) -> Result<Response<Self::AssetStream>, Status> {
         let request = request.into_inner();
         let run_id = parse_run_id(&request.run_id)?;
-        let (path, entrypoint) = self
+        let (path, metadata) = self
             .runs
             .asset(run_id, &request.name)
             .await
             .map_err(|err| Status::internal(format!("{err:#}")))?;
-        Ok(Response::new(asset_stream(path, entrypoint)))
+        Ok(Response::new(asset_stream(path, metadata)))
     }
 
-    async fn checkpoint(
+    async fn save_asset(
         &self,
-        request: Request<Streaming<CheckpointRequest>>,
-    ) -> Result<Response<CheckpointResponse>, Status> {
+        request: Request<Streaming<SaveAssetRequest>>,
+    ) -> Result<Response<SaveAssetResponse>, Status> {
         let mut stream = request.into_inner();
-
-        let metadata = match stream.message().await?.and_then(|r| r.payload) {
-            Some(checkpoint_request::Payload::Metadata(metadata)) => metadata,
+        let metadata = match stream.message().await?.and_then(|message| message.payload) {
+            Some(save_asset_request::Payload::Metadata(metadata)) => metadata,
             _ => {
                 return Err(Status::invalid_argument(
-                    "first checkpoint message must be metadata",
+                    "first asset-save message must be metadata",
                 ));
             }
         };
         let run_id = parse_run_id(&metadata.run_id)?;
-        let asset_type = self
-            .runs
-            .asset_type(run_id)
-            .await
-            .map_err(|err| Status::internal(format!("{err:#}")))?;
-        info!(run = %run_id, step = metadata.step, "receiving checkpoint");
-
-        let checkpoint_id = uuid::Uuid::new_v4();
-        let path = self.uploads.staging_path(checkpoint_id);
-        let result = receive_checkpoint(&path, &mut stream).await;
-
-        match result {
-            Ok((bytes, content_hash)) => {
-                self.uploads.checkpoint(
-                    checkpoint_id,
-                    run_id,
-                    metadata.step,
-                    bytes,
-                    content_hash,
-                    asset_type,
-                );
-                info!(
-                    checkpoint = %checkpoint_id,
-                    run = %run_id,
-                    step = metadata.step,
-                    bytes,
-                    path = %path.display(),
-                    "checkpoint staged"
-                );
-                Ok(Response::new(CheckpointResponse {}))
-            }
-            Err(err) => {
-                error!(error = format!("{err:#}"), "staging checkpoint failed");
-                Err(Status::internal(format!("{err:#}")))
-            }
+        let id: Uuid = metadata
+            .asset_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("invalid asset ID"))?;
+        if id.is_nil() {
+            return Err(Status::invalid_argument("asset ID must not be nil"));
         }
+        crate::asset_repo::kind_value(&metadata.kind)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&metadata.metadata_json)
+            .map_err(|_| Status::invalid_argument("asset metadata must be a JSON object"))?;
+        let context = self
+            .runs
+            .admit_save(run_id, &metadata.name)
+            .await
+            .map_err(|err| Status::failed_precondition(err.to_string()))?;
+        let path = self.uploads.staging_path(Uuid::new_v4());
+        let result = async {
+            let (size, hash) = receive_asset(&path, &mut stream).await?;
+            self.runs
+                .save_asset(context, metadata, &path, size, hash, &self.uploads)
+                .await
+        }
+        .await;
+        let _ = fs::remove_file(&path).await;
+        let _ = fs::remove_file(path.with_extension("part")).await;
+        let id = result.map_err(|err| Status::internal(format!("{err:#}")))?;
+        Ok(Response::new(SaveAssetResponse {
+            asset_id: id.to_string(),
+        }))
     }
 
     async fn metrics(
@@ -248,33 +242,34 @@ pub fn parse_run_id(value: &str) -> Result<Uuid, Status> {
 pub async fn data_handler(
     runs: RunExecutor,
     req_stream: &mut Streaming<DataRequest>,
-    resp_stream: &UnboundedSender<Result<DataResponse, Status>>,
+    resp_stream: &mpsc::Sender<Result<DataResponse, Status>>,
 ) -> anyhow::Result<()> {
+    let mut identity = None;
     while let Some(req) = req_stream.message().await? {
         let run_id = parse_run_id(&req.run_id)?;
-        debug!(run = %run_id, split = ?req.split(), "data request");
-        let Some(loaded_batch) = runs
-            .next_batch(run_id, req.split() == Split::Validation)
-            .await?
-        else {
-            debug!(run = %run_id, split = ?req.split(), "data stream exhausted");
+        if let Some((id, name)) = &identity {
+            anyhow::ensure!(
+                *id == run_id && name == &req.stream,
+                "a Data stream cannot change run or query"
+            );
+        } else {
+            identity = Some((run_id, req.stream.clone()));
+        }
+        let Some(batch) = runs.next_batch(run_id, &req.stream).await? else {
             return Ok(());
         };
-        let batch = loaded_batch.into_iter().map(proto::Sample::from).collect();
-        resp_stream.send(Ok(DataResponse { batch }))?;
+        resp_stream.send(Ok(batch)).await?;
     }
     Ok(())
 }
 
 pub fn asset_stream(
     path: PathBuf,
-    entrypoint: Option<String>,
+    metadata: crate::proto::AssetMetadata,
 ) -> Pin<Box<dyn Stream<Item = Result<AssetResponse, Status>> + Send>> {
     Box::pin(async_stream::stream! {
         yield Ok(AssetResponse {
-            payload: Some(asset_response::Payload::Metadata(proto::AssetMetadata {
-                entrypoint,
-            })),
+            payload: Some(asset_response::Payload::Metadata(metadata)),
         });
         let mut file = match fs::File::open(&path).await {
             Ok(file) => file,
@@ -299,9 +294,9 @@ pub fn asset_stream(
     })
 }
 
-pub async fn receive_checkpoint(
+pub async fn receive_asset(
     path: &Path,
-    stream: &mut Streaming<CheckpointRequest>,
+    stream: &mut Streaming<SaveAssetRequest>,
 ) -> anyhow::Result<(u64, [u8; 64])> {
     let part = path.with_extension("part");
     let mut file = fs::File::create(&part).await?;
@@ -309,12 +304,12 @@ pub async fn receive_checkpoint(
     let mut hasher = Sha256::new();
     while let Some(request) = stream.message().await? {
         match request.payload {
-            Some(checkpoint_request::Payload::Chunk(chunk)) => {
+            Some(save_asset_request::Payload::Chunk(chunk)) => {
                 bytes += chunk.len() as u64;
                 hasher.update(&chunk);
                 file.write_all(&chunk).await?;
             }
-            _ => anyhow::bail!("expected checkpoint chunks after the metadata"),
+            _ => anyhow::bail!("expected asset chunks after the metadata"),
         }
     }
     file.sync_all().await?;
@@ -356,7 +351,11 @@ pub async fn serve(
         shutdown,
     );
     let result = Server::builder()
-        .add_service(TensorLaneServer::new(service.clone()))
+        .add_service(
+            TensorLaneServer::new(service.clone())
+                .max_decoding_message_size(MAX_BATCH_BYTES)
+                .max_encoding_message_size(MAX_BATCH_BYTES),
+        )
         .serve_with_shutdown(
             SocketAddr::from((Ipv4Addr::new(0, 0, 0, 0), port)),
             service.wait(),

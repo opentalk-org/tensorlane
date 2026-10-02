@@ -1,116 +1,54 @@
-use anyhow::{anyhow, ensure};
-use blake2::{
-    Blake2bVar,
-    digest::{Update, VariableOutput},
-};
-use bytes::Bytes;
-use uuid::Uuid;
+use crate::db::SampleRow;
+use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
-use crate::{
-    db::SampleRow,
-    symbols::{TextCleaner, boundary_token_id, text_to_tensor_bytes},
-};
-
-#[derive(Clone)]
-pub struct SampleObject {
-    pub path: String,
-    pub offset: i64,
-    pub length: i64,
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlobRef {
+    pub object: String,
+    pub byte_offset: Option<u64>,
+    pub byte_length: Option<u64>,
 }
-
-#[derive(Clone)]
-pub struct Sample {
-    pub duration: f64,
-    pub audio_id: Uuid,
-    pub language_id: i32,
-    pub speaker_id: u64,
-    pub text: Bytes,
-
-    pub object: SampleObject,
-}
-
-impl Sample {
-    fn new(
-        audio_id: Uuid,
-        duration: f64,
-        text: String,
-        text_cleaner: &mut TextCleaner,
-        language: &String,
-        plbert_langs: &[String],
-        speaker_id: Option<String>,
-        object: SampleObject,
-    ) -> anyhow::Result<Self> {
-        let boundary_token_id = boundary_token_id(text_cleaner)?;
-        let text_tensor = text_to_tensor_bytes(text_cleaner, boundary_token_id, &text);
-        let lang_norm = language.trim().to_lowercase().replace("_", "-");
-        let language_id: i32 = if plbert_langs.is_empty() {
-            0
-        } else {
-            plbert_langs
-                .iter()
-                .position(|l| {
-                    l == &lang_norm
-                        || l == lang_norm
-                            .split_once("-")
-                            .unwrap_or((lang_norm.as_str(), ""))
-                            .0
-                })
-                .ok_or_else(|| anyhow!("training audio is missing its language"))?
-                as i32
-        };
-        let mut hasher = Blake2bVar::new(8)?;
-        let speaker = speaker_id.unwrap_or("0".to_string());
-        // TODO: check the ylacombe/expresso thing too
-        hasher.update(speaker.as_bytes());
-        let mut digest = [0u8; 8];
-        hasher.finalize_variable(&mut digest)?;
-
-        let speaker_id = u64::from_be_bytes(digest) % ((1u64 << 63) - 1);
-
-        Ok(Sample {
-            audio_id,
-            duration,
-            language_id,
-            speaker_id,
-            text: text_tensor,
-            object,
-        })
-    }
-}
-
-pub trait Sampler: Send {
-    /// `Ok(None)` means the sampler is exhausted and the stream should end.
-    fn next_batch(&mut self) -> anyhow::Result<Option<Vec<Sample>>>;
-}
-
-pub struct QuerySampler {
-    batches: std::vec::IntoIter<Vec<Sample>>,
-}
-
-impl QuerySampler {
-    pub fn len(&self) -> usize {
-        self.batches.len()
-    }
-
-    pub fn repeat(self) -> impl Sampler {
-        RepeatingQuerySampler {
-            batches: self.batches.cycle(),
+impl BlobRef {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(!self.object.is_empty(), "blob object must not be empty");
+        match (self.byte_offset, self.byte_length) {
+            (None, None) => Ok(()),
+            (Some(offset), Some(length)) => {
+                ensure!(length > 0, "blob range length must be positive");
+                offset
+                    .checked_add(length - 1)
+                    .context("blob range overflows")?;
+                Ok(())
+            }
+            _ => anyhow::bail!("blob range needs both byte_offset and byte_length"),
         }
     }
-
-    pub fn audio_ids(&self) -> Vec<Uuid> {
-        self.batches
-            .as_slice()
-            .iter()
-            .flatten()
-            .map(|sample| sample.audio_id)
-            .collect()
-    }
-
-    pub fn new(rows: Vec<SampleRow>, languages: &[String]) -> anyhow::Result<Self> {
-        let mut cleaner = TextCleaner::default();
-        let mut batches = Vec::new();
-        let mut batch = Vec::new();
+}
+#[derive(Clone)]
+pub struct Sample {
+    pub sample_id: String,
+    pub metadata_json: String,
+    pub blobs: BTreeMap<String, BlobRef>,
+}
+#[derive(Clone)]
+pub struct BatchPlan {
+    pub query_batch_idx: u64,
+    pub samples: Vec<Sample>,
+}
+pub trait Sampler: Send {
+    fn next_batch(&mut self) -> Result<Option<BatchPlan>>;
+}
+pub struct QuerySampler {
+    batches: Vec<BatchPlan>,
+    next: usize,
+    repeat: bool,
+}
+impl QuerySampler {
+    pub fn new(rows: Vec<SampleRow>) -> Result<Self> {
+        let mut batches: Vec<BatchPlan> = Vec::new();
         let mut previous = None;
         for row in rows {
             let key = (row.batch_idx, row.sample_idx);
@@ -118,55 +56,60 @@ impl QuerySampler {
                 previous.is_none_or(|last| last < key),
                 "query rows must be strictly ordered by batch_idx, sample_idx"
             );
-            if previous.is_some_and(|last: (u64, u64)| last.0 != row.batch_idx) {
-                batches.push(std::mem::take(&mut batch));
-            }
             previous = Some(key);
-            batch.push(Sample::new(
-                row.audio_id,
-                row.duration,
-                row.text.ok_or_else(|| anyhow!("sample is missing text"))?,
-                &mut cleaner,
-                &row.language
-                    .ok_or_else(|| anyhow!("sample is missing language"))?,
-                languages,
-                row.speaker_id,
-                SampleObject {
-                    path: row.object_path,
-                    offset: row.byte_offset,
-                    length: row.byte_length,
-                },
-            )?);
-        }
-        if !batch.is_empty() {
-            batches.push(batch);
+            let _: Map<String, Value> = serde_json::from_str(&row.metadata_json)
+                .context("sample metadata must be a JSON object")?;
+            let blobs: BTreeMap<String, BlobRef> = serde_json::from_str(&row.blobs_json)
+                .context("blobs must be a JSON object of storage references")?;
+            for (name, blob) in &blobs {
+                ensure!(!name.is_empty(), "blob name must not be empty");
+                blob.validate()?;
+            }
+            if batches
+                .last()
+                .is_none_or(|batch| batch.query_batch_idx != row.batch_idx)
+            {
+                batches.push(BatchPlan {
+                    query_batch_idx: row.batch_idx,
+                    samples: Vec::new(),
+                });
+            }
+            batches.last_mut().unwrap().samples.push(Sample {
+                sample_id: row.sample_id,
+                metadata_json: row.metadata_json,
+                blobs,
+            });
         }
         Ok(Self {
-            batches: batches.into_iter(),
+            batches,
+            next: 0,
+            repeat: false,
         })
     }
+    pub fn len(&self) -> usize {
+        self.batches.len()
+    }
+    pub fn repeat(mut self) -> Self {
+        self.repeat = true;
+        self
+    }
 }
-
 impl Sampler for QuerySampler {
-    fn next_batch(&mut self) -> anyhow::Result<Option<Vec<Sample>>> {
-        Ok(self.batches.next())
+    fn next_batch(&mut self) -> Result<Option<BatchPlan>> {
+        if self.next == self.batches.len() {
+            if !self.repeat || self.batches.is_empty() {
+                return Ok(None);
+            }
+            self.next = 0;
+        }
+        let batch = self.batches[self.next].clone();
+        self.next += 1;
+        Ok(Some(batch))
     }
 }
-
-struct RepeatingQuerySampler {
-    batches: std::iter::Cycle<std::vec::IntoIter<Vec<Sample>>>,
-}
-
-impl Sampler for RepeatingQuerySampler {
-    fn next_batch(&mut self) -> anyhow::Result<Option<Vec<Sample>>> {
-        Ok(self.batches.next())
-    }
-}
-
-#[cfg(test)]
-#[path = "sampling_tests.rs"]
-mod tests;
-
 #[cfg(test)]
 #[path = "sampling/benchmark.rs"]
 mod benchmark;
+#[cfg(test)]
+#[path = "sampling_tests.rs"]
+mod tests;

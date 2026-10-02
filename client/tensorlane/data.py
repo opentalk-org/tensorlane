@@ -2,29 +2,27 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from torch import Tensor
+from typing import Any
 
 
 @dataclass(frozen=True)
-class Sample:
-    """Transformed CPU waveform, original metadata, and int64 text tokens."""
-
-    wave: Tensor
-    duration: float
-    speaker_id: int
-    language_id: int
-    text: Tensor
+class RawSample:
+    sample_id: str
+    stream: str
+    metadata: dict[str, Any]
+    blobs: dict[str, bytes]
 
 
 @dataclass(frozen=True)
 class Batch:
-    samples: tuple[Sample, ...]
+    stream: str
+    batch_id: int
+    query_batch_idx: int
+    samples: tuple[Any, ...]
+    data: Any
 
     def __len__(self) -> int:
         return len(self.samples)
 
-    def __iter__(self) -> Iterator[Sample]:
+    def __iter__(self) -> Iterator[Any]:
         return iter(self.samples)

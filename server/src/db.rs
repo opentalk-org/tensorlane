@@ -1,28 +1,19 @@
 use serde::Deserialize;
 use serde_json::Value;
-use uuid::Uuid;
 
 #[derive(clickhouse::Row, Deserialize)]
 pub struct SampleRow {
-    #[serde(with = "clickhouse::serde::uuid")]
-    pub audio_id: Uuid,
-    pub duration: f64,
-    pub language: Option<String>,
-    pub speaker_id: Option<String>,
-    pub text: Option<String>,
-
+    pub sample_id: String,
     pub batch_idx: u64,
     pub sample_idx: u64,
-
-    pub object_path: String,
-    pub byte_offset: i64,
-    pub byte_length: i64,
+    pub metadata_json: String,
+    pub blobs_json: String,
 }
 
 pub async fn fetch_samples(
     client: &clickhouse::Client,
     sql: &str,
-    params: &[(&str, Value)],
+    params: &std::collections::BTreeMap<String, Value>,
 ) -> anyhow::Result<Vec<SampleRow>> {
     let mut query = client.query(sql);
     for (name, value) in params {

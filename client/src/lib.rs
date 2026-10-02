@@ -1,5 +1,7 @@
 use pyo3::prelude::*;
 
+const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+
 mod assets;
 mod client;
 mod data;

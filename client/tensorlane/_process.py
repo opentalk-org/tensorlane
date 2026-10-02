@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from multiprocessing.connection import Client
 from pathlib import Path
 import queue
-import sys
 import threading
 import traceback
 import time
@@ -11,6 +12,7 @@ import time
 import torch.multiprocessing as multiprocessing
 
 from . import _native
+from .data import Batch, RawSample
 
 
 def _connect(path: Path, key: bytes, stopped):
@@ -22,25 +24,41 @@ def _connect(path: Path, key: bytes, stopped):
     raise RuntimeError("daemon stopped during connection")
 
 
-def transform_worker(
-    root: Path,
-    transform,
-    output,
-    stopped,
-) -> None:
+def callback(spec, stream):
+    return spec.get(stream) if isinstance(spec, Mapping) else spec
+
+
+def share(value):
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise TypeError("workers must return CPU tensors")
+        return value.detach().share_memory_()
+    if isinstance(value, dict):
+        return {key: share(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [share(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(share(item) for item in value)
+    if isinstance(value, RawSample):
+        return RawSample(
+            value.sample_id, value.stream, share(value.metadata), share(value.blobs)
+        )
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return value
+    raise TypeError(f"unsupported worker output: {type(value).__name__}")
+
+
+def transform_worker(root: Path, transform, streams, output, stopped) -> None:
     multiprocessing.current_process().authkey = (root / "auth").read_bytes()
     receiver = _native.Listener(root / "work.sock")
     try:
         import torch
 
         output.cancel_join_thread()
-
         errors = queue.SimpleQueue()
-
-        def feeder_error(error, _message):
-            errors.put(error)
-
-        output._on_queue_feeder_error = feeder_error
+        output._on_queue_feeder_error = lambda error, _message: errors.put(error)
         ended = set()
         with torch.no_grad():
             while not stopped.is_set():
@@ -53,56 +71,43 @@ def transform_worker(
                     if stopped.is_set():
                         return
                     raise RuntimeError("data stream ended before End")
+                stream = message["stream"]
+                if stream not in streams or stream in ended:
+                    raise RuntimeError("unexpected or already ended stream")
                 if message["kind"] == "sample":
-                    from .data import Sample
-
                     try:
-                        if sys.byteorder != "little":
-                            raise RuntimeError(
-                                "PCM decoding currently requires a little-endian host"
-                            )
-                        wave = (
-                            torch.frombuffer(
-                                bytearray(message["wave"]), dtype=torch.int16
-                            )
-                            if message["wave"]
-                            else torch.empty(0, dtype=torch.int16)
+                        metadata = json.loads(message["metadata_json"])
+                        if not isinstance(metadata, dict):
+                            raise TypeError("sample metadata must be an object")
+                        sample = RawSample(
+                            message["sample_id"], stream, metadata, message["blobs"]
                         )
-                        text = (
-                            torch.frombuffer(
-                                bytearray(message["text"]), dtype=torch.int64
-                            )
-                            if message["text"]
-                            else torch.empty(0, dtype=torch.int64)
-                        )
-                        transformed = transform(wave)
-                        if (
-                            not isinstance(transformed, torch.Tensor)
-                            or transformed.device.type != "cpu"
-                        ):
-                            raise TypeError("transform must return a CPU torch.Tensor")
-                        sample = Sample(
-                            transformed.detach().share_memory_(),
-                            message["duration"],
-                            message["speaker_id"],
-                            message["language_id"],
-                            text.share_memory_(),
+                        transform_fn = callback(transform, stream)
+                        transformed = share(
+                            transform_fn(sample) if transform_fn else sample
                         )
                         output.put(
                             (
                                 "sample",
-                                message["validation"],
-                                (message["batch"], message["index"], sample),
+                                stream,
+                                (
+                                    message["batch"],
+                                    message["query_batch_idx"],
+                                    message["index"],
+                                    transformed,
+                                ),
                             )
                         )
                     except Exception as error:
                         raise RuntimeError(
-                            f"batch {message['batch']} sample {message['index']}: {error}"
+                            f"stream {stream} batch {message['batch']} sample {message['index']}: {error}"
                         ) from error
+                elif message["kind"] == "end":
+                    output.put(("end", stream, None))
+                    ended.add(stream)
                 else:
-                    output.put(("end", message["validation"], None))
-                    ended.add(message["validation"])
-                if len(ended) == 2:
+                    raise RuntimeError("unexpected work message")
+                if len(ended) == len(streams):
                     while not stopped.wait(0.1):
                         if not errors.empty():
                             raise RuntimeError(
@@ -118,26 +123,27 @@ def collate_worker(
     root: Path,
     ranks: int,
     num_workers: int,
+    streams,
+    collate_fn,
     incoming,
     stopped,
     ready,
 ) -> None:
-    from .data import Batch
-
     key = (root / "auth").read_bytes()
     multiprocessing.current_process().authkey = key
-    outputs = [[queue.Queue() for _ in range(ranks)] for _ in range(2)]
+    outputs = {name: [queue.Queue() for _ in range(ranks)] for name in streams}
     errors = queue.Queue()
 
-    def deliver(rank: int, validation: bool) -> None:
+    def deliver(rank: int, stream: str, stream_index: int) -> None:
         connection = None
         try:
-            prefix = "validation-" if validation else ""
-            connection = _connect(root / f"{prefix}rank-{rank}.sock", key, stopped)
+            connection = _connect(
+                root / "streams" / str(stream_index) / f"rank-{rank}.sock", key, stopped
+            )
             connection.send(("ready", None))
             while not stopped.is_set():
                 try:
-                    message = outputs[validation][rank].get(timeout=0.1)
+                    message = outputs[stream][rank].get(timeout=0.1)
                 except queue.Empty:
                     if connection.poll():
                         raise RuntimeError(f"rank {rank} disconnected")
@@ -153,57 +159,61 @@ def collate_worker(
             if connection is not None:
                 connection.close()
 
-    for validation in (False, True):
+    for stream_index, stream in enumerate(streams):
         for rank in range(ranks):
             threading.Thread(
-                target=deliver, args=(rank, validation), daemon=True
+                target=deliver, args=(rank, stream, stream_index), daemon=True
             ).start()
     ready.set()
-    pending = [{}, {}]
-    completed = [{}, {}]
-    next_batch = [0, 0]
-    ended = [0, 0]
+    pending = {name: {} for name in streams}
+    completed = {name: {} for name in streams}
+    next_batch = {name: 0 for name in streams}
+    ended = {name: 0 for name in streams}
     while not stopped.is_set():
+        if not errors.empty():
+            raise RuntimeError(errors.get())
         try:
-            error = errors.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            raise RuntimeError(error)
-        if all(count == num_workers for count in ended):
-            stopped.wait(0.1)
-            continue
-        try:
-            kind, validation, value = incoming.get(timeout=0.1)
+            kind, stream, value = incoming.get(timeout=0.1)
         except queue.Empty:
             continue
-        if kind == "error":
-            raise RuntimeError(value)
+        if stream not in outputs:
+            raise RuntimeError("unexpected stream")
         if kind == "end":
-            ended[validation] += 1
-            if ended[validation] == num_workers:
-                if pending[validation] or completed[validation]:
+            ended[stream] += 1
+            if ended[stream] > num_workers:
+                raise RuntimeError("duplicate stream end")
+            if ended[stream] == num_workers:
+                if pending[stream] or completed[stream]:
                     raise RuntimeError(
                         "stream ended with incomplete or missing batches"
                     )
-                for output in outputs[validation]:
+                for output in outputs[stream]:
                     output.put(("end", None))
             continue
-        if kind != "sample":
+        if kind != "sample" or ended[stream] == num_workers:
             raise RuntimeError(f"unexpected transformation message: {kind}")
-        (batch_id, batch_size), index, sample = value
-        if batch_id < next_batch[validation] or batch_id in completed[validation]:
+        (batch_id, batch_size), query_idx, index, sample = value
+        if batch_id < next_batch[stream] or batch_id in completed[stream]:
             raise RuntimeError("message for an already completed batch")
-        size, parts = pending[validation].setdefault(batch_id, (batch_size, {}))
+        if batch_size <= 0 or index < 0 or index >= batch_size:
+            raise RuntimeError("invalid sample position")
+        size, expected_query_idx, parts = pending[stream].setdefault(
+            batch_id, (batch_size, query_idx, {})
+        )
+        if size != batch_size or expected_query_idx != query_idx or index in parts:
+            raise RuntimeError("inconsistent batch or duplicate sample position")
         parts[index] = sample
         if len(parts) == size:
-            completed[validation][batch_id] = Batch(
-                tuple(parts[index] for index in range(size))
+            samples = tuple(parts[index] for index in range(size))
+            collator = callback(collate_fn, stream)
+            data = share(collator(samples)) if collator else samples
+            completed[stream][batch_id] = Batch(
+                stream, batch_id, query_idx, samples, data
             )
-            del pending[validation][batch_id]
-        while next_batch[validation] in completed[validation]:
-            batch_id = next_batch[validation]
-            outputs[validation][batch_id % ranks].put(
-                ("batch", (batch_id, completed[validation].pop(batch_id)))
+            del pending[stream][batch_id]
+        while next_batch[stream] in completed[stream]:
+            batch_id = next_batch[stream]
+            outputs[stream][batch_id % ranks].put(
+                ("batch", (batch_id, completed[stream].pop(batch_id)))
             )
-            next_batch[validation] += 1
+            next_batch[stream] += 1

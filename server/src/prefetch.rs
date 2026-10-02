@@ -1,236 +1,102 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-
-use bytes::Bytes;
-use tokio::{
-    fs,
-    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    time::{Instant, MissedTickBehavior, interval_at},
-};
+use crate::{MAX_BATCH_BYTES, loader::Loader, sampling::Sampler};
+use anyhow::{Result, ensure};
+use prost::Message;
+use std::{path::PathBuf, sync::Arc};
+use tokio::{fs, sync::mpsc};
 use tokio_util::{future::FutureExt, sync::CancellationToken, task::TaskTracker};
-use tracing::{Instrument, debug, info, warn};
+use tracing::Instrument;
 
-use crate::{
-    loader::Loader,
-    sampling::{Sample, Sampler},
-};
-
-struct PrefetchedSample {
-    sample: Sample,
+pub type LoadedBatch = crate::proto::DataResponse;
+struct CachedBatch {
     path: PathBuf,
 }
-
-type PrefetchedBatch = Vec<PrefetchedSample>;
-
-pub struct LoadedSample {
-    pub wave: Bytes,
-    pub duration: f64,
-    pub speaker_id: i64,
-    pub language_id: i32,
-    pub text: Bytes,
-}
-
-pub type LoadedBatch = Vec<LoadedSample>;
-
-impl From<LoadedSample> for crate::proto::Sample {
-    fn from(sample: LoadedSample) -> Self {
-        Self {
-            wave: sample.wave,
-            duration: sample.duration,
-            speaker_id: sample.speaker_id,
-            language_id: sample.language_id,
-            text: sample.text,
-        }
-    }
-}
-
 const CACHED_BATCHES: usize = 20;
-const CACHE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct Prefetcher {
-    rx: mpsc::UnboundedReceiver<(anyhow::Result<PrefetchedBatch>, OwnedSemaphorePermit)>,
-    cancel_token: CancellationToken,
+    rx: mpsc::Receiver<Result<CachedBatch>>,
+    cancel: CancellationToken,
     tasks: TaskTracker,
 }
-
 impl Prefetcher {
     pub fn spawn(
         mut sampler: Box<dyn Sampler>,
         loader: Arc<dyn Loader>,
-        cache_dir: PathBuf,
-        cancel_token: CancellationToken,
+        cache: PathBuf,
+        parent: CancellationToken,
         span: tracing::Span,
+        stream: String,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let slots = Arc::new(Semaphore::new(CACHED_BATCHES));
-
+        let (tx, rx) = mpsc::channel(CACHED_BATCHES);
+        let cancel = parent.child_token();
         let tasks = TaskTracker::new();
-        let cancel_token = cancel_token.child_token();
         tasks.spawn({
-            let cancel_token = cancel_token.clone();
-            let cache_dir = cache_dir.clone();
-            let slots = slots.clone();
-            log_cache(cancel_token, cache_dir, slots)
-        });
-        tasks.spawn({
-            let cancel_token = cancel_token.clone();
+            let cancel = cancel.clone();
             async move {
-                'outer: loop {
-                    let permit = match slots
-                        .clone()
-                        .acquire_owned()
-                        .with_cancellation_token(&cancel_token)
-                        .await
-                    {
-                        Some(Err(_)) | None => break,
-                        Some(Ok(permit)) => permit,
-                    };
-
-                    let result = loop {
-                        let loaded = match sampler.next_batch() {
-                            Ok(Some(batch)) => match load_batch(&loader, &cache_dir, batch)
-                                .with_cancellation_token(&cancel_token)
-                                .await
-                            {
-                                None => break 'outer,
-                                Some(v) => v,
-                            },
-                            Ok(None) => {
-                                debug!("schedule exhausted");
-                                break 'outer;
-                            }
-                            Err(err) => break Err(err),
-                        };
-
-                        match loaded {
-                            Ok(None) => {
-                                warn!("batch loading failed, skipping batch");
-                                continue;
-                            }
-                            Ok(Some(batch)) => break Ok(batch),
-                            Err(err) => {
-                                warn!(
-                                    error = format!("{err:#}"),
-                                    "batch loading failed, skipping batch"
-                                );
-                                continue;
-                            }
-                        }
-                    };
-                    if tx.send((result, permit)).is_err() {
+                let mut batch_id = 0;
+                loop {
+                    let Some(Ok(slot)) = tx.reserve().with_cancellation_token(&cancel).await else {
                         break;
+                    };
+                    let result: Option<Result<Option<CachedBatch>>> = async {
+                        let Some(plan) = sampler.next_batch()? else {
+                            return Ok(None);
+                        };
+                        let mut response = LoadedBatch {
+                            stream: stream.clone(),
+                            batch_id,
+                            query_batch_idx: plan.query_batch_idx,
+                            batch: Vec::with_capacity(plan.samples.len()),
+                        };
+                        for sample in plan.samples {
+                            response.batch.push(loader.load_sample(sample).await?);
+                            ensure!(
+                                response.encoded_len() <= MAX_BATCH_BYTES,
+                                "encoded batch exceeds 64 MiB"
+                            );
+                        }
+                        let path = cache.join(format!("{}.batch", uuid::Uuid::new_v4()));
+                        let part = path.with_extension("part");
+                        let write = async {
+                            fs::write(&part, response.encode_to_vec()).await?;
+                            fs::rename(&part, &path).await?;
+                            Ok::<_, std::io::Error>(())
+                        }
+                        .await;
+                        if write.is_err() {
+                            let _ = fs::remove_file(&part).await;
+                        }
+                        write?;
+                        batch_id += 1;
+                        Ok(Some(CachedBatch { path }))
+                    }
+                    .with_cancellation_token(&cancel)
+                    .await;
+                    match result {
+                        Some(Ok(Some(batch))) => slot.send(Ok(batch)),
+                        Some(Err(error)) => {
+                            slot.send(Err(error));
+                            break;
+                        }
+                        _ => break,
                     }
                 }
-                debug!("prefetcher stopped");
             }
             .instrument(span)
         });
-
-        Self {
-            rx,
-            cancel_token,
-            tasks,
-        }
+        Self { rx, cancel, tasks }
     }
-
-    pub async fn next_batch(&mut self) -> anyhow::Result<Option<LoadedBatch>> {
-        match self.rx.recv().await {
-            Some((batch, _permit)) => {
-                futures::future::try_join_all(batch?.into_iter().map(read_sample))
-                    .await
-                    .map(Some)
-            }
-            None => Ok(None),
-        }
+    pub async fn next_batch(&mut self) -> Result<Option<LoadedBatch>> {
+        let Some(batch) = self.rx.recv().await else {
+            return Ok(None);
+        };
+        let path = batch?.path;
+        let result = fs::read(&path).await;
+        let _ = fs::remove_file(&path).await;
+        Ok(Some(LoadedBatch::decode(result?.as_slice())?))
     }
-
-    /// Cancels all of the running prefeching tasks.
     pub async fn finish(self) {
         self.tasks.close();
-        self.cancel_token.cancel();
+        self.cancel.cancel();
         self.tasks.wait().await;
     }
-}
-
-async fn cache_bytes(cache_dir: &Path) -> std::io::Result<u64> {
-    let mut entries = fs::read_dir(cache_dir).await?;
-    let mut bytes = 0;
-    while let Some(entry) = entries.next_entry().await? {
-        match entry.metadata().await {
-            Ok(metadata) if metadata.is_file() => bytes += metadata.len(),
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(bytes)
-}
-
-async fn log_cache(cancel_token: CancellationToken, cache_dir: PathBuf, slots: Arc<Semaphore>) {
-    let mut interval = interval_at(Instant::now() + CACHE_LOG_INTERVAL, CACHE_LOG_INTERVAL);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    loop {
-        if interval
-            .tick()
-            .with_cancellation_token(&cancel_token)
-            .await
-            .is_none()
-        {
-            break;
-        }
-        match cache_bytes(&cache_dir)
-            .with_cancellation_token(&cancel_token)
-            .await
-        {
-            None => break,
-            Some(Ok(cached_bytes)) => info!(
-                cached_bytes,
-                cached_batches = CACHED_BATCHES - slots.available_permits(),
-                cache_dir = %cache_dir.display(),
-                "prefetch cache usage"
-            ),
-            Some(Err(err)) => warn!(
-                error = format!("{err:#}"),
-                cache_dir = %cache_dir.display(),
-                "failed to measure prefetch cache"
-            ),
-        }
-    }
-}
-
-async fn read_sample(sample: PrefetchedSample) -> anyhow::Result<LoadedSample> {
-    let wave = fs::read(&sample.path).await?.into();
-    fs::remove_file(&sample.path).await?;
-    let meta = sample.sample;
-    Ok(LoadedSample {
-        wave,
-        duration: meta.duration,
-        speaker_id: meta.speaker_id as i64,
-        language_id: meta.language_id,
-        text: meta.text,
-    })
-}
-
-async fn load_batch(
-    loader: &Arc<dyn Loader>,
-    cache_dir: &Path,
-    batch: Vec<Sample>,
-) -> anyhow::Result<Option<PrefetchedBatch>> {
-    debug!(samples = batch.len(), "loading batch");
-
-    let mut loaded_batch: Vec<PrefetchedSample> = vec![];
-    if let Some(batch) = loader.load_batch(batch).await? {
-        for (sample, wave) in batch {
-            let path = cache_dir.join(format!("{}-{}.raw", sample.audio_id, uuid::Uuid::new_v4()));
-            fs::write(&path, &wave).await?;
-            loaded_batch.push(PrefetchedSample { sample, path });
-        }
-    } else {
-        return Ok(None);
-    }
-
-    Ok(Some(loaded_batch))
 }

@@ -4,75 +4,58 @@ service TensorLane {
   rpc Init (InitRequest) returns (InitResponse);
   rpc Data (stream DataRequest) returns (stream DataResponse);
   rpc Asset (AssetRequest) returns (stream AssetResponse);
-  rpc Checkpoint (stream CheckpointRequest) returns (CheckpointResponse);
+  rpc SaveAsset (stream SaveAssetRequest) returns (SaveAssetResponse);
   rpc Metrics (stream MetricsRequest) returns (MetricsResponse);
   rpc End (EndRequest) returns (EndResponse);
 }
-
-message InitRequest {
-  string run_id = 1;
-}
-
+message InitRequest { string run_id = 1; }
 message InitResponse {
   string run_id = 1;
-  string train_config = 2;
+  string config = 2;
   repeated string assets = 3;
+  repeated string streams = 4;
 }
-
-enum Split {
-  TRAINING = 0;
-  VALIDATION = 1;
-}
-
 message DataRequest {
   string run_id = 1;
-  Split split = 2;
+  reserved 2;
+  string stream = 3;
 }
-
 message Sample {
-  bytes wave = 1;
-  double duration = 2;
-  int64 speaker_id = 3;
-  int32 language_id = 4;
-  bytes text = 5;
+  reserved 1 to 5;
+  string sample_id = 6;
+  string metadata_json = 7;
+  map<string, bytes> blobs = 8;
 }
-
 message DataResponse {
   repeated Sample batch = 1;
+  string stream = 2;
+  uint64 batch_id = 3;
+  uint64 query_batch_idx = 4;
 }
-
-message AssetRequest {
-  string run_id = 1;
-  // key into the service's assets map from the data config
-  string name = 2;
-}
-
+message AssetRequest { string run_id = 1; string name = 2; }
 message AssetMetadata {
   optional string entrypoint = 1;
+  optional string asset_id = 2;
+  string metadata_json = 3;
+  string kind = 4;
+  string asset_type = 5;
 }
-
 message AssetResponse {
-  oneof payload {
-    // must be the first message of the stream
-    AssetMetadata metadata = 1;
-    bytes chunk = 2;
-  }
+  oneof payload { AssetMetadata metadata = 1; bytes chunk = 2; }
 }
-
-message CheckpointMetadata {
+message SaveAssetMetadata {
   string run_id = 1;
-  uint64 step = 2;
+  string asset_id = 2;
+  string name = 3;
+  uint64 step = 4;
+  string kind = 5;
+  optional string asset_type = 6;
+  string metadata_json = 7;
 }
-
-message CheckpointRequest {
-  oneof payload {
-    // must be the first message of the stream
-    CheckpointMetadata metadata = 1;
-    bytes chunk = 2;
-  }
+message SaveAssetRequest {
+  oneof payload { SaveAssetMetadata metadata = 1; bytes chunk = 2; }
 }
-
-message CheckpointResponse {}
+message SaveAssetResponse { string asset_id = 1; }
 
 message MetricsStreamMetadata {
   string run_id = 1;
@@ -106,7 +89,6 @@ message ArtifactChunk {
 
 message MetricsRequest {
   oneof payload {
-    // Must be the first message of the stream and appear exactly once.
     MetricsStreamMetadata metadata = 1;
     ScalarMetric metric = 2;
     ArtifactMetric artifact = 3;

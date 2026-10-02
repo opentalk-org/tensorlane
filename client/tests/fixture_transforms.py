@@ -1,28 +1,41 @@
-import time
 import os
+import time
 import torch
 
 
-def double(wave):
-    if wave.dtype != torch.int16 or wave.device.type != "cpu" or wave.ndim != 1:
-        raise TypeError("expected raw one-dimensional CPU int16 input")
-    return wave.to(torch.int64) * 2
+def transform(sample):
+    value = sample.metadata["position"]
+    return {
+        "value": torch.tensor([value, -value]),
+        "nested": [sample.metadata["label"], (sample.blobs["payload"],)],
+    }
 
 
-def fail(wave):
-    raise ValueError("fixture failure")
+def collate(samples):
+    return {
+        "values": torch.stack([sample["value"] for sample in samples]),
+        "labels": [sample["nested"][0] for sample in samples],
+    }
 
 
-def slow(wave):
+def fail(sample):
+    raise ValueError("fixture transform failure")
+
+
+def fail_collate(samples):
+    raise ValueError("fixture collation failure")
+
+
+def slow(sample):
     time.sleep(60)
-    return wave
+    return sample
 
 
-def invalid(wave):
-    return None
-
-
-def identify_worker(wave):
-    if int(wave[0]) == 0:
+def identify_worker(sample):
+    if sample.metadata["position"] == 0:
         time.sleep(0.3)
-    return torch.tensor([int(wave[0]), os.getpid()])
+    return {"value": torch.tensor([sample.metadata["position"], os.getpid()])}
+
+
+def invalid(sample):
+    return object()

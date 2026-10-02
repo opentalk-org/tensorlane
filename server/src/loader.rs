@@ -1,95 +1,102 @@
+use crate::{
+    MAX_BATCH_BYTES,
+    sampling::{BlobRef, Sample},
+};
+use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
-use aws_sdk_s3::error::SdkError;
-use bytes::{BufMut, Bytes, BytesMut};
-use tracing::{debug, trace, warn};
-
-use crate::{audio, sampling};
+use aws_sdk_s3::Client;
+use bytes::{Bytes, BytesMut};
+use futures::{StreamExt, TryStreamExt};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Semaphore;
 
 #[async_trait]
 pub trait Loader: Send + Sync {
-    async fn load(&self, sample: &sampling::Sample) -> anyhow::Result<Option<Bytes>>;
-    async fn load_batch(
-        &self,
-        batch: Vec<sampling::Sample>,
-    ) -> anyhow::Result<Option<Vec<(sampling::Sample, Bytes)>>> {
-        debug!(samples = batch.len(), "loading batch");
-
-        let res = futures::future::try_join_all(batch.into_iter().map(|sample| async move {
-            let wave = self.load(&sample).await?;
-            anyhow::Ok((sample, wave))
-        }))
-        .await?;
-
-        let mut vec = vec![];
-        for sample in res {
-            match sample.1 {
-                Some(data) => vec.push((sample.0, data)),
-                None => return Ok(None),
-            }
+    async fn load(&self, reference: &BlobRef) -> Result<Bytes>;
+    async fn load_sample(&self, sample: Sample) -> Result<crate::proto::Sample> {
+        let mut reads = futures::stream::iter(sample.blobs.into_iter().map(
+            |(name, reference)| async move {
+                Ok::<_, anyhow::Error>((name, self.load(&reference).await?))
+            },
+        ))
+        .buffer_unordered(16);
+        let mut size = sample.sample_id.len() + sample.metadata_json.len();
+        let mut blobs = HashMap::new();
+        while let Some((name, bytes)) = reads.try_next().await? {
+            size = size
+                .checked_add(name.len())
+                .and_then(|size| size.checked_add(bytes.len()))
+                .context("sample size overflow")?;
+            ensure!(
+                size <= MAX_BATCH_BYTES,
+                "sample exceeds the 64 MiB batch limit"
+            );
+            blobs.insert(name, bytes);
         }
-
-        return Ok(Some(vec));
+        Ok(crate::proto::Sample {
+            sample_id: sample.sample_id,
+            metadata_json: sample.metadata_json,
+            blobs,
+        })
     }
 }
-
 #[derive(Clone)]
 pub struct S3Loader {
-    s3_client: aws_sdk_s3::Client,
+    s3_client: Client,
     bucket: &'static str,
+    slots: Arc<Semaphore>,
 }
-
 impl S3Loader {
-    pub fn new(s3_client: aws_sdk_s3::Client, bucket: &'static str) -> Self {
-        Self { s3_client, bucket }
+    pub fn new(s3_client: Client, bucket: &'static str) -> Self {
+        Self {
+            s3_client,
+            bucket,
+            slots: Arc::new(Semaphore::new(16)),
+        }
     }
 }
-
 #[async_trait]
 impl Loader for S3Loader {
-    async fn load(&self, sample: &sampling::Sample) -> anyhow::Result<Option<Bytes>> {
-        trace!(
-            audio = %sample.audio_id,
-            object = %sample.object.path,
-            offset = sample.object.offset,
-            length = sample.object.length,
-            "fetching audio from bucket"
-        );
-        let obj = match self
+    async fn load(&self, reference: &BlobRef) -> Result<Bytes> {
+        reference.validate()?;
+        let _permit = self.slots.acquire().await?;
+        let mut request = self
             .s3_client
             .get_object()
             .bucket(self.bucket)
-            .key(&sample.object.path)
-            .range(format!(
-                "bytes={}-{}",
-                sample.object.offset,
-                sample.object.offset + sample.object.length - 1
-            ))
+            .key(&reference.object);
+        if let (Some(offset), Some(length)) = (reference.byte_offset, reference.byte_length) {
+            ensure!(
+                length <= MAX_BATCH_BYTES as u64,
+                "blob exceeds the 64 MiB batch limit"
+            );
+            request = request.range(format!("bytes={offset}-{}", offset + length - 1));
+        }
+        let object = request
             .send()
             .await
-        {
-            Err(SdkError::TimeoutError(err)) => {
-                warn!(error = ?err, "s3 request timeout, skipping sample");
-                return Ok(None);
-            }
-            Err(SdkError::ResponseError(err)) if err.raw().status().is_server_error() => {
-                warn!(error = ?err, "s3 internal server error, skipping sample");
-                return Ok(None);
-            }
-            Err(SdkError::ServiceError(err)) if err.raw().status().is_server_error() => {
-                warn!(error = ?err, "s3 internal server error, skipping sample");
-                return Ok(None);
-            }
-            other => other?,
-        };
-
-        let mut stream = obj.body;
-
-        let mut buff = BytesMut::new();
-        while let Some(bytes) = stream.try_next().await? {
-            buff.put(bytes);
+            .with_context(|| format!("loading blob {}", reference.object))?;
+        if let Some(length) = object.content_length() {
+            ensure!(
+                length >= 0 && length as usize <= MAX_BATCH_BYTES,
+                "blob exceeds the 64 MiB batch limit"
+            );
         }
-        let wave = audio::process_audio(buff.freeze(), 24_000)?;
-
-        Ok(Some(wave))
+        let mut stream = object.body;
+        let mut bytes = BytesMut::new();
+        while let Some(chunk) = stream.try_next().await? {
+            ensure!(
+                bytes.len() + chunk.len() <= MAX_BATCH_BYTES,
+                "blob exceeds the 64 MiB batch limit"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(length) = reference.byte_length {
+            ensure!(
+                bytes.len() as u64 == length,
+                "blob range returned an unexpected byte length"
+            );
+        }
+        Ok(bytes.freeze())
     }
 }

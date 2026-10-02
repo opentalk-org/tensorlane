@@ -14,29 +14,35 @@ pub async fn prefetch(
     grpc: &TensorLaneClient<Channel>,
     initialized: &InitResponse,
     root: &Path,
-) -> anyhow::Result<HashMap<String, PathBuf>> {
-    stream::iter(initialized.assets.iter().enumerate())
+) -> anyhow::Result<(HashMap<String, PathBuf>, HashMap<String, String>)> {
+    let downloads: Vec<_> = stream::iter(initialized.assets.iter().enumerate())
         .map(|(index, name)| {
             let grpc = grpc.clone();
             let destination = root.join("assets").join(index.to_string());
             async move {
-                let path = download(grpc, &initialized.run_id, name, destination)
+                let (path, metadata) = download(grpc, &initialized.run_id, name, destination)
                     .await
                     .with_context(|| format!("downloading asset {name:?}"))?;
-                Ok((name.clone(), path))
+                Ok::<_, anyhow::Error>((name.clone(), path, metadata))
             }
         })
         .buffer_unordered(4)
         .try_collect()
-        .await
+        .await?;
+    let mut paths = HashMap::new();
+    let mut metadata = HashMap::new();
+    for (name, path, info) in downloads {
+        paths.insert(name.clone(), path);
+        metadata.insert(name, info);
+    }
+    Ok((paths, metadata))
 }
-
 async fn download(
     mut grpc: TensorLaneClient<Channel>,
     run_id: &str,
     name: &str,
     destination: PathBuf,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<(PathBuf, String)> {
     let mut responses = grpc
         .asset(AssetRequest {
             run_id: run_id.to_owned(),
@@ -44,12 +50,9 @@ async fn download(
         })
         .await?
         .into_inner();
-    match responses
-        .message()
-        .await?
-        .and_then(|message| message.payload)
-    {
-        Some(Payload::Metadata(_)) => {}
+    let metadata = match responses.message().await?.and_then(|message| message.payload) {
+        Some(Payload::Metadata(metadata)) => serde_json::json!({"asset_id":metadata.asset_id,"entrypoint":metadata.entrypoint,
+            "metadata":serde_json::from_str::<serde_json::Value>(&metadata.metadata_json)?,"kind":metadata.kind,"asset_type":metadata.asset_type}).to_string(),
         _ => anyhow::bail!("asset stream must start with metadata"),
     };
     fs::create_dir_all(&destination).await?;
@@ -65,5 +68,5 @@ async fn download(
     file.flush().await?;
     drop(file);
     fs::rename(partial, &path).await?;
-    Ok(fs::canonicalize(path).await?)
+    Ok((fs::canonicalize(path).await?, metadata))
 }

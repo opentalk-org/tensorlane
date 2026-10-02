@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-mod audio;
+mod asset_repo;
 mod db;
 mod grpc;
 mod http;
@@ -26,12 +26,13 @@ mod prefetch;
 mod run;
 mod run_repo;
 mod sampling;
-mod symbols;
 mod uploads;
 
 mod proto {
     tonic::include_proto!("_");
 }
+
+const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -103,7 +104,7 @@ struct Args {
     #[arg(
         long,
         env = "CHECKPOINT_PREFIX",
-        help = "S3 object-key prefix for uploaded checkpoints."
+        help = "S3 object-key prefix for saved assets."
     )]
     checkpoint_prefix: String,
     #[arg(

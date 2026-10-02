@@ -1,8 +1,8 @@
 use crate::{
     ipc::{Receiver, Sender},
     proto::{
-        ArtifactChunk, ArtifactMetric, CheckpointMetadata, CheckpointRequest, MetricsRequest,
-        MetricsResponse, MetricsStreamMetadata, ScalarMetric, checkpoint_request, metrics_request,
+        ArtifactChunk, ArtifactMetric, MetricsRequest, MetricsResponse, MetricsStreamMetadata,
+        SaveAssetMetadata, SaveAssetRequest, ScalarMetric, metrics_request, save_asset_request,
         tensor_lane_client::TensorLaneClient,
     },
 };
@@ -45,9 +45,14 @@ enum Upload {
         name: String,
         content_type: String,
     },
-    Checkpoint {
+    SaveAsset {
+        asset_id: String,
+        name: String,
         step: u64,
         path: PathBuf,
+        kind: String,
+        asset_type: Option<String>,
+        metadata_json: String,
     },
     Flush,
 }
@@ -130,8 +135,38 @@ impl UploadClient {
         )
     }
 
-    fn checkpoint(&self, py: Python<'_>, step: u64, path: PathBuf) -> anyhow::Result<()> {
-        self.send(py, Upload::Checkpoint { step, path })
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, path, step=0, kind="file".to_owned(), asset_type=None, metadata_json="{}".to_owned()))]
+    fn save_asset(
+        &self,
+        py: Python<'_>,
+        name: String,
+        path: PathBuf,
+        step: u64,
+        kind: String,
+        asset_type: Option<String>,
+        metadata_json: String,
+    ) -> anyhow::Result<String> {
+        ensure!(!name.is_empty(), "asset name must not be empty");
+        ensure!(
+            kind == "file" || kind == "checkpoint",
+            "asset kind must be checkpoint or file"
+        );
+        let _: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&metadata_json)?;
+        let asset_id = uuid::Uuid::new_v4().to_string();
+        self.send(
+            py,
+            Upload::SaveAsset {
+                asset_id: asset_id.clone(),
+                name,
+                step,
+                path,
+                kind,
+                asset_type,
+                metadata_json,
+            },
+        )?;
+        Ok(asset_id)
     }
 
     #[pyo3(signature = (timeout=300.0))]
@@ -252,8 +287,29 @@ async fn receive(
         let mut metrics: Option<Metrics> = None;
         while let Some(job) = queue.recv().await {
             match job {
-                Upload::Checkpoint { step, path } => {
-                    checkpoint(grpc.clone(), &run_id, step, path).await?
+                Upload::SaveAsset {
+                    asset_id,
+                    name,
+                    step,
+                    path,
+                    kind,
+                    asset_type,
+                    metadata_json,
+                } => {
+                    save_asset(
+                        grpc.clone(),
+                        SaveAssetMetadata {
+                            run_id: run_id.clone(),
+                            asset_id,
+                            name,
+                            step,
+                            kind,
+                            asset_type,
+                            metadata_json,
+                        },
+                        path,
+                    )
+                    .await?
                 }
                 Upload::Flush => {
                     if let Some(metrics) = metrics.take() {
@@ -390,23 +446,20 @@ impl Metrics {
     }
 }
 
-async fn checkpoint(
+async fn save_asset(
     mut grpc: TensorLaneClient<Channel>,
-    run_id: &str,
-    step: u64,
+    metadata: SaveAssetMetadata,
     path: PathBuf,
 ) -> anyhow::Result<()> {
+    let expected_id = metadata.asset_id.clone();
     let mut file = archive(path.clone())
         .await
-        .with_context(|| format!("opening checkpoint {}", path.display()))?;
+        .with_context(|| format!("opening asset {}", path.display()))?;
     let (sender, receiver) = mpsc::channel(4);
     let sending = async {
         sender
-            .send(CheckpointRequest {
-                payload: Some(checkpoint_request::Payload::Metadata(CheckpointMetadata {
-                    run_id: run_id.to_owned(),
-                    step,
-                })),
+            .send(SaveAssetRequest {
+                payload: Some(save_asset_request::Payload::Metadata(metadata)),
             })
             .await?;
         loop {
@@ -417,21 +470,28 @@ async fn checkpoint(
             }
             bytes.truncate(count);
             sender
-                .send(CheckpointRequest {
-                    payload: Some(checkpoint_request::Payload::Chunk(bytes)),
+                .send(SaveAssetRequest {
+                    payload: Some(save_asset_request::Payload::Chunk(bytes)),
                 })
                 .await?;
         }
         drop(sender);
-        anyhow::Ok(())
+        Ok::<_, anyhow::Error>(())
     };
     let request = async {
-        grpc.checkpoint(ReceiverStream::new(receiver)).await?;
-        anyhow::Ok(())
+        let response = grpc
+            .save_asset(ReceiverStream::new(receiver))
+            .await?
+            .into_inner();
+        ensure!(
+            response.asset_id == expected_id,
+            "server returned an unexpected asset ID"
+        );
+        Ok::<_, anyhow::Error>(())
     };
     tokio::time::timeout(FINISH_TIMEOUT, async { tokio::try_join!(request, sending) })
         .await
-        .context("checkpoint upload timed out")??;
+        .context("asset upload timed out")??;
     Ok(())
 }
 

@@ -14,29 +14,6 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(clickhouse::Row, Serialize)]
-struct CheckpointRecord {
-    #[serde(with = "clickhouse::serde::uuid")]
-    id: Uuid,
-    #[serde(with = "clickhouse::serde::time::datetime64::micros")]
-    updated_at: OffsetDateTime,
-    kind: i8,
-    name: String,
-    step: u64,
-    path: String,
-    size: u64,
-    #[serde(with = "serde_big_array::BigArray")]
-    content_hash: [u8; 64],
-    #[serde(rename = "type")]
-    asset_type: String,
-    metadata: String,
-    #[serde(with = "clickhouse::serde::uuid")]
-    run_id: Uuid,
-    #[serde(with = "clickhouse::serde::uuid")]
-    ancestor_asset_id: Uuid,
-    deleted: bool,
-}
-
-#[derive(clickhouse::Row, Serialize)]
 struct ArtifactRecord {
     #[serde(with = "clickhouse::serde::uuid")]
     id: Uuid,
@@ -90,26 +67,6 @@ impl UploadStore {
         self.staging_dir.join(id.to_string())
     }
 
-    pub fn checkpoint(
-        &self,
-        id: Uuid,
-        run_id: Uuid,
-        step: u64,
-        size: u64,
-        content_hash: [u8; 64],
-        asset_type: String,
-    ) {
-        let store = self.clone();
-        self.tasks.spawn(async move {
-            if let Err(err) = store
-                .upload_checkpoint(id, run_id, step, size, content_hash, asset_type)
-                .await
-            {
-                error!(checkpoint = %id, run = %run_id, error = format!("{err:#}"), "checkpoint upload failed");
-            }
-        });
-    }
-
     pub fn artifact(
         &self,
         id: Uuid,
@@ -144,38 +101,23 @@ impl UploadStore {
         self.tasks.wait().await;
     }
 
-    async fn upload_checkpoint(
+    pub fn asset_key(&self, id: Uuid) -> String {
+        format!("{}/{}", self.checkpoint_prefix, id)
+    }
+
+    pub async fn save_asset(
         &self,
-        id: Uuid,
-        run_id: Uuid,
-        step: u64,
-        size: u64,
-        content_hash: [u8; 64],
-        asset_type: String,
+        record: &crate::asset_repo::AssetRecord,
+        local_path: &Path,
     ) -> anyhow::Result<()> {
-        let local_path = self.staging_path(id);
-        let key = format!("{}/{}", self.checkpoint_prefix, id);
-        self.upload(&local_path, &key, "application/x-tar").await?;
-        let row = CheckpointRecord {
-            id,
-            updated_at: OffsetDateTime::now_utc(),
-            kind: 1,
-            name: format!("{run_id}_{step:09}"),
-            step,
-            path: key.clone(),
-            size,
-            content_hash,
-            asset_type,
-            metadata: "{}".to_owned(),
-            run_id,
-            ancestor_asset_id: Uuid::nil(),
-            deleted: false,
-        };
-        let mut insert = self.database.insert::<CheckpointRecord>("assets").await?;
-        insert.write(&row).await?;
+        self.upload(local_path, &record.path, "application/x-tar")
+            .await?;
+        let mut insert = self
+            .database
+            .insert::<crate::asset_repo::AssetRecord>("assets")
+            .await?;
+        insert.write(record).await?;
         insert.end().await?;
-        fs::remove_file(&local_path).await?;
-        info!(checkpoint = %id, run = %run_id, key, size, "checkpoint uploaded");
         Ok(())
     }
 

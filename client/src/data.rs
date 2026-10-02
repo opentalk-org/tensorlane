@@ -1,8 +1,11 @@
-use crate::proto::{DataRequest, Split, tensor_lane_client::TensorLaneClient};
-use crate::semaphore::BatchBudget;
+use crate::{
+    proto::{DataRequest, tensor_lane_client::TensorLaneClient},
+    semaphore::BatchBudget,
+};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     sync::Arc,
     thread::{self, JoinHandle},
     time::Duration,
@@ -14,25 +17,22 @@ use tonic::transport::Channel;
 #[derive(Serialize, Deserialize)]
 pub enum Work {
     Sample {
-        validation: bool,
+        stream: String,
         batch: (u64, usize),
+        query_batch_idx: u64,
         index: usize,
-        wave: Vec<u8>,
-        text: Vec<u8>,
-        duration: f64,
-        speaker_id: i64,
-        language_id: i32,
+        sample_id: String,
+        metadata_json: String,
+        blobs: HashMap<String, Vec<u8>>,
     },
     End {
-        validation: bool,
+        stream: String,
     },
 }
-
 struct Requests {
     budget: Arc<BatchBudget>,
     thread: Option<JoinHandle<anyhow::Result<()>>>,
 }
-
 impl Requests {
     fn finish(&mut self) -> anyhow::Result<()> {
         self.budget.cancel();
@@ -44,22 +44,21 @@ impl Requests {
         Ok(())
     }
 }
-
 impl Drop for Requests {
     fn drop(&mut self) {
         let _ = self.finish();
     }
 }
-
 pub async fn prefetch(
     mut grpc: TensorLaneClient<Channel>,
     run_id: String,
-    validation: bool,
+    stream_name: String,
     budget: Arc<BatchBudget>,
     work: mpsc::UnboundedSender<Work>,
 ) -> anyhow::Result<()> {
     let (requests, receiver) = mpsc::unbounded_channel();
     let waiting = budget.clone();
+    let request_stream = stream_name.clone();
     let mut request_task = Requests {
         budget,
         thread: Some(
@@ -70,18 +69,14 @@ pub async fn prefetch(
                         if requests
                             .send(DataRequest {
                                 run_id: run_id.clone(),
-                                split: if validation {
-                                    Split::Validation
-                                } else {
-                                    Split::Training
-                                } as i32,
+                                stream: request_stream.clone(),
                             })
                             .is_err()
                         {
                             break;
                         }
                     }
-                    anyhow::Ok(())
+                    Ok(())
                 })?,
         ),
     };
@@ -92,39 +87,32 @@ pub async fn prefetch(
     .await
     .context("opening Data stream timed out")??
     .into_inner();
-    let mut batch_id = 0u64;
-    loop {
-        let Some(response) = stream.message().await.context("receiving data batch")? else {
-            break;
-        };
-        let batch_size = response.batch.len();
+    let mut expected_id = 0;
+    while let Some(response) = stream.message().await.context("receiving data batch")? {
         ensure!(
-            batch_size > 0,
-            "batch {batch_id}: empty batches are unsupported"
+            response.stream == stream_name && response.batch_id == expected_id,
+            "unexpected stream or batch ID"
         );
+        let batch_size = response.batch.len();
+        ensure!(batch_size > 0, "empty batches are unsupported");
         for (index, sample) in response.batch.into_iter().enumerate() {
-            ensure!(
-                sample.wave.len() % 2 == 0,
-                "batch {batch_id} sample {index}: invalid int16 PCM"
-            );
-            ensure!(
-                sample.text.len() % 8 == 0,
-                "batch {batch_id} sample {index}: invalid int64 tokens"
-            );
             work.send(Work::Sample {
-                validation,
-                batch: (batch_id, batch_size),
+                stream: stream_name.clone(),
+                batch: (response.batch_id, batch_size),
+                query_batch_idx: response.query_batch_idx,
                 index,
-                wave: sample.wave,
-                text: sample.text,
-                duration: sample.duration,
-                speaker_id: sample.speaker_id,
-                language_id: sample.language_id,
-            })?;
+                sample_id: sample.sample_id,
+                metadata_json: sample.metadata_json,
+                blobs: sample.blobs,
+            })
+            .context("transform worker disconnected")?;
         }
-        batch_id += 1;
+        expected_id += 1;
     }
     request_task.finish()?;
-    work.send(Work::End { validation })?;
+    work.send(Work::End {
+        stream: stream_name,
+    })
+    .context("transform worker disconnected")?;
     Ok(())
 }

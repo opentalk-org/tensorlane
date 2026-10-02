@@ -10,9 +10,8 @@ import socket
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from multiprocessing.connection import Listener
-from torch import Tensor
 
 import torch.multiprocessing as multiprocessing
 
@@ -43,15 +42,27 @@ class TensorLane:
         self,
         root: Path,
         run_id: str,
-        train_config: str,
+        config: str | dict,
         rank: int,
         native: _native.Daemon | None = None,
         assets: dict[str, Path] | None = None,
+        streams: list[str] | tuple[str, ...] = (),
+        asset_metadata: dict | None = None,
+        ranks: int = 1,
+        num_workers: int = 5,
+        prefetch_factor: int = 2,
     ) -> None:
         self._root = root
         self.run_id = run_id
-        self.train_config = train_config
+        self.config = json.loads(config) if isinstance(config, str) else config
+        if not isinstance(self.config, dict):
+            raise TypeError("config must be a JSON object")
+        self.streams = tuple(streams)
+        self.asset_metadata = asset_metadata or {}
         self._rank = rank
+        self.ranks = ranks
+        self.num_workers = num_workers
+        self.prefetch_factor = prefetch_factor
         self._assets = assets if assets is not None else {}
         self._closed = False
         self._native = native
@@ -60,6 +71,10 @@ class TensorLane:
         self._stopped = None
         self._monitor = None
         self._uploads = None
+
+    @property
+    def rank(self) -> int:
+        return self._rank
 
     def _supervise_processes(self, root: Path) -> None:
         while not self._stopped.wait(0.05):
@@ -85,13 +100,16 @@ class TensorLane:
                 raise RuntimeError("TensorLane daemon is closed")
             _check_alive(self._root)
 
-    def batches(self, validation: bool = False, *, timeout: float = 120) -> BatchReader:
+    def batches(self, stream: str = "training", *, timeout: float = 120) -> BatchReader:
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
-        return BatchReader(self._root, self._rank, timeout, self._check, validation)
+        if stream not in self.streams:
+            raise ValueError(f"unknown stream: {stream}")
+        return BatchReader(
+            self._root, self._rank, timeout, self._check, self.streams.index(stream)
+        )
 
     def asset(self, name: str) -> Path:
-        """Return the downloaded file unchanged; decoding or unpacking is up to the caller."""
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
         return self._assets[name]
@@ -143,7 +161,6 @@ class TensorLane:
         return self._uploads
 
     def metric(self, step: int, name: str, value: float) -> None:
-        """Queue a scalar metric; the daemon supplies its timestamp."""
         self._upload_client().metric(step, name, value)
 
     def metric_artifact(
@@ -153,20 +170,32 @@ class TensorLane:
         name: str,
         content_type: str = "application/octet-stream",
     ) -> None:
-        """Queue a file or directory for TAR upload; content_type describes its contents.
-
-        Keep the source available and unchanged until flush completes.
-        """
         self._upload_client().metric_artifact(
             step, Path(path).absolute(), name, content_type
         )
 
-    def checkpoint(self, step: int, path: str | Path) -> None:
-        """Queue a file or directory for TAR upload. Keep it unchanged until flush completes."""
-        self._upload_client().checkpoint(step, Path(path).absolute())
+    def save_asset(
+        self,
+        name: str,
+        path: str | Path,
+        *,
+        step: int = 0,
+        kind: str = "file",
+        asset_type: str | None = None,
+        metadata: dict | None = None,
+    ) -> str:
+        if metadata is not None and not isinstance(metadata, dict):
+            raise TypeError("asset metadata must be an object")
+        return self._upload_client().save_asset(
+            name,
+            Path(path).absolute(),
+            step,
+            kind,
+            asset_type,
+            json.dumps(metadata or {}, allow_nan=False),
+        )
 
     def flush(self, *, timeout: float = 300) -> None:
-        """Wait for this rank's uploads and surface errors. Flush all ranks before the shutdown barrier."""
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
         if self._uploads is not None:
@@ -179,20 +208,50 @@ class TensorLane:
         self.close()
 
 
+def _validate_callbacks(spec, streams=None):
+    if spec is None:
+        return
+    if isinstance(spec, Mapping):
+        if streams is not None and any(name not in streams for name in spec):
+            raise ValueError("callback mapping contains an unknown stream")
+        if any(
+            not isinstance(name, str) or not callable(fn) for name, fn in spec.items()
+        ):
+            raise TypeError("callback mapping must contain callables")
+    elif not callable(spec):
+        raise TypeError("callback must be callable or a mapping")
+
+
 def init(
-    run_id: str,
-    transform: Callable[[Tensor], Tensor],
-    ranks: int,
-    prefetch_factor: int = 2,
+    run_id: str | None = None,
+    transform=None,
+    ranks: int | None = None,
+    prefetch_factor: int | None = None,
     *,
-    rank: int,
-    start_daemon: bool,
-    num_workers: int = 5,
+    rank: int | None = None,
+    start_daemon: bool | None = None,
+    num_workers: int | None = None,
+    collate_fn=None,
     addr: str | None = None,
     ipc_dir: str | Path | None = None,
     timeout: float = 120,
 ) -> TensorLane:
-    """Initialize on every rank; exactly one caller must start the daemon."""
+    run_id = run_id or os.environ.get("TENSORLANE_RUN_ID")
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("provide run_id or set TENSORLANE_RUN_ID")
+    if rank is None:
+        rank = int(os.environ.get("RANK", "0"))
+    if start_daemon is None:
+        start_daemon = rank == 0
+    for name, value in (
+        ("ranks", ranks),
+        ("prefetch_factor", prefetch_factor),
+        ("num_workers", num_workers),
+    ):
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value <= 0
+        ):
+            raise ValueError(f"{name} must be a positive integer")
     if not isinstance(rank, int) or isinstance(rank, bool) or rank < 0:
         raise ValueError("rank must be a nonnegative integer")
     if timeout <= 0:
@@ -209,28 +268,27 @@ def init(
             time.sleep(0.02)
         metadata = json.loads(metadata_path.read_text())
         _check_alive(root)
+        _validate_callbacks(transform, metadata["streams"])
+        _validate_callbacks(collate_fn, metadata["streams"])
         if rank >= int((root / "ranks").read_text()):
             raise ValueError("invalid rank")
         return TensorLane(
             root,
             metadata["run_id"],
-            metadata["train_config"],
+            metadata["config"],
             rank,
             assets={name: Path(path) for name, path in metadata["assets"].items()},
+            streams=metadata["streams"],
+            asset_metadata=metadata["asset_metadata"],
+            ranks=metadata["ranks"],
+            num_workers=metadata["num_workers"],
+            prefetch_factor=metadata["prefetch_factor"],
         )
 
-    if ranks <= 0 or prefetch_factor <= 0:
-        raise ValueError("ranks and prefetch_factor must be positive")
-    if rank >= ranks:
+    if ranks is not None and rank >= ranks:
         raise ValueError("invalid rank")
-    if not callable(transform):
-        raise TypeError("transform must be callable")
-    if (
-        not isinstance(num_workers, int)
-        or isinstance(num_workers, bool)
-        or num_workers <= 0
-    ):
-        raise ValueError("num_workers must be a positive integer")
+    _validate_callbacks(transform)
+    _validate_callbacks(collate_fn)
 
     native = _native.Daemon(
         run_id,
@@ -239,20 +297,32 @@ def init(
         ranks,
         prefetch_factor,
         num_workers,
+        rank,
     )
     daemon = TensorLane(
         root,
         native.run_id,
-        native.train_config,
+        native.config,
         rank,
         native,
         assets={name: Path(path) for name, path in native.assets.items()},
+        streams=native.streams,
+        asset_metadata={
+            name: json.loads(value) for name, value in native.asset_metadata.items()
+        },
+        ranks=native.ranks,
+        num_workers=native.num_workers,
+        prefetch_factor=native.prefetch_factor,
     )
 
+    ranks = daemon.ranks
+    num_workers = daemon.num_workers
     from ._process import collate_worker, transform_worker
 
     context = multiprocessing.get_context("spawn")
     try:
+        _validate_callbacks(transform, daemon.streams)
+        _validate_callbacks(collate_fn, daemon.streams)
         daemon._queue = context.Queue()
         daemon._stopped = context.Event()
         collator_ready = context.Event()
@@ -260,7 +330,7 @@ def init(
             process = context.Process(
                 name=f"tensorlane-transform-{worker_index}",
                 target=transform_worker,
-                args=(root, transform, daemon._queue, daemon._stopped),
+                args=(root, transform, daemon.streams, daemon._queue, daemon._stopped),
             )
             process.start()
             daemon._processes.append(process)
@@ -271,6 +341,8 @@ def init(
                 root,
                 ranks,
                 num_workers,
+                daemon.streams,
+                collate_fn,
                 daemon._queue,
                 daemon._stopped,
                 collator_ready,
@@ -300,7 +372,12 @@ def init(
             json.dumps(
                 {
                     "run_id": daemon.run_id,
-                    "train_config": daemon.train_config,
+                    "ranks": daemon.ranks,
+                    "num_workers": daemon.num_workers,
+                    "prefetch_factor": daemon.prefetch_factor,
+                    "config": daemon.config,
+                    "streams": daemon.streams,
+                    "asset_metadata": daemon.asset_metadata,
                     "assets": {
                         name: str(path) for name, path in daemon._assets.items()
                     },
@@ -322,7 +399,7 @@ class BatchReader(Iterator[Batch]):
         rank: int,
         timeout: float,
         check: Callable[[], None],
-        validation: bool = False,
+        stream_index: int = 0,
     ) -> None:
         if rank < 0 or timeout <= 0:
             raise ValueError("rank must be nonnegative and timeout must be positive")
@@ -340,13 +417,11 @@ class BatchReader(Iterator[Batch]):
                 raise RuntimeError("invalid rank")
             key = (self._root / "auth").read_bytes()
             multiprocessing.current_process().authkey = key
-            prefix = "validation-" if validation else ""
-            self._semaphore = _native.Semaphore(
-                (self._root / f"{prefix}semaphore").read_text()
-            )
+            directory = self._root / "streams" / str(stream_index)
+            self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
             try:
                 self._listener = Listener(
-                    str(self._root / f"{prefix}rank-{rank}.sock"),
+                    str(directory / f"rank-{rank}.sock"),
                     family="AF_UNIX",
                     authkey=key,
                 )

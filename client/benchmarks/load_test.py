@@ -1,9 +1,3 @@
-"""Drain the configured training schedule with no transform or training computation.
-
-Use a long server-side schedule for meaningful throughput measurements.
-Consumption timing includes rank socket setup, but excludes process startup and Init.
-"""
-
 import argparse
 import multiprocessing
 from multiprocessing.connection import wait
@@ -11,8 +5,8 @@ import signal
 import time
 
 
-def identity(wave):
-    return wave
+def identity(sample):
+    return sample
 
 
 def consume(args, rank, barrier, results):

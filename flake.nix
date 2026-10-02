@@ -99,6 +99,7 @@
               UV_PYTHON_DOWNLOADS = "never";
 
               LIBTORCH_USE_PYTORCH = "1";
+              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.zlib ];
 
               RUST_LOG = "off,tensorlane=debug";
             };

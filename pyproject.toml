@@ -8,6 +8,9 @@ dependencies = [
     "torch==2.11.0"
 ]
 
+[dependency-groups]
+test = ["grpcio", "grpcio-tools", "accelerate"]
+
 [build-system]
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
