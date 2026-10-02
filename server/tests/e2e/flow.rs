@@ -279,13 +279,13 @@ async fn complete_examples_continue_through_the_native_python_pipeline() -> Resu
     };
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(18).await?;
-    let mut first: Value = serde_json::from_str(include_str!("../../../sample-configs.json"))?;
+    let mut first: Value = serde_json::from_str(include_str!("../../../queries/examples/sample-configs.json"))?;
     first["config"]["dataset_id"] = json!(dataset);
     first["config"]["training"] = json!({"batches":3,"batch_size":3});
     first["config"]["num_workers"] = json!(2);
     first["config"]["validation"] = json!({"samples":4,"batch_size":2});
     let mut second: Value =
-        serde_json::from_str(include_str!("../../../sample-configs-stage2.json"))?;
+        serde_json::from_str(include_str!("../../../queries/examples/sample-configs-stage2.json"))?;
     second["config"]["training"] = json!({"batches":2,"batch_size":2});
     second["config"]["validation"] = json!({"samples":4,"batch_size":2});
     let temp = tempfile::tempdir()?;

@@ -85,9 +85,11 @@ A transform receives `RawSample(sample_id, stream, metadata, blobs)`. Without a 
 
 `Batch` carries `stream`, contiguous `batch_id`, original `query_batch_idx`, transformed `samples`, and collated `data`. Without a collator, `data` is the samples tuple. Worker supervision and independent per-stream batch credits bound buffering and propagate failures to readers.
 
+[sample-configs.json](sample-configs.json) and [sample-configs-stage2.json](sample-configs-stage2.json) embed the duration-based sampling queries in `queries/`. Rebuild either with `queries/build-config.sh CONFIG_FILE`. Continuation uses the completed sample position; keep the seed, dataset, filters, validation exclusions, and `superbatch_seconds` fixed when changing `max_seconds`. Supply validation sample IDs explicitly in `params.validation_ids`.
+
 ## Separate runs and explicit continuation
 
-[sample-configs.json](sample-configs.json) consumes 20 batches of 32 samples starting at position zero. [sample-configs-stage2.json](sample-configs-stage2.json) starts at position 640 with batches of 16 and loads the first run's registered model ID. Replace its example asset UUID with the ID returned by `save_asset`.
+[sample-configs.json](queries/examples/sample-configs.json) consumes 20 batches of 32 samples starting at position zero. [sample-configs-stage2.json](queries/examples/sample-configs-stage2.json) starts at position 640 with batches of 16 and loads the first run's registered model ID. Replace its example asset UUID with the ID returned by `save_asset`.
 
 The example SQL assigns a deterministic sample position before batching. It assumes unique sample IDs within a dataset and stable dataset contents and seed. Changing batch size preserves the meaning of `dataset_offset`. TensorLane never derives continuation offsets from prefetching; the application counts completed training work and records the next position.
 
@@ -97,7 +99,7 @@ The example SQL assigns a deterministic sample position before batching. It assu
 TENSORLANE_RUN_ID=RUN_ID_1 nix develop -c uv run --group test accelerate launch client/examples/train.py
 ```
 
-The script saves model weights, flushes them, and records the committed asset ID and completed dataset offset in `training-output/progress.json`. Put those two values into `config.assets.model.asset_id` and `config.params.dataset_offset` in [sample-configs-stage2.json](sample-configs-stage2.json). Submit that complete JSON through `POST /runs` to create a separate run, then execute:
+The script saves model weights, flushes them, and records the committed asset ID and completed dataset offset in `training-output/progress.json`. Put those two values into `config.assets.model.asset_id` and `config.params.dataset_offset` in [sample-configs-stage2.json](queries/examples/sample-configs-stage2.json). Submit that complete JSON through `POST /runs` to create a separate run, then execute:
 
 ```sh
 TENSORLANE_RUN_ID=RUN_ID_2 nix develop -c uv run --group test accelerate launch client/examples/train2.py

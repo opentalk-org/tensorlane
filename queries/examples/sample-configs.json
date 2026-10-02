@@ -1,0 +1,33 @@
+{
+  "project_id": "f3b83939-af56-473a-8ad8-b77b12bfef37",
+  "name": "training stage 1",
+  "config": {
+    "dataset_id": "e25b39ac-3400-4f9f-9fac-3e9c94e1a92b",
+    "asset_type": "model",
+    "seed": 1,
+    "queries": {
+      "training": "WITH ordered AS (\n    SELECT sample_id, metadata_json, blobs_json,\n        toUInt64(row_number() OVER (ORDER BY cityHash64({seed:UInt64}, sample_id), sample_id) - 1) AS position\n    FROM example_samples\n    WHERE dataset_id = {dataset_id:UUID}\n)\nSELECT sample_id,\n    toUInt64(intDiv(position - {dataset_offset:UInt64}, {batch_size:UInt64})) AS batch_idx,\n    position AS sample_idx,\n    metadata_json, blobs_json\nFROM ordered\nWHERE position >= {dataset_offset:UInt64}\n  AND position < {dataset_offset:UInt64} + {batches:UInt64} * {batch_size:UInt64}\nORDER BY batch_idx, sample_idx\n",
+      "validation": "SELECT sample_id,\n    toUInt64(intDiv(position, {batch_size:UInt64})) AS batch_idx,\n    position AS sample_idx,\n    metadata_json, blobs_json\nFROM (\n    SELECT sample_id, metadata_json, blobs_json,\n        toUInt64(row_number() OVER (ORDER BY sample_id) - 1) AS position\n    FROM example_samples\n    WHERE dataset_id = {dataset_id:UUID}\n    ORDER BY sample_id\n    LIMIT {samples:UInt64}\n)\nORDER BY batch_idx, sample_idx\n"
+    },
+    "params": {
+      "dataset_offset": 0
+    },
+    "training": {
+      "batches": 20,
+      "batch_size": 32
+    },
+    "validation": {
+      "samples": 1000,
+      "batch_size": 32,
+      "repeat": true
+    },
+    "assets": {},
+    "optimizer": {
+      "learning_rate": 0.0001
+    },
+    "output_dir": "training-output",
+    "ranks": 1,
+    "num_workers": 5,
+    "prefetch_factor": 2
+  }
+}
