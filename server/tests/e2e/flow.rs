@@ -88,7 +88,7 @@ async fn offsets_and_batch_sizes_continue_across_separate_runs() -> Result<()> {
     let mut first = run_config(dataset, 2);
     first["training"]["batch_size"] = json!(3);
     let mut second = run_config(dataset, 3);
-    second["start_params"]["dataset_offset"] = json!(6);
+    second["params"]["dataset_offset"] = json!(6);
     second["training"]["batch_size"] = json!(2);
     let a = env.create_run(first).await?;
     let b = env.create_run(second).await?;
@@ -324,7 +324,7 @@ async fn complete_examples_continue_through_the_native_python_pipeline() -> Resu
     second["config"]["dataset_id"] = json!(dataset);
     second["config"]["num_workers"] = json!(2);
     second["config"]["output_dir"] = json!(output);
-    second["config"]["start_params"]["dataset_offset"] = progress["dataset_offset"].clone();
+    second["config"]["params"]["dataset_offset"] = progress["dataset_offset"].clone();
     second["config"]["assets"]["model"]["asset_id"] = progress["asset_id"].clone();
     let run = env.create_run(second["config"].clone()).await?;
     let result = tokio::process::Command::new(&python)

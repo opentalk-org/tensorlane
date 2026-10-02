@@ -42,7 +42,7 @@ Pass `run_id` to `tensorlane.init` or set `TENSORLANE_RUN_ID`. The gRPC connecti
 
 The familiar `queries`, `assets`, `dataset_id`, `seed`, `asset_type`, `training`, and `validation` fields remain in a single `config` object. Training uses one parameter object. There are no stage arrays or runtime parameter updates.
 
-Every nonempty name in `queries` defines an independent stream. Its optional same-named configuration object supplies query parameters. Query names cannot be `queries`, `assets`, `start_params`, `dataset_id`, `seed`, `asset_type`, `ranks`, `num_workers`, or `prefetch_factor`. Parameter binding proceeds through optional `dataset_id` and `seed`, shared `start_params`, then the query's object. Later values override earlier ones. SQL declares ClickHouse types with placeholders such as `{dataset_offset:UInt64}`; `repeat` is excluded from SQL parameters.
+Every nonempty name in `queries` defines an independent stream. Its optional same-named configuration object supplies query parameters. Query names cannot be `queries`, `assets`, `params`, `dataset_id`, `seed`, `asset_type`, `ranks`, `num_workers`, or `prefetch_factor`. Parameter binding proceeds through optional `dataset_id` and `seed`, shared `params`, then the query's object. Later values override earlier ones. SQL declares ClickHouse types with placeholders such as `{dataset_offset:UInt64}`; `repeat` is excluded from SQL parameters.
 
 Each query executes once at initialization. Training and other streams are finite by default; validation repeats by default. A query object can override this with `repeat`. Repeating replays the original descriptor plan, even if the source table changes. Blob contents are read when prefetched, so applications that require identical bytes should use immutable objects. If `batches` is supplied, it must equal the number of distinct batches returned by that query. An empty plan terminates even when repeating.
 
@@ -97,7 +97,7 @@ The example SQL assigns a deterministic sample position before batching. It assu
 TENSORLANE_RUN_ID=RUN_ID_1 nix develop -c uv run --group test accelerate launch client/examples/train.py
 ```
 
-The script saves model weights, flushes them, and records the committed asset ID and completed dataset offset in `training-output/progress.json`. Put those two values into `config.assets.model.asset_id` and `config.start_params.dataset_offset` in [sample-configs-stage2.json](sample-configs-stage2.json). Submit that complete JSON through `POST /runs` to create a separate run, then execute:
+The script saves model weights, flushes them, and records the committed asset ID and completed dataset offset in `training-output/progress.json`. Put those two values into `config.assets.model.asset_id` and `config.params.dataset_offset` in [sample-configs-stage2.json](sample-configs-stage2.json). Submit that complete JSON through `POST /runs` to create a separate run, then execute:
 
 ```sh
 TENSORLANE_RUN_ID=RUN_ID_2 nix develop -c uv run --group test accelerate launch client/examples/train2.py

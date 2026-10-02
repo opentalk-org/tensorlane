@@ -59,7 +59,7 @@ pub fn run_config(dataset_id: Uuid, batches: u64) -> Value {
         WHERE p.position = modulo(n.number + {dataset_offset:UInt64}, (SELECT count() FROM pool))
         ORDER BY batch_idx, sample_idx";
     json!({"dataset_id":dataset_id,"asset_type":"e2e-model","seed":1,
-        "queries":{"training":sql,"validation":sql},"start_params":{"dataset_offset":0,"batch_size":1},
+        "queries":{"training":sql,"validation":sql},"params":{"dataset_offset":0,"batch_size":1},
         "training":{"batches":batches},"validation":{"batches":1},"assets":{},"optimizer":{"lr":0.1}})
 }
 pub fn tar_file(name: &str, content: &[u8]) -> Result<Bytes> {

@@ -56,7 +56,7 @@ def main():
                     completed += len(batch)
                     lane.metric(batch.batch_id, f"rank/{lane.rank}/loss", loss.item())
             count = torch.tensor(completed, device=accelerator.device)
-            offset = lane.config["start_params"]["dataset_offset"]
+            offset = lane.config["params"]["dataset_offset"]
             offset += accelerator.reduce(count, reduction="sum").item()
             if accelerator.is_main_process:
                 output = Path(lane.config["output_dir"])

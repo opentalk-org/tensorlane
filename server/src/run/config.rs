@@ -43,11 +43,11 @@ impl Config {
                 shared.insert(name.to_owned(), value.clone());
             }
         }
-        if let Some(params) = document.get("start_params") {
+        if let Some(params) = document.get("params") {
             shared.extend(
                 params
                     .as_object()
-                    .context("config.start_params must be an object")?
+                    .context("config.params must be an object")?
                     .iter()
                     .map(|(key, value)| (key.clone(), value.clone())),
             );
@@ -60,7 +60,7 @@ impl Config {
                 ![
                     "queries",
                     "assets",
-                    "start_params",
+                    "params",
                     "dataset_id",
                     "seed",
                     "asset_type",
@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn binds_precedence_and_keeps_application_fields() {
         let value = json!({"queries":{"training":"SELECT 1", "evaluation":"SELECT 2", "validation":"SELECT 3"},
-            "seed":1,"start_params":{"seed":2,"dataset_offset":9},"training":{"seed":3,"batches":4,"repeat":true},"optimizer":{"lr":0.1}});
+            "seed":1,"params":{"seed":2,"dataset_offset":9},"training":{"seed":3,"batches":4,"repeat":true},"optimizer":{"lr":0.1}});
         let cfg = Config::parse(value.as_object().unwrap()).unwrap();
         assert_eq!(cfg.queries["training"].params["seed"], 3);
         assert_eq!(cfg.queries["training"].params["dataset_offset"], 9);
