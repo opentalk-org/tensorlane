@@ -1,5 +1,6 @@
 use crate::{MAX_BATCH_BYTES, loader::Loader, sampling::Sampler};
 use anyhow::{Result, ensure};
+use futures::{StreamExt, TryStreamExt};
 use prost::Message;
 use std::{path::PathBuf, sync::Arc};
 use tokio::{fs, sync::mpsc};
@@ -50,8 +51,14 @@ impl Prefetcher {
                             load_seconds: 0.0,
                             server_wait_seconds: 0.0,
                         };
-                        for sample in plan.samples {
-                            response.batch.push(loader.load_sample(sample).await?);
+                        let mut samples = futures::stream::iter(
+                            plan.samples
+                                .into_iter()
+                                .map(|sample| loader.load_sample(sample)),
+                        )
+                        .buffered(16);
+                        while let Some(sample) = samples.try_next().await? {
+                            response.batch.push(sample);
                             ensure!(
                                 response.encoded_len() <= MAX_BATCH_BYTES,
                                 "encoded batch exceeds 64 MiB"
@@ -109,5 +116,83 @@ impl Prefetcher {
         self.tasks.close();
         self.cancel.cancel();
         self.tasks.wait().await;
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use crate::sampling::{BatchPlan, BlobRef, Sample};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OneBatch(Option<BatchPlan>);
+
+    impl Sampler for OneBatch {
+        fn next_batch(&mut self) -> Result<Option<BatchPlan>> {
+            Ok(self.0.take())
+        }
+    }
+
+    struct DelayedLoader {
+        active: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Loader for DelayedLoader {
+        async fn load(&self, _: &BlobRef) -> Result<bytes::Bytes> {
+            unreachable!()
+        }
+
+        async fn load_sample(&self, sample: Sample) -> Result<crate::proto::Sample> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let index: u64 = sample.sample_id.parse()?;
+            tokio::time::sleep(std::time::Duration::from_millis(32 - index)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::proto::Sample {
+                sample_id: sample.sample_id,
+                metadata_json: sample.metadata_json,
+                blobs: HashMap::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_samples_preserve_order_and_bound_concurrency() -> Result<()> {
+        let cache = tempfile::tempdir()?;
+        let samples = (0..32)
+            .map(|index| Sample {
+                sample_id: index.to_string(),
+                metadata_json: "{}".to_string(),
+                blobs: BTreeMap::new(),
+            })
+            .collect();
+        let loader = Arc::new(DelayedLoader {
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        let mut prefetch = Prefetcher::spawn(
+            Box::new(OneBatch(Some(BatchPlan {
+                query_batch_idx: 7,
+                samples,
+            }))),
+            loader.clone(),
+            cache.path().to_path_buf(),
+            CancellationToken::new(),
+            tracing::Span::none(),
+            "training".to_string(),
+        );
+        let batch = prefetch.next_batch().await?.expect("one batch");
+        assert_eq!(batch.query_batch_idx, 7);
+        assert_eq!(batch.batch.len(), 32);
+        for (index, sample) in batch.batch.iter().enumerate() {
+            assert_eq!(sample.sample_id, index.to_string());
+        }
+        assert!((2..=16).contains(&loader.peak.load(Ordering::SeqCst)));
+        assert!(prefetch.next_batch().await?.is_none());
+        prefetch.finish().await;
+        Ok(())
     }
 }
