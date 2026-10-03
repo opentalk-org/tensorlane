@@ -362,11 +362,21 @@ impl TestEnv {
         }
         Ok(id)
     }
+    pub async fn create_project(&self) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        self.clickhouse
+            .query("INSERT INTO projects (id,name,description,created_at,updated_at) VALUES (?,'e2e','',now64(6),now64(6))")
+            .bind(id)
+            .execute()
+            .await?;
+        Ok(id)
+    }
     pub async fn create_run(&self, config: Value) -> Result<String> {
+        let project_id = self.create_project().await?;
         let response = self
             .http
             .post(format!("{}/runs", self.http_url))
-            .json(&json!({"project_id":Uuid::new_v4(),"name":"e2e","config":config}))
+            .json(&json!({"project_id":project_id,"name":"e2e","config":config}))
             .send()
             .await?
             .error_for_status()?;

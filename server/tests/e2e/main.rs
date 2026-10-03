@@ -1,6 +1,7 @@
 mod cache;
 mod flow;
 mod metrics;
+mod projects;
 mod setup;
 mod shutdown;
 mod storage;

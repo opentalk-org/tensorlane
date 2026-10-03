@@ -126,7 +126,10 @@ async fn create_run(
     Config::parse(&request.config).map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err))?;
     let run_id = run_repo
         .create(request.project_id, &request.name, &request.config)
-        .await?;
+        .await?
+        .ok_or_else(|| {
+            AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Project not found"))
+        })?;
     info!(run = %run_id, "run created");
     Ok((
         StatusCode::CREATED,

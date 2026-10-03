@@ -1,3 +1,11 @@
+-- Project used by the bundled run configurations.
+INSERT INTO projects (id, name, description, created_at, updated_at)
+SELECT toUUID('f3b83939-af56-473a-8ad8-b77b12bfef37'),
+    'TensorLane examples', 'Bundled example runs', now64(6), now64(6)
+WHERE NOT EXISTS (
+    SELECT 1 FROM projects WHERE id = toUUID('f3b83939-af56-473a-8ad8-b77b12bfef37')
+);
+
 CREATE TABLE IF NOT EXISTS example_samples (
     dataset_id UUID,
     position UInt64,

@@ -115,8 +115,17 @@ impl RunRepo {
         project_id: Uuid,
         name: &str,
         config: &Map<String, Value>,
-    ) -> Result<Uuid> {
+    ) -> Result<Option<Uuid>> {
         Config::parse(config)?;
+        let project = self
+            .client
+            .query("SELECT 1 FROM projects WHERE id = ? LIMIT 1")
+            .bind(project_id)
+            .fetch_optional::<u8>()
+            .await?;
+        if project.is_none() {
+            return Ok(None);
+        }
         let row = RunConfigRow {
             id: Uuid::new_v4(),
             project_id,
@@ -127,7 +136,7 @@ impl RunRepo {
         insert.write(&row).await?;
         insert.end().await?;
         self.append_status(row.id, RunStatus::Queued).await?;
-        Ok(row.id)
+        Ok(Some(row.id))
     }
 
     pub fn assets(&self) -> crate::asset_repo::AssetRepo {
