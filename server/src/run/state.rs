@@ -1,11 +1,11 @@
 use super::Config;
 use crate::{
-    db::fetch_samples,
+    db::stream_samples,
     loader::Loader,
     prefetch::{LoadedBatch, Prefetcher},
     sampling::QuerySampler,
 };
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -35,28 +35,20 @@ impl RunState {
         cache: &Path,
         config: &Config,
     ) -> Result<Self> {
-        let mut plans = Vec::new();
-        for (name, query) in &config.queries {
-            let rows = fetch_samples(database, &query.sql, &query.params).await?;
-            let sampler = QuerySampler::new(rows)?;
-            if let Some(expected) = query.batches {
-                ensure!(
-                    sampler.len() as u64 == expected,
-                    "query {name} returned {} batches, expected {expected}",
-                    sampler.len()
-                );
-            }
-            plans.push((
-                name.clone(),
-                if query.repeat {
-                    sampler.repeat()
-                } else {
-                    sampler
-                },
-            ));
-        }
         let cache = cache.join(id.to_string());
-        for index in 0..plans.len() {
+        fs::create_dir_all(cache.join("plans")).await?;
+        let mut plans = Vec::new();
+        for (index, (name, query)) in config.queries.iter().enumerate() {
+            let rows = stream_samples(database, &query.sql, &query.params);
+            let sampler = QuerySampler::create(
+                name,
+                rows,
+                &cache.join("plans").join(format!("{index}.plan")),
+                query.repeat,
+                query.batches,
+            )
+            .await?;
+            plans.push((name.clone(), sampler));
             fs::create_dir_all(cache.join("data").join(index.to_string())).await?;
         }
         let cancel = CancellationToken::new();

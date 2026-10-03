@@ -10,6 +10,13 @@ use tracing::Instrument;
 pub type LoadedBatch = crate::proto::DataResponse;
 struct CachedBatch {
     path: PathBuf,
+    index: usize,
+    available: mpsc::Sender<usize>,
+}
+impl Drop for CachedBatch {
+    fn drop(&mut self) {
+        let _ = self.available.try_send(self.index);
+    }
 }
 const CACHED_BATCHES: usize = 20;
 
@@ -28,6 +35,10 @@ impl Prefetcher {
         stream: String,
     ) -> Self {
         let (tx, rx) = mpsc::channel(CACHED_BATCHES);
+        let (available, mut slots) = mpsc::channel(CACHED_BATCHES);
+        for index in 0..CACHED_BATCHES {
+            available.try_send(index).expect("empty slot queue");
+        }
         let cancel = parent.child_token();
         let tasks = TaskTracker::new();
         tasks.spawn({
@@ -39,7 +50,15 @@ impl Prefetcher {
                         break;
                     };
                     let result: Option<Result<Option<CachedBatch>>> = async {
-                        let Some(plan) = sampler.next_batch()? else {
+                        let Some(index) = slots.recv().await else {
+                            return Ok(None);
+                        };
+                        let cached = CachedBatch {
+                            path: cache.join(format!("{index}.batch")),
+                            index,
+                            available: available.clone(),
+                        };
+                        let Some(plan) = sampler.next_batch().await? else {
                             return Ok(None);
                         };
                         let started = std::time::Instant::now();
@@ -69,20 +88,9 @@ impl Prefetcher {
                             response.encoded_len() + 9 <= MAX_BATCH_BYTES,
                             "encoded batch exceeds 64 MiB"
                         );
-                        let path = cache.join(format!("{}.batch", uuid::Uuid::new_v4()));
-                        let part = path.with_extension("part");
-                        let write = async {
-                            fs::write(&part, response.encode_to_vec()).await?;
-                            fs::rename(&part, &path).await?;
-                            Ok::<_, std::io::Error>(())
-                        }
-                        .await;
-                        if write.is_err() {
-                            let _ = fs::remove_file(&part).await;
-                        }
-                        write?;
+                        fs::write(&cached.path, response.encode_to_vec()).await?;
                         batch_id += 1;
-                        Ok(Some(CachedBatch { path }))
+                        Ok(Some(cached))
                     }
                     .with_cancellation_token(&cancel)
                     .await;
@@ -105,10 +113,9 @@ impl Prefetcher {
         let Some(batch) = self.rx.recv().await else {
             return Ok(None);
         };
-        let path = batch?.path;
-        let result = fs::read(&path).await;
-        let _ = fs::remove_file(&path).await;
-        let mut response = LoadedBatch::decode(result?.as_slice())?;
+        let batch = batch?;
+        let bytes = fs::read(&batch.path).await?;
+        let mut response = LoadedBatch::decode(bytes.as_slice())?;
         response.server_wait_seconds = started.elapsed().as_secs_f64();
         Ok(Some(response))
     }
@@ -129,8 +136,8 @@ mod concurrency_tests {
     struct OneBatch(Option<BatchPlan>);
 
     impl Sampler for OneBatch {
-        fn next_batch(&mut self) -> Result<Option<BatchPlan>> {
-            Ok(self.0.take())
+        fn next_batch(&mut self) -> futures::future::BoxFuture<'_, Result<Option<BatchPlan>>> {
+            Box::pin(std::future::ready(Ok(self.0.take())))
         }
     }
 
