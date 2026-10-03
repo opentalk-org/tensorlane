@@ -1,12 +1,66 @@
 # TensorLane
 
-Training data from ClickHouse and S3, delivered as Python batches.
+TensorLane is a data loader for training on datasets stored in S3 and indexed in ClickHouse. You define the sampling and batching in SQL, then iterate over the batches in Python.
 
-SQL selects samples, orders them, and assigns batches. A Rust server fetches the referenced objects; Python workers transform the samples and collate them for your training loop. Dataset tables, decoding, and the model belong to your application.
+The [audio example](queries/training.sql) uses recording durations and transcripts to select samples and assign batches. Audio is read from byte ranges in S3 objects, so changing the sampling rules doesn't require repacking the dataset.
 
-## Setup
+## Defining batches
 
-Requires Linux, Python 3.11+, ClickHouse, and an S3-compatible bucket. Put the connection settings in `.env` at the repository root:
+A run has a query for each stream, such as `training` or `validation`. The queries can read any of your ClickHouse tables. Each result row describes one sample:
+
+| Column | ClickHouse type | Meaning |
+| --- | --- | --- |
+| `sample_id` | `String` | Sample identifier |
+| `batch_idx` | `UInt64` | Samples with the same value form a batch |
+| `sample_idx` | `UInt64` | Sample order within that batch |
+| `metadata_json` | `String` | JSON object passed to Python |
+| `blobs_json` | `String` | Named references to files in S3 |
+
+Return rows in strictly increasing `(batch_idx, sample_idx)` order. Batch sizes can vary; sample IDs can repeat. For example, this `blobs_json` requests part of an object:
+
+```json
+{"audio": {"object": "recordings/part-001", "byte_offset": 64, "byte_length": 32000}}
+```
+
+Omit both range fields to fetch the whole object. The Python sample will contain its bytes at `sample.blobs["audio"]`. Use `{}` for samples that only need metadata.
+
+Put queries in `config.queries`. Parameters use ClickHouse syntax such as `{batch_size:UInt64}`. Values come from `config.dataset_id` and `config.seed`, then `config.params`, with per-stream settings taking precedence. See the [example run configuration](queries/examples/sample-configs.json).
+
+## Reading in Python
+
+The Rust server fetches the objects referenced by the query. Python workers call your `transform` on each sample, then `collate_fn` assembles the transformed samples into `batch.data`.
+
+This reader works with the bundled dataset, which contains numeric metadata:
+
+```python
+import tensorlane
+import torch
+
+
+def transform(sample):
+    return torch.tensor(sample.metadata["position"], dtype=torch.float32)
+
+
+def main():
+    with tensorlane.init(transform=transform, collate_fn=torch.stack) as lane:
+        with lane.batches("training") as batches:
+            for batch in batches:
+                print(batch.batch_id, batch.data)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+For files, decode `sample.blobs` inside `transform`. Define callbacks at module scope and return CPU tensors; workers use multiprocessing. Without callbacks, `batch.data` is a tuple of raw samples.
+
+`init` reads `TENSORLANE_RUN_ID` and connects to `TENSORLANE_ADDR` (default `localhost:8181`). Its defaults are five workers and two prefetched batches per rank, per stream. Override them with `num_workers` and `prefetch_factor`.
+
+The [training example](client/examples/train.py) shows a complete PyTorch loop with Accelerate, including batch distribution across local ranks and checkpoint uploads.
+
+## Running locally
+
+Requires Linux, Python 3.11+, ClickHouse and an S3-compatible bucket. In the repository root, create `.env` with your connection settings:
 
 ```sh
 CLICKHOUSE_URL=http://localhost:8123
@@ -18,7 +72,7 @@ AWS_SECRET_ACCESS_KEY=your-secret-key
 S3_BUCKET=tensorlane
 ```
 
-The Nix development shell loads `.env` and provides the build tools. Build the Python client:
+Build the Python client in the Nix development shell, which loads `.env`:
 
 ```sh
 nix develop
@@ -26,17 +80,13 @@ uv sync --group test
 uv run --group test maturin develop
 ```
 
-Apply the [database schema](db/README.md), then start the server in another terminal:
+Apply the [database schema](db/README.md) and execute [example-dataset.sql](queries/example-dataset.sql) in ClickHouse. It creates 2,000 samples without S3 data. Start the server in another terminal:
 
 ```sh
 nix develop -c server
 ```
 
-HTTP listens on `8180`; gRPC listens on `8181`. The development environment puts the server cache in `.tensorlane/cache`. Set `HTTP_PORT`, `GRPC_PORT`, or `CACHE_DIR` to override these defaults. Keep the cache on disk-backed storage.
-
-## Read batches
-
-For the bundled example, execute [example-dataset.sql](queries/example-dataset.sql) once in the configured ClickHouse database. It creates 2,000 samples with metadata and no S3 blobs. Create a run:
+Create a run over the example dataset:
 
 ```sh
 curl --fail-with-body http://localhost:8180/runs \
@@ -44,83 +94,19 @@ curl --fail-with-body http://localhost:8180/runs \
   --data-binary @queries/examples/sample-configs.json
 ```
 
-Set `TENSORLANE_RUN_ID` to the returned `run_id`. Save this as `read.py` and run it with `uv run python read.py` inside the development shell:
+Export the returned `run_id` as `TENSORLANE_RUN_ID`. Save the Python reader above as `read.py`, then run `uv run python read.py` in the development shell.
 
-```python
-import torch
-import tensorlane
+## Run behavior
 
+Initialization executes each query once and saves the complete result to disk before returning. Training ends at the last batch; validation repeats by default. Set `repeat` per stream to change this. Repeating reuses the saved result, while S3 objects are fetched as needed.
 
-def transform(sample):
-    return torch.tensor(sample.metadata["position"], dtype=torch.float32)
+The server reads each saved result one batch at a time. Each stream uses one query-result file and at most 20 reusable batch files under `CACHE_DIR` (`.tensorlane/cache` in the development shell). Keep this directory on disk with room for the full query results. Encoded batches are limited to 64 MiB; decoded data and worker processes also consume RAM. ClickHouse query memory is separate.
 
+Closing a run removes its cache. A missing client heartbeat fails the run after 60 seconds. Server restarts fail previous active runs; run one server per database.
 
-def collate(samples):
-    return torch.stack(samples)
+Save checkpoints with `lane.save_asset("model", path, kind="checkpoint")`, then call `lane.flush()` before modifying the source file. To load one in a new run, add it to `config.assets` and read its local path with `lane.asset("model")`. The [resume example](client/examples/train2.py) restores weights and continues from the number of samples actually trained on.
 
-
-def main():
-    with tensorlane.init(transform=transform, collate_fn=collate) as lane:
-        with lane.batches("training") as batches:
-            for batch in batches:
-                print(batch.batch_id, batch.data)
-
-
-if __name__ == "__main__":
-    main()
-```
-
-Transforms receive `RawSample(sample_id, stream, metadata, blobs)`, where `blobs` maps names to bytes. Collators receive the ordered transformed samples. Define both callbacks at module scope for multiprocessing; worker tensors must be on CPU. Without callbacks, `batch.samples` contains the raw samples and `batch.data` is the same tuple.
-
-`lane.config` holds the complete submitted configuration. Defaults are five workers, prefetch factor two, and one rank; set `num_workers`, `prefetch_factor`, and `ranks` in the run configuration or override them in `init`. Set `TENSORLANE_ADDR` for a server other than `localhost:8181`.
-
-For multiple ranks, one local process starts the daemon and the others attach. Batches are assigned round robin within each stream. The [Accelerate example](client/examples/train.py) shows rank setup, training, and synchronization before close.
-
-## Write a query
-
-Each entry in `config.queries` defines a named stream. SQL must return:
-
-| Column | Type | Contents |
-| --- | --- | --- |
-| `sample_id` | `String` | Sample identifier; duplicates are allowed |
-| `batch_idx` | `UInt64` | Batch grouping; gaps are allowed |
-| `sample_idx` | `UInt64` | Order within the batch |
-| `metadata_json` | `String` | JSON object passed to the transform |
-| `blobs_json` | `String` | JSON object mapping blob names to S3 references |
-
-Rows must be strictly ordered by `(batch_idx, sample_idx)`. A blob reference is `{"object":"path/in/bucket"}` or `{"object":"packed/file","byte_offset":64,"byte_length":32}`. Both range fields are required together. Empty blob maps are valid.
-
-SQL parameters use ClickHouse placeholders such as `{batch_size:UInt64}`. Values come from `dataset_id` and `seed`, then `config.params`, then the stream's own configuration object, with later values taking precedence. Application settings such as optimizer parameters are stored alongside them.
-
-Each query runs once during initialization. TensorLane validates and writes the complete result to disk before returning from `init`. Training ends at EOF; validation repeats by default. Set `repeat` per stream to change this. Repetition reads the same plan file; blobs are fetched as needed, so use immutable objects when their contents must stay identical. If supplied, `batches` must match the query's distinct batch count.
-
-## Storage and limits
-
-Each stream has one plan file and at most 20 reusable batch-cache files. The same files are reused as training progresses. Plans are read one batch at a time; their disk usage grows with the query result.
-
-| Limit | Value |
-| --- | --- |
-| Encoded batch | 64 MiB |
-| Batch descriptors | 64 MiB / 65,536 samples |
-| Concurrent S3 reads | 16 across the server |
-| Client batch credits | `ranks × prefetch_factor` per stream |
-
-These limits do not cap total RAM: active blob reads, decoded tensors, and ClickHouse query execution have separate memory costs. Run caches are removed on close. A client missing heartbeats for 60 seconds is marked failed and its cache is removed. Server restart marks previously running runs failed. Use one server per run database.
-
-## Checkpoints and metrics
-
-Declare input assets in `config.assets` by registered `asset_id` or S3 `object`. They are downloaded before initialization completes; `lane.asset("model")` returns the local path. TAR archives are extracted automatically.
-
-```python
-asset_id = lane.save_asset("model", "weights.pt", step=1000, kind="checkpoint")
-lane.flush()
-```
-
-Saving returns an ID immediately and uploads in the background. Keep the source unchanged until `flush()` completes. Successful saves record their predecessor, preserving checkpoint history. Files upload as-is; directories become TAR archives.
-
-A continuation is a new run: load the saved asset and pass the next sample position after completed training work. Prefetched batches do not count as completed work. See [train2.py](client/examples/train2.py) and its [run configuration](queries/examples/sample-configs-stage2.json).
-
-Use `lane.metric(step, name, value)` for scalars and `lane.metric_artifact(...)` for files. Throughput and pipeline timings are reported every 10 seconds by default; disable them with `performance_metrics=False`. Run configuration, status, and asset history are available through [the HTTP API](server/src/http.rs); data transfer uses [gRPC](proto/tensorlane.proto).
+Use `lane.metric(step, name, value)` to record scalars and `lane.metric_artifact(...)` for files. Throughput and timing metrics are enabled by default. The full run configuration is available as `lane.config`.
 
 ## Development
 
@@ -130,6 +116,6 @@ nix develop -c uv run --group test python -m unittest discover -s client/tests -
 nix develop -c cargo test -p tensorlane --test e2e -- --test-threads=1
 ```
 
-Integration tests start ClickHouse and MinIO through Docker. Set `TENSORLANE_TEST_PYTHON` to the prepared environment's Python executable to include the training examples.
+Integration tests require Docker for ClickHouse and MinIO. Set `TENSORLANE_TEST_PYTHON` to the prepared Python executable to include the training examples.
 
-[Load benchmark](client/benchmarks/load_test.py) · [Audio sampling SQL](queries/training.sql) · [Audio run configuration](sample-configs.json) · [Schema and migrations](db/README.md)
+[Load benchmark](client/benchmarks/load_test.py) · [HTTP routes](server/src/http.rs) · [gRPC protocol](proto/tensorlane.proto)
