@@ -228,10 +228,28 @@ mod tests {
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
     #[tokio::test]
+    async fn anonymous_http_is_allowed_without_a_configured_key() {
+        let app = router(
+            RunRepo::new(clickhouse::Client::default()),
+            crate::auth::Auth::new(None).unwrap(),
+        );
+        for (path, expected) in [
+            ("/runs/invalid", StatusCode::BAD_REQUEST),
+            ("/unknown", StatusCode::NOT_FOUND),
+        ] {
+            let request = Request::builder().uri(path).body(Body::empty()).unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn authentication_covers_routes_fallbacks_and_wrong_methods() {
         let app = router(
             RunRepo::new(clickhouse::Client::default()),
-            crate::auth::Auth::new(Some(KEY), false).unwrap(),
+            crate::auth::Auth::new(Some(KEY)).unwrap(),
         );
         for (method, path) in [
             ("GET", "/runs"),

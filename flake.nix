@@ -73,7 +73,6 @@
               CLICKHOUSE_PASSWORD = "";
               GRPC_PORT = "8181";
               HTTP_PORT = "8180";
-              TENSORLANE_ALLOW_UNAUTHENTICATED = "true";
 
               AWS_ENDPOINT_URL = "http://127.0.0.1:9001";
               AWS_ACCESS_KEY_ID = "tensorlane";

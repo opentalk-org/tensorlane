@@ -57,12 +57,6 @@ struct Args {
     command: Option<Command>,
     #[arg(long, env = "TENSORLANE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
-    #[arg(
-        long,
-        env = "TENSORLANE_ALLOW_UNAUTHENTICATED",
-        help = "Disable authentication for local development only."
-    )]
-    allow_unauthenticated: bool,
     #[arg(long, env = "GRPC_TLS_CERT_FILE", requires = "grpc_tls_key_file")]
     grpc_tls_cert_file: Option<PathBuf>,
     #[arg(long, env = "GRPC_TLS_KEY_FILE", requires = "grpc_tls_cert_file")]
@@ -158,7 +152,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let args = Args::from_arg_matches(&matches)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let auth = auth::Auth::new(args.api_key.as_deref(), args.allow_unauthenticated)?;
+    let auth = auth::Auth::new(args.api_key.as_deref())?;
     let grpc_tls = match (args.grpc_tls_cert_file, args.grpc_tls_key_file) {
         (Some(cert), Some(key)) => Some(tonic::transport::Identity::from_pem(
             fs::read(cert)

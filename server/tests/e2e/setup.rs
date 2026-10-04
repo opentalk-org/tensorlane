@@ -319,7 +319,6 @@ impl TestEnv {
                 "--metrics-prefix",
                 "metrics",
             ])
-            .arg("--allow-unauthenticated")
             .env_remove("TENSORLANE_API_KEY")
             .env_remove("GRPC_TLS_CERT_FILE")
             .env_remove("GRPC_TLS_KEY_FILE")

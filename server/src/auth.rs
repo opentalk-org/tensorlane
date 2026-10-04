@@ -14,7 +14,7 @@ pub struct Auth {
 }
 
 impl Auth {
-    pub fn new(key: Option<&str>, allow_unauthenticated: bool) -> anyhow::Result<Self> {
+    pub fn new(key: Option<&str>) -> anyhow::Result<Self> {
         let digest = match key {
             Some(key) => {
                 anyhow::ensure!(
@@ -23,13 +23,7 @@ impl Auth {
                 );
                 Some(Sha256::digest(key.as_bytes()).into())
             }
-            None => {
-                anyhow::ensure!(
-                    allow_unauthenticated,
-                    "set TENSORLANE_API_KEY, or explicitly use --allow-unauthenticated for local development"
-                );
-                None
-            }
+            None => None,
         };
         Ok(Self { digest })
     }
@@ -81,18 +75,19 @@ mod tests {
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn startup_requires_a_key_or_explicit_local_opt_out() {
-        assert!(Auth::new(None, false).is_err());
-        assert!(Auth::new(None, true).unwrap().accepts(None));
+    fn authentication_is_optional_but_configured_keys_are_enforced() {
+        let mut anonymous = Auth::new(None).unwrap();
+        assert!(anonymous.accepts(None));
+        assert!(anonymous.call(GrpcRequest::new(())).is_ok());
         for key in ["", "short", "0123456789abcdef0123456789abcdef\n"] {
-            assert!(Auth::new(Some(key), true).is_err());
+            assert!(Auth::new(Some(key)).is_err());
         }
-        assert!(!Auth::new(Some(KEY), true).unwrap().accepts(None));
+        assert!(!Auth::new(Some(KEY)).unwrap().accepts(None));
     }
 
     #[test]
     fn grpc_rejects_missing_wrong_and_duplicate_credentials() {
-        let mut auth = Auth::new(Some(KEY), false).unwrap();
+        let mut auth = Auth::new(Some(KEY)).unwrap();
         for value in [None, Some("Basic ignored"), Some("Bearer wrong")] {
             let mut request = GrpcRequest::new(());
             if let Some(value) = value {
