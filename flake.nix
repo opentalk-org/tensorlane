@@ -8,6 +8,8 @@
     dnvr.url = "github:dialohq/dnvr";
     dnvr.inputs.nixpkgs.follows = "dnvrNixpkgs";
     dialo-overlays.url = "github:dialohq/nix-overlays";
+    nix2container.url = "github:dialohq/nix2container/compressed-layers";
+    nix2container.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs =
@@ -42,7 +44,17 @@
 
           packages = {
             default = self'.packages.server;
-            server = import ./nix/server.nix { inherit pkgs; src = ./.; };
+            server = import ./nix/server.nix {
+              inherit pkgs;
+              src = ./.;
+            };
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+            image = import ./nix/image.nix {
+              inherit pkgs;
+              inherit (self'.packages) server;
+              nix2container = inputs.nix2container.packages.${system}.nix2container;
+            };
           };
 
           dnvr.specialArgs = { inherit inputs system; };
@@ -88,7 +100,10 @@
               UV_PYTHON_DOWNLOADS = "never";
 
               LIBTORCH_USE_PYTORCH = "1";
-              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.stdenv.cc.cc.lib pkgs.zlib ];
+              LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+                pkgs.stdenv.cc.cc.lib
+                pkgs.zlib
+              ];
 
               RUST_LOG = "off,tensorlane=debug";
             };

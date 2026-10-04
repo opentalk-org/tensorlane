@@ -72,6 +72,27 @@
         "type": "github"
       }
     },
+    "nix2container": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1783012660,
+        "narHash": "sha256-7F3Z4W/EbPawrEmolu6UIlZmWl/r+6xPYKzZbopBEvA=",
+        "owner": "dialohq",
+        "repo": "nix2container",
+        "rev": "c1a53d1a50ab47a7acd7856a79809b8fdaf083a1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "dialohq",
+        "ref": "compressed-layers",
+        "repo": "nix2container",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1767313136,
@@ -125,6 +146,7 @@
         "dnvr": "dnvr",
         "dnvrNixpkgs": "dnvrNixpkgs",
         "flake-parts": "flake-parts",
+        "nix2container": "nix2container",
         "nixpkgs": "nixpkgs_2"
       }
     }

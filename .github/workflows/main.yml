@@ -1,0 +1,47 @@
+name: Build and push image
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  build-push:
+    # Allow PR runs only from branches in this repository, not from forks.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PR_NUMBER: ${{ github.event.number }}
+      PR_HEAD_COMMIT: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@1ca7d21a94afc7c957383a2d217460d980de4934 # v31.10.1
+
+      - name: Build image
+        run: nix build .#image --print-build-logs
+
+      - name: Push image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          REGISTRY_AUTH_FILE: ${{ runner.temp }}/containers-auth.json
+          DOCKER_CONFIG: ${{ runner.temp }}/docker-config
+        run: |
+          nix shell --inputs-from . nixpkgs#skopeo nixpkgs#crane -c bash -euo pipefail <<'SH'
+          printf '%s' "$GITHUB_TOKEN" | skopeo login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          printf '%s' "$GITHUB_TOKEN" | crane auth login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          nix run .#image.copyToRegistry -- --preserve-digests --dest-precompute-digests
+          image=$(nix eval --raw .#image.imageRefUnsafe)
+          if [[ -n "$PR_HEAD_COMMIT" ]]; then
+            crane tag "$image" "pr-$PR_NUMBER-sha-$PR_HEAD_COMMIT"
+          else
+            crane tag "$image" "sha-$GITHUB_SHA"
+          fi
+          printf 'Published `%s@%s`\n' "${image%:*}" "$(crane digest "$image")" >> "$GITHUB_STEP_SUMMARY"
+          SH
