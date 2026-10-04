@@ -16,7 +16,7 @@ async fn shutdown_with_runs(running: usize, initializing: usize) -> Result<()> {
     env.put_object("inputs/slow-asset", Bytes::from_static(b"model"))
         .await?;
     let mut config = run_config(dataset, 2);
-    config["assets"] = json!({"model": {"object": "inputs/slow-asset"}});
+    config["tensorlane"]["assets"] = json!({"model": {"object": "inputs/slow-asset"}});
     let mut runs = Vec::new();
     for _ in 0..running {
         let run = env.create_run(config.clone()).await?;
@@ -132,7 +132,7 @@ async fn failed_initialization_releases_shutdown_and_cleans_cache() -> Result<()
     let mut env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
     let mut config = run_config(dataset, 1);
-    config["assets"] = json!({"missing": {"object": "inputs/missing"}});
+    config["tensorlane"]["assets"] = json!({"missing": {"object": "inputs/missing"}});
     let run = env.create_run(config).await?;
     env.pause_s3().await?;
     let mut client = env.grpc.clone();

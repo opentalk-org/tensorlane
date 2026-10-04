@@ -61,7 +61,7 @@ async fn multipart_checkpoint_matches_s3_and_clickhouse_metadata() -> Result<()>
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
     let mut config = run_config(dataset, 1);
-    config["asset_type"] = json!("custom-model-type");
+    config["tensorlane"]["asset_type"] = json!("custom-model-type");
     let run = env.create_run(config).await?;
     env.init_run(&run).await?;
     let contents: Vec<u8> = (0..64 * 1024 * 1024 + 123)
@@ -210,8 +210,11 @@ async fn named_asset_lineage_survives_new_runs_and_failed_saves() -> Result<()> 
     );
     env.end_run(&run).await?;
     let mut config = run_config(dataset, 1);
-    config["assets"] = json!({"model":{"asset_id":b}});
-    config.as_object_mut().unwrap().remove("asset_type");
+    config["tensorlane"]["assets"] = json!({"model":{"asset_id":b}});
+    config["tensorlane"]
+        .as_object_mut()
+        .unwrap()
+        .remove("asset_type");
     let next = env.create_run(config).await?;
     env.init_run(&next).await?;
     assert_eq!(env.asset(&next, "model").await?.1, body);

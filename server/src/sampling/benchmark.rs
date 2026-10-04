@@ -21,7 +21,7 @@ async fn live_plan_memory() -> anyhow::Result<()> {
         let started = Instant::now();
         let rows = stream_samples(&database, &query.sql, &query.params);
         let path = dir.path().join(format!("{index}.plan"));
-        let mut sampler = QuerySampler::create(&name, rows, &path, false, query.batches).await?;
+        let mut sampler = QuerySampler::create(&name, rows, &path, false).await?;
         let disk_bytes = std::fs::metadata(&path)?.len();
         let (mut count, mut batches) = (0, 0);
         while let Some(batch) = sampler.next_batch().await? {
@@ -51,8 +51,8 @@ async fn disk_plan_memory() -> anyhow::Result<()> {
         .into_iter()
         .enumerate()
     {
-        let metadata = serde_json::json!({"text":"a".repeat(text_len),"duration":4.5}).to_string();
-        let blobs = r#"{"audio":{"object":"objects/01234567-0123-0123-0123-012345678901.tar","byte_offset":1024,"byte_length":65536}}"#;
+        let metadata = serde_json::json!({"text":"a".repeat(text_len),"weight":4.5}).to_string();
+        let blobs = r#"{"payload":{"object":"objects/01234567-0123-0123-0123-012345678901.tar","byte_offset":1024,"byte_length":65536}}"#;
         let source = futures::stream::iter((0..count).map(|i| {
             Ok(SampleRow {
                 sample_id: "01234567-0123-0123-0123-012345678901".into(),
@@ -63,7 +63,7 @@ async fn disk_plan_memory() -> anyhow::Result<()> {
             })
         }));
         let path = dir.path().join(format!("{index}.plan"));
-        plans.push(QuerySampler::create("benchmark", source, &path, false, None).await?);
+        plans.push(QuerySampler::create("benchmark", source, &path, false).await?);
         disk_bytes += std::fs::metadata(path)?.len();
     }
     let mut samples = 0;

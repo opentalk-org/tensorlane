@@ -265,3 +265,66 @@ table "assets" {
     columns = [column.id]
   }
 }
+
+table "audio_files" {
+  schema = schema.default
+  engine = MergeTree
+
+  column "id" {
+    type = UUID
+  }
+  column "updated_at" {
+    type = DateTime64(9)
+  }
+  column "name" {
+    type = String
+  }
+  column "bucket_file_id" {
+    type = UUID
+    default = "00000000-0000-0000-0000-000000000000"
+  }
+  column "byte_offset" {
+    type = UInt64
+  }
+  column "duration" {
+    type = Float32
+  }
+  column "sample_rate" {
+    type    = UInt32
+    default = 0
+  }
+  column "byte_length" {
+    type = UInt64
+  }
+  column "score" {
+    type = Float32
+  }
+  column "language" {
+    type = sql("LowCardinality(String)")
+  }
+  column "style_prompt" {
+    type = String
+  }
+  column "voice_prompt" {
+    type = String
+  }
+  column "virtual" {
+    type = Bool
+  }
+  column "storage_kind" {
+    type = sql("Enum8('packed' = 1, 'external' = 2)")
+  }
+  column "storage_ref" {
+    type = String
+  }
+  column "metadata" {
+    type = String
+  }
+
+  primary_key {
+    columns = [column.id, column.updated_at]
+  }
+  sort {
+    columns = [column.id, column.updated_at]
+  }
+}

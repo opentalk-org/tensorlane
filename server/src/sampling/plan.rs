@@ -34,7 +34,6 @@ impl QuerySampler {
         rows: impl Stream<Item = Result<SampleRow>> + Send,
         path: &Path,
         repeat: bool,
-        expected: Option<u64>,
     ) -> Result<Self> {
         let part = path.with_extension("part");
         let output = File::create_new(&part)
@@ -78,12 +77,6 @@ impl QuerySampler {
             writer.write_u32_le(size as u32).await?;
             writer.write_all(&encoded).await?;
             samples += 1;
-        }
-        if let Some(expected) = expected {
-            ensure!(
-                batches == expected,
-                "query {name} returned {batches} batches, expected {expected}"
-            );
         }
         writer.flush().await?;
         writer.get_ref().sync_all().await?;

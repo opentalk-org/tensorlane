@@ -58,9 +58,19 @@ pub fn run_config(dataset_id: Uuid, batches: u64) -> Value {
         FROM numbers({batches:UInt64} * {batch_size:UInt64}) AS n CROSS JOIN pool AS p
         WHERE p.position = modulo(n.number + {dataset_offset:UInt64}, (SELECT count() FROM pool))
         ORDER BY batch_idx, sample_idx";
-    json!({"dataset_id":dataset_id,"asset_type":"e2e-model","seed":1,
-        "queries":{"training":sql,"validation":sql},"params":{"dataset_offset":0,"batch_size":1},
-        "training":{"batches":batches},"validation":{"batches":1},"assets":{},"optimizer":{"lr":0.1}})
+    json!({"tensorlane": {"asset_type": "e2e-model", "assets": {}},
+        "queries": [
+            {"key": "training", "sql": sql, "params": {"dataset_id": dataset_id, "dataset_offset": 0, "batch_size": 1, "batches": batches}},
+            {"key": "validation", "sql": sql, "params": {"dataset_id": dataset_id, "dataset_offset": 0, "batch_size": 1, "batches": 1}, "repeat": true}
+        ], "app": {"seed": 1, "optimizer": {"lr": 0.1}}})
+}
+pub fn query<'a>(config: &'a mut Value, key: &str) -> &'a mut Value {
+    config["queries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|query| query["key"] == key)
+        .unwrap()
 }
 pub fn tar_file(name: &str, content: &[u8]) -> Result<Bytes> {
     let mut builder = tar::Builder::new(Vec::new());

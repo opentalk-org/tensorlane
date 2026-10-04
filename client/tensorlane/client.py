@@ -26,8 +26,6 @@ def _content_type(path):
     suffix = Path(path).suffix.lower()
     if suffix in {".pt", ".pth", ".ckpt", ".safetensors"}:
         return "application/octet-stream"
-    if suffix == ".wav":
-        return "audio/wav"
     return mimetypes.guess_type(str(path))[0] or "application/octet-stream"
 
 
@@ -115,7 +113,7 @@ class TensorLane:
                 raise RuntimeError("TensorLane daemon is closed")
             _check_alive(self._root)
 
-    def batches(self, stream: str = "training", *, timeout: float = 120) -> BatchReader:
+    def batches(self, stream: str, *, timeout: float = 120) -> BatchReader:
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
         if stream not in self.streams:
@@ -128,8 +126,8 @@ class TensorLane:
     def _performance_collector(self):
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
-        if self._performance is None and self._performance_enabled:
-            self._performance = Performance(self._root, self._rank)
+        if self._performance is None and self._performance_enabled and self._rank == 0:
+            self._performance = Performance(self._root)
         return self._performance
 
     def asset(self, name: str) -> Path:
@@ -464,8 +462,8 @@ class BatchReader(Iterator[Batch]):
         rank: int,
         timeout: float,
         check: Callable[[], None],
-        stream_index: int = 0,
-        stream: str = "training",
+        stream_index: int,
+        stream: str,
         performance: Performance | None = None,
     ) -> None:
         if rank < 0 or timeout <= 0:
@@ -570,8 +568,6 @@ class BatchReader(Iterator[Batch]):
         if self._closed:
             return
         self._record_application(time.monotonic())
-        if self._performance is not None:
-            self._performance.finish(self._stream)
         if self._connection is not None:
             self._connection.close()
             self._connection = None

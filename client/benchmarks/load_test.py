@@ -24,7 +24,7 @@ def consume(args, rank, barrier, results):
         started = time.perf_counter()
         batch_count = 0
         sample_count = 0
-        with lane.batches() as batches:
+        with lane.batches("training") as batches:
             for batch in batches:
                 batch_count += 1
                 sample_count += len(batch)

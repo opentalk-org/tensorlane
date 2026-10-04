@@ -1,4 +1,4 @@
-use crate::setup::{TestEnv, array, run_config, scalar, tar_file};
+use crate::setup::{TestEnv, array, query, run_config, scalar, tar_file};
 use anyhow::Result;
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -12,8 +12,9 @@ async fn full_run_exercises_http_grpc_and_generic_data() -> Result<()> {
     let asset = Bytes::from_static(b"opaque input weights");
     env.put_object("inputs/model", asset.clone()).await?;
     let mut config = run_config(dataset, 2);
-    config["assets"] = json!({"model":{"object":"inputs/model","entrypoint":"weights"}});
-    config["optimizer"] = json!({"nested":{"anything":true}});
+    config["tensorlane"]["assets"] =
+        json!({"model":{"object":"inputs/model","entrypoint":"weights"}});
+    config["app"]["optimizer"] = json!({"nested":{"anything":true}});
     let run = env.create_run(config.clone()).await?;
     let fetched: Value = env
         .http
@@ -86,10 +87,10 @@ async fn offsets_and_batch_sizes_continue_across_separate_runs() -> Result<()> {
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(12).await?;
     let mut first = run_config(dataset, 2);
-    first["training"]["batch_size"] = json!(3);
+    query(&mut first, "training")["params"]["batch_size"] = json!(3);
     let mut second = run_config(dataset, 3);
-    second["params"]["dataset_offset"] = json!(6);
-    second["training"]["batch_size"] = json!(2);
+    query(&mut second, "training")["params"]["dataset_offset"] = json!(6);
+    query(&mut second, "training")["params"]["batch_size"] = json!(2);
     let a = env.create_run(first).await?;
     let b = env.create_run(second).await?;
     env.init_run(&a).await?;
@@ -119,9 +120,10 @@ async fn third_query_and_metadata_only_samples_work() -> Result<()> {
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
     let mut config = run_config(dataset, 1);
-    config["queries"]["evaluation"] = json!(
-        "SELECT 'text' AS sample_id, toUInt64(7) AS batch_idx, toUInt64(0) AS sample_idx, '{\"text\":\"hello\"}' AS metadata_json, '{}' AS blobs_json"
-    );
+    config["queries"].as_array_mut().unwrap().push(json!({
+        "key": "evaluation",
+        "sql": "SELECT 'text' AS sample_id, toUInt64(7) AS batch_idx, toUInt64(0) AS sample_idx, '{\"text\":\"hello\"}' AS metadata_json, '{}' AS blobs_json"
+    }));
     let id = env.create_run(config).await?;
     env.init_run(&id).await?;
     let batches = env.stream_batches(&id, "evaluation", 2).await?;
@@ -209,13 +211,13 @@ async fn migrations_preserve_legacy_sections_and_verify_before_retirement() -> R
 }
 
 #[tokio::test]
-async fn repeat_replays_the_original_query_and_finite_validation_can_override_default() -> Result<()>
+async fn repeat_replays_the_original_query_and_validation_is_finite_by_default() -> Result<()>
 {
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
     let mut config = run_config(dataset, 2);
-    config["training"]["repeat"] = json!(true);
-    config["validation"]["repeat"] = json!(false);
+    query(&mut config, "training")["repeat"] = json!(true);
+    query(&mut config, "validation").as_object_mut().unwrap().remove("repeat");
     let id = env.create_run(config).await?;
     env.init_run(&id).await?;
     env.clickhouse.query("ALTER TABLE example_samples UPDATE metadata_json='{\"position\":99}' WHERE dataset_id=? SETTINGS mutations_sync=2").bind(dataset).execute().await?;
@@ -248,22 +250,18 @@ async fn repeat_replays_the_original_query_and_finite_validation_can_override_de
 }
 
 #[tokio::test]
-async fn mismatched_batch_count_and_unsorted_query_fail_initialization() -> Result<()> {
+async fn query_results_determine_batch_count_and_unsorted_rows_fail() -> Result<()> {
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
     let mut config = run_config(dataset, 2);
-    config["queries"]["training"] = json!(
+    query(&mut config, "training")["sql"] = json!(
         "SELECT 'x' AS sample_id,toUInt64(0) AS batch_idx,toUInt64(0) AS sample_idx,'{}' AS metadata_json,'{}' AS blobs_json"
     );
     let id = env.create_run(config.clone()).await?;
-    assert!(
-        env.init_run(&id)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("expected 2")
-    );
-    config["queries"]["training"] = json!(
+    env.init_run(&id).await?;
+    assert_eq!(env.stream_batches(&id, "training", 3).await?.len(), 1);
+    env.end_run(&id).await?;
+    query(&mut config, "training")["sql"] = json!(
         "SELECT 'x' AS sample_id,number AS batch_idx,number AS sample_idx,'{}' AS metadata_json,'{}' AS blobs_json FROM numbers(2) ORDER BY number DESC"
     );
     let id = env.create_run(config).await?;
@@ -279,18 +277,27 @@ async fn complete_examples_continue_through_the_native_python_pipeline() -> Resu
     };
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(18).await?;
-    let mut first: Value = serde_json::from_str(include_str!("../../../queries/examples/sample-configs.json"))?;
-    first["config"]["dataset_id"] = json!(dataset);
-    first["config"]["training"] = json!({"batches":3,"batch_size":3});
-    first["config"]["num_workers"] = json!(2);
-    first["config"]["validation"] = json!({"samples":4,"batch_size":2});
-    let mut second: Value =
-        serde_json::from_str(include_str!("../../../queries/examples/sample-configs-stage2.json"))?;
-    second["config"]["training"] = json!({"batches":2,"batch_size":2});
-    second["config"]["validation"] = json!({"samples":4,"batch_size":2});
+    let mut first: Value = serde_json::from_str(include_str!(
+        "../../../queries/examples/sample-configs.json"
+    ))?;
+    for query in first["config"]["queries"].as_array_mut().unwrap() {
+        query["params"]["dataset_id"] = json!(dataset);
+    }
+    query(&mut first["config"], "training")["params"]["batches"] = json!(3);
+    query(&mut first["config"], "training")["params"]["batch_size"] = json!(3);
+    first["config"]["tensorlane"]["num_workers"] = json!(2);
+    query(&mut first["config"], "validation")["params"]["samples"] = json!(4);
+    query(&mut first["config"], "validation")["params"]["batch_size"] = json!(2);
+    let mut second: Value = serde_json::from_str(include_str!(
+        "../../../queries/examples/sample-configs-stage2.json"
+    ))?;
+    query(&mut second["config"], "training")["params"]["batches"] = json!(2);
+    query(&mut second["config"], "training")["params"]["batch_size"] = json!(2);
+    query(&mut second["config"], "validation")["params"]["samples"] = json!(4);
+    query(&mut second["config"], "validation")["params"]["batch_size"] = json!(2);
     let temp = tempfile::tempdir()?;
     let output = temp.path().join("training");
-    first["config"]["output_dir"] = json!(output);
+    first["config"]["app"]["output_dir"] = json!(output);
     let run = env.create_run(first["config"].clone()).await?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let result = tokio::process::Command::new(&python)
@@ -324,11 +331,14 @@ async fn complete_examples_continue_through_the_native_python_pipeline() -> Resu
         .bind(&run).fetch_one::<u64>().await?;
     assert!(telemetry > 0);
     let first_asset = progress["asset_id"].as_str().unwrap();
-    second["config"]["dataset_id"] = json!(dataset);
-    second["config"]["num_workers"] = json!(2);
-    second["config"]["output_dir"] = json!(output);
-    second["config"]["params"]["dataset_offset"] = progress["dataset_offset"].clone();
-    second["config"]["assets"]["model"]["asset_id"] = progress["asset_id"].clone();
+    for query in second["config"]["queries"].as_array_mut().unwrap() {
+        query["params"]["dataset_id"] = json!(dataset);
+    }
+    second["config"]["tensorlane"]["num_workers"] = json!(2);
+    second["config"]["app"]["output_dir"] = json!(output);
+    query(&mut second["config"], "training")["params"]["dataset_offset"] =
+        progress["dataset_offset"].clone();
+    second["config"]["tensorlane"]["assets"]["model"]["asset_id"] = progress["asset_id"].clone();
     let run = env.create_run(second["config"].clone()).await?;
     let result = tokio::process::Command::new(&python)
         .current_dir(root)

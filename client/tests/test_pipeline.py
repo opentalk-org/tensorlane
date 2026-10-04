@@ -59,9 +59,9 @@ class Fixture(rpc.TensorLaneServicer):
     def __init__(self):
         self.streams = {"training": 5, "validation": 3, "evaluation": 2}
         self.config = {
-            "queries": {name: "SELECT ..." for name in self.streams},
-            "optimizer": {"lr": 0.1},
-            "assets": {},
+            "queries": [{"key": key, "sql": "SELECT ..."} for key in self.streams],
+            "app": {"optimizer": {"lr": 0.1}},
+            "tensorlane": {"assets": {}},
         }
         self.requests = {name: [] for name in self.streams}
         self.init_requests = []
@@ -295,6 +295,8 @@ class PipelineTests(unittest.TestCase):
         self.start(collate_fn={"training": collate})
         self.assertEqual(self.daemon.config, self.service.config)
         self.assertEqual(self.daemon.streams, tuple(self.service.streams))
+        with self.assertRaises(TypeError):
+            self.daemon.batches()
         for stream, count in self.service.streams.items():
             with self.daemon.batches(stream) as reader:
                 batches = list(reader)
@@ -311,7 +313,8 @@ class PipelineTests(unittest.TestCase):
                     self.assertEqual(batch.data, batch.samples)
 
     def test_runtime_parameters_from_json_are_shared_with_followers(self):
-        self.service.config.update(ranks=2, num_workers=2, prefetch_factor=1)
+        self.service.config["tensorlane"].update(ranks=2, num_workers=2, prefetch_factor=1)
+        self.service.config["app"].update(ranks=99, num_workers="custom", prefetch_factor=0)
         self.daemon = tensorlane.init(
             self.run_id, addr=f"localhost:{self.service.port}", ipc_dir=self.temp.name
         )
@@ -337,7 +340,7 @@ class PipelineTests(unittest.TestCase):
             )
 
     def test_explicit_runtime_parameters_override_json(self):
-        self.service.config.update(ranks=2, num_workers=2, prefetch_factor=1)
+        self.service.config["tensorlane"].update(ranks=2, num_workers=2, prefetch_factor=1)
         self.start(workers=1)
         self.assertEqual(
             (self.daemon.ranks, self.daemon.num_workers, self.daemon.prefetch_factor),
@@ -346,7 +349,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self.daemon.config, self.service.config)
 
     def test_existing_run_id_from_environment_needs_no_argument(self):
-        self.service.config.update(num_workers=1)
+        self.service.config["tensorlane"].update(num_workers=1)
         with patch.dict("os.environ", {"TENSORLANE_RUN_ID": self.run_id}):
             self.daemon = tensorlane.init(
                 addr=f"localhost:{self.service.port}", ipc_dir=self.temp.name
@@ -368,7 +371,7 @@ class PipelineTests(unittest.TestCase):
             with self.daemon.batches(name) as reader:
                 self.assertEqual(len(list(reader)), self.service.streams[name])
         self.assertEqual(len(self.service.requests["training"]), 1)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             self.assertEqual(len(list(reader)), 5)
 
     def test_credit_budget_covers_unconsumed_batches(self):
@@ -376,7 +379,7 @@ class PipelineTests(unittest.TestCase):
         wait_for(lambda: len(self.service.requests["training"]) == 1)
         time.sleep(0.1)
         self.assertEqual(len(self.service.requests["training"]), 1)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             next(reader)
             wait_for(lambda: len(self.service.requests["training"]) == 2)
             time.sleep(0.1)
@@ -385,7 +388,7 @@ class PipelineTests(unittest.TestCase):
     def test_multiple_workers_preserve_order(self):
         self.service.streams["training"] = 10
         self.start(factor=4, workers=3, transform_fn=identify_worker)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             batches = list(reader)
         self.assertEqual(
             [batch.samples[0]["value"][0].item() for batch in batches], list(range(10))
@@ -525,7 +528,7 @@ class PipelineTests(unittest.TestCase):
         self.daemon.save_asset("model", path)
         self.assertLess(time.monotonic() - started, 1)
         self.assertTrue(self.service.upload_started.wait(5))
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             self.assertEqual(len(list(reader)), 5)
         with ThreadPoolExecutor() as executor:
             flushed = executor.submit(self.daemon.flush)
@@ -547,7 +550,7 @@ class PipelineTests(unittest.TestCase):
             queued = executor.submit(self.daemon.save_asset, "other", self.file("other"))
             try:
                 queued.result(timeout=1)
-                with self.daemon.batches() as reader:
+                with self.daemon.batches("training") as reader:
                     self.assertEqual(len(list(reader)), 5)
                 self.assertFalse(flushed.done())
             finally:
@@ -603,9 +606,9 @@ class PipelineTests(unittest.TestCase):
     def test_file_artifacts_are_raw_and_directory_artifacts_are_tar(self):
         self.start()
         for filename, body, content_type in [
-            ("audio.wav", b"RIFFplain audio", "audio/wav"),
+            ("payload.bin", b"opaque bytes", "application/octet-stream"),
             ("config.json", b'{"model":1}', "application/json"),
-            ("alignment.pt", b"plain tensor bytes", "application/octet-stream"),
+            ("weights.pt", b"plain tensor bytes", "application/octet-stream"),
         ]:
             self.daemon.metric_artifact(0, self.file(filename, body), filename)
             self.daemon.save_asset(filename, Path(self.temp.name) / filename)
@@ -616,9 +619,9 @@ class PipelineTests(unittest.TestCase):
         self.daemon.flush()
         for artifact, saved, (_, body, content_type) in zip(
             self.service.artifacts, self.service.saved,
-            [("audio.wav", b"RIFFplain audio", "audio/wav"),
+            [("payload.bin", b"opaque bytes", "application/octet-stream"),
              ("config.json", b'{"model":1}', "application/json"),
-             ("alignment.pt", b"plain tensor bytes", "application/octet-stream")],
+             ("weights.pt", b"plain tensor bytes", "application/octet-stream")],
         ):
             self.assertEqual(artifact[1], body)
             self.assertEqual(saved[2], body)
@@ -631,24 +634,23 @@ class PipelineTests(unittest.TestCase):
     def test_automatic_performance_metrics_flush_during_run(self):
         with patch("tensorlane._performance.INTERVAL", 0.05):
             self.start(workers=1, transform_fn=timed_transform)
-            with self.daemon.batches() as reader:
-                first = next(reader)
+            with self.daemon.batches("training") as reader:
+                next(reader)
                 time.sleep(0.03)
                 next(reader)
-                wait_for(lambda: any("/training/batches_total" in row[1].name
+                wait_for(lambda: any("/training/application_seconds_mean" in row[1].name
                                      for row in self.service.metrics))
             self.daemon.flush()
         values = {metric.name: metric.value for _, metric in self.service.metrics}
-        prefix = "tensorlane/rank/0/training/"
-        self.assertEqual(values[prefix + "batches_total"], 2)
-        self.assertEqual(values[prefix + "samples_total"], len(first) + 2)
+        prefix = "tensorlane/training/"
+        self.assertGreater(values[prefix + "samples_per_second"], 0)
         self.assertGreater(values[prefix + "transform_work_seconds_mean"], 0)
         self.assertGreater(values[prefix + "application_seconds_mean"], 0)
         self.assertFalse(self.service.end_requests)
 
     def test_automatic_performance_metrics_can_be_disabled(self):
         self.start(workers=1, performance_metrics=False)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             list(reader)
         self.daemon.flush()
         self.daemon.close()
@@ -656,7 +658,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_automatic_metrics_failure_does_not_fail_training(self):
         self.start(workers=1)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             next(reader)
             self.service.fail_metrics = True
             with self.assertLogs("tensorlane", level="WARNING"):
@@ -701,10 +703,10 @@ class PipelineTests(unittest.TestCase):
         self.start()
         with self.assertRaisesRegex(ValueError, "unknown stream"):
             self.daemon.batches("missing")
-        reader = self.daemon.batches()
+        reader = self.daemon.batches("training")
         try:
             with self.assertRaisesRegex(RuntimeError, "already connected"):
-                self.daemon.batches()
+                self.daemon.batches("training")
         finally:
             self.daemon.close()
             reader.close()
@@ -727,7 +729,7 @@ class PipelineTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "exited|disconnected"),
             ):
                 self.start(transform_fn=transform_fn, collate_fn=collate_fn)
-                with self.daemon.batches() as reader:
+                with self.daemon.batches("training") as reader:
                     next(reader)
             if self.daemon:
                 self.daemon.close()
@@ -740,7 +742,7 @@ class PipelineTests(unittest.TestCase):
     def test_worker_and_collator_crashes_wake_readers(self):
         for name in ("tensorlane-transform-0", "tensorlane-collate"):
             self.start(transform_fn=slow)
-            with self.daemon.batches() as reader:
+            with self.daemon.batches("training") as reader:
                 next(
                     process
                     for process in self.daemon._processes
@@ -807,7 +809,7 @@ class PipelineTests(unittest.TestCase):
         self.service.streams = {"training": 1, "validation": 0, "evaluation": 0}
         self.service.blob_size = 9 * 1024 * 1024
         self.start(transform_fn=None)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             self.assertEqual(
                 len(next(reader).samples[0].blobs["payload"]), self.service.blob_size
             )
@@ -816,7 +818,7 @@ class PipelineTests(unittest.TestCase):
         self.service.empty_batch = True
         with self.assertRaisesRegex(RuntimeError, "empty batches"):
             self.start()
-            with self.daemon.batches() as reader:
+            with self.daemon.batches("training") as reader:
                 next(reader)
 
     def test_nonzero_owner_and_returned_run_id(self):
@@ -830,7 +832,7 @@ class PipelineTests(unittest.TestCase):
             addr=f"localhost:{self.service.port}",
             ipc_dir=self.temp.name,
         )
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             self.assertEqual([batch.batch_id for batch in reader], [1, 3])
         self.assertEqual(self.daemon.run_id, self.service.returned_run_id)
         self.daemon.close()
@@ -882,7 +884,7 @@ class PipelineTests(unittest.TestCase):
             ipc_dir=self.temp.name,
         )
         self.assertEqual(len(self.daemon._processes), 6)
-        with self.daemon.batches() as reader:
+        with self.daemon.batches("training") as reader:
             started = time.monotonic()
             self.daemon.close()
             self.assertLess(time.monotonic() - started, 10)

@@ -9,14 +9,14 @@ from . import _native
 
 INTERVAL = 10.0
 STAGES = ("server_load", "server_wait", "grpc_receive_wait", "transform_work", "collate", "data_wait")
+REPORTED_STAGES = {"server_load", "transform_work", "collate", "data_wait"}
 
 
 class Performance:
     """Aggregate timings in memory; upload off the batch-consumption path."""
 
-    def __init__(self, root, rank):
+    def __init__(self, root):
         self._root = root
-        self._rank = rank
         self._lock = threading.Lock()
         self._sending = threading.Lock()
         self._streams = {}
@@ -29,47 +29,34 @@ class Performance:
     def _state(self, stream):
         if stream not in self._streams:
             self._streams[stream] = dict(
-                batches=0, samples=0, errors=0, step=0, active=0,
-                window_batches=0, window_samples=0, application=0.0, intervals=0,
-                dirty=True, last_batch=time.monotonic(), timings=[0.0] * len(STAGES),
-                wait_max=0.0, since=time.monotonic(),
+                batches=0, samples=0, errors=0, reported_errors=0, step=0,
+                application=0.0, intervals=0, timings=[0.0] * len(STAGES),
+                since=time.monotonic(),
             )
         return self._streams[stream]
 
     def open(self, stream):
         with self._lock:
-            self._state(stream)["active"] += 1
-
-    def finish(self, stream):
-        with self._lock:
-            self._state(stream)["active"] -= 1
-            self._state(stream)["dirty"] = True
+            self._state(stream)
 
     def application(self, stream, seconds):
         with self._lock:
             state = self._state(stream)
-            state["dirty"] = True
             state["application"] += seconds
             state["intervals"] += 1
 
     def batch(self, batch, wait):
         with self._lock:
             state = self._state(batch.stream)
-            state["dirty"] = True
-            state["last_batch"] = time.monotonic()
             state["step"] = batch.batch_id
             state["batches"] += 1
             state["samples"] += len(batch)
-            state["window_batches"] += 1
-            state["window_samples"] += len(batch)
             for index, seconds in enumerate((*batch._timings, wait)):
                 state["timings"][index] += seconds
-            state["wait_max"] = max(state["wait_max"], wait)
 
     def error(self, stream):
         with self._lock:
             self._state(stream)["errors"] += 1
-            self._state(stream)["dirty"] = True
 
     def event(self, name, seconds):
         with self._lock:
@@ -79,30 +66,27 @@ class Performance:
     def snapshot(self):
         now = time.monotonic()
         result = []
-        prefix = f"tensorlane/rank/{self._rank}/"
+        prefix = "tensorlane/"
         with self._lock:
             for stream, state in self._streams.items():
-                batches, samples = state["window_batches"], state["window_samples"]
+                batches, samples = state["batches"], state["samples"]
                 elapsed = max(now - state["since"], 1e-9)
-                if not (state["active"] or state["dirty"]):
+                if not (batches or state["intervals"] or state["errors"] != state["reported_errors"]):
                     continue
-                values = dict(
-                    batches_total=state["batches"], samples_total=state["samples"],
-                    errors_total=state["errors"], seconds_since_last_batch=now - state["last_batch"],
-                    batches_per_second=batches / elapsed,
-                    samples_per_second=samples / elapsed,
-                    application_seconds_mean=state["application"] / max(state["intervals"], 1),
-                    loop_seconds_mean=(state["application"] + state["timings"][-1]) / max(batches, state["intervals"], 1),
-                    data_wait_seconds_max=state["wait_max"],
-                    data_wait_fraction=state["timings"][-1] / max(state["timings"][-1] + state["application"], 1e-9),
-                )
+                values = {}
                 if batches:
+                    values["samples_per_second"] = samples / elapsed
                     for name, total in zip(STAGES, state["timings"]):
-                        values[f"{name}_seconds_mean"] = total / batches
+                        if name in REPORTED_STAGES:
+                            values[f"{name}_seconds_mean"] = total / batches
+                if state["intervals"]:
+                    values["application_seconds_mean"] = state["application"] / state["intervals"]
+                if state["errors"] != state["reported_errors"]:
+                    values["errors_total"] = state["errors"]
                 for name, value in values.items():
                     result.append((state["step"], prefix + quote(stream, safe="") + "/" + name, value))
-                state.update(window_batches=0, window_samples=0, application=0.0,
-                             intervals=0, dirty=False, timings=[0.0] * len(STAGES), wait_max=0.0, since=now)
+                state.update(batches=0, samples=0, application=0.0, intervals=0,
+                             reported_errors=state["errors"], timings=[0.0] * len(STAGES), since=now)
             for name, (count, total) in self._events.items():
                 result.append((0, prefix + name, total / count))
             self._events.clear()

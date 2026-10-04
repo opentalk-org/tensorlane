@@ -116,11 +116,21 @@
               fi
             '';
 
+            processes.server.command = "server";
+
             scripts.server = {
               description = "The main server.";
               runtimeInputs = [ pkgs.cargo ];
               text = ''
-                cargo run --bin tensorlane
+                cd "$DNVR_ROOT"
+                if [ -f .env ]; then
+                  set -a
+                  # shellcheck source=/dev/null
+                  . ./.env
+                  set +a
+                fi
+                unset NIX_CFLAGS_COMPILE CFLAGS CXXFLAGS
+                exec cargo run --bin tensorlane
               '';
             };
           };

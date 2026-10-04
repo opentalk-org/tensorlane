@@ -45,7 +45,6 @@ impl RunState {
                 rows,
                 &cache.join("plans").join(format!("{index}.plan")),
                 query.repeat,
-                query.batches,
             )
             .await?;
             plans.push((name.clone(), sampler));

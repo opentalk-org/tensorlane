@@ -46,3 +46,7 @@ Application dataset tables are excluded from active schema management. Historica
 migrations remain intact and no dataset contents are dropped. Automatic schema
 application skips table and column drops; the configuration retirement must run
 through the committed, ordered migrations.
+
+Historical migration files still describe the original application dataset tables.
+Their checksums and compatibility exclusions are preserved for existing installs;
+the current declared schema and runtime do not depend on those tables.

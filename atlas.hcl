@@ -5,6 +5,7 @@ locals {
 
 env "local" {
   src     = local.schema_dir
+  # Compatibility exclusions for application tables in historical migrations.
   exclude = ["default.audio_files", "default.audio_segments", "default.audio_waveforms", "default.dataset_audio_files", "default.datasets", "default.bucket_files", "default.configs", "default.statistics_entries", "default.mos_comparisons", "default.example_samples"]
   diff {
     skip {
@@ -22,6 +23,7 @@ env "local" {
 
 env "migration" {
   src     = local.schema_dir
+  # Compatibility exclusions for application tables in historical migrations.
   exclude = ["default.audio_files", "default.audio_segments", "default.audio_waveforms", "default.dataset_audio_files", "default.datasets", "default.bucket_files", "default.configs", "default.statistics_entries", "default.mos_comparisons", "default.example_samples"]
   diff {
     skip {

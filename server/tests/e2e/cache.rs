@@ -1,4 +1,4 @@
-use crate::setup::{TestEnv, eventually, files, run_config};
+use crate::setup::{TestEnv, eventually, files, query, run_config};
 use anyhow::Result;
 use bytes::Bytes;
 use serde_json::json;
@@ -34,7 +34,7 @@ async fn assets_are_cached_unchanged_and_initialization_failure_cleans_up() -> R
     let body = Bytes::from(vec![29; 3 * 1024 * 1024 + 13]);
     env.put_object("inputs/model", body.clone()).await?;
     let mut config = run_config(dataset, 1);
-    config["assets"] = json!({"model":{"object":"inputs/model"}});
+    config["tensorlane"]["assets"] = json!({"model":{"object":"inputs/model"}});
     let id = env.create_run(config).await?;
     env.init_run(&id).await?;
     env.s3
@@ -46,7 +46,7 @@ async fn assets_are_cached_unchanged_and_initialization_failure_cleans_up() -> R
     assert_eq!(env.asset(&id, "model").await?.1, body);
     env.end_run(&id).await?;
     let mut invalid = run_config(dataset, 1);
-    invalid["assets"] = json!({"missing":{"object":"does-not-exist"}});
+    invalid["tensorlane"]["assets"] = json!({"missing":{"object":"does-not-exist"}});
     let failed = env.create_run(invalid).await?;
     assert!(env.init_run(&failed).await.is_err());
     assert!(!env.run_cache(&failed).exists());
@@ -57,7 +57,7 @@ async fn missing_blob_fails_instead_of_skipping_a_batch() -> Result<()> {
     let env = TestEnv::start().await?;
     let dataset = env.seed_dataset(2).await?;
     let mut config = run_config(dataset, 1);
-    config["queries"]["training"] = json!(
+    query(&mut config, "training")["sql"] = json!(
         "SELECT 'missing' AS sample_id,toUInt64(0) AS batch_idx,toUInt64(0) AS sample_idx,'{}' AS metadata_json,'{\"payload\":{\"object\":\"missing\"}}' AS blobs_json"
     );
     let id = env.create_run(config).await?;
@@ -75,7 +75,7 @@ async fn oversized_batches_and_short_ranges_propagate_loading_errors() -> Result
     env.put_object("oversized", Bytes::from(vec![1; 64 * 1024 * 1024]))
         .await?;
     let mut config = run_config(dataset, 1);
-    config["queries"]["training"] = json!(
+    query(&mut config, "training")["sql"] = json!(
         "SELECT 'big' AS sample_id,toUInt64(0) AS batch_idx,toUInt64(0) AS sample_idx,'{}' AS metadata_json,'{\"payload\":{\"object\":\"oversized\"}}' AS blobs_json"
     );
     let run = env.create_run(config.clone()).await?;
@@ -84,7 +84,7 @@ async fn oversized_batches_and_short_ranges_propagate_loading_errors() -> Result
     assert!(error.contains("64 MiB"), "{error}");
     env.end_run(&run).await?;
     env.put_object("short", Bytes::from_static(b"abc")).await?;
-    config["queries"]["training"] = json!(
+    query(&mut config, "training")["sql"] = json!(
         "SELECT 'range' AS sample_id,toUInt64(0) AS batch_idx,toUInt64(0) AS sample_idx,'{}' AS metadata_json,'{\"payload\":{\"object\":\"short\",\"byte_offset\":1,\"byte_length\":8}}' AS blobs_json"
     );
     let run = env.create_run(config).await?;

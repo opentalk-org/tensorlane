@@ -27,15 +27,15 @@ def main():
             rank=accelerator.local_process_index,
             start_daemon=accelerator.is_local_main_process,
         ) as lane:
-            set_seed(lane.config["seed"])
+            set_seed(lane.config["app"]["seed"])
             model = torch.nn.Linear(1, 1)
             optimizer = torch.optim.SGD(
-                model.parameters(), lr=lane.config["optimizer"]["learning_rate"]
+                model.parameters(), lr=lane.config["app"]["optimizer"]["learning_rate"]
             )
             model, optimizer = accelerator.prepare(model, optimizer)
             completed = 0
             with (
-                lane.batches() as batches,
+                lane.batches("training") as batches,
                 model.join() if accelerator.num_processes > 1 else nullcontext(),
             ):
                 for batch in batches:
@@ -47,10 +47,11 @@ def main():
                     completed += len(batch)
                     lane.metric(batch.batch_id, f"rank/{lane.rank}/loss", loss.item())
             count = torch.tensor(completed, device=accelerator.device)
-            offset = lane.config["params"]["dataset_offset"]
+            query = next(q for q in lane.config["queries"] if q["key"] == "training")
+            offset = query["params"]["dataset_offset"]
             offset += accelerator.reduce(count, reduction="sum").item()
             if accelerator.is_main_process:
-                output = Path(lane.config["output_dir"])
+                output = Path(lane.config["app"]["output_dir"])
                 output.mkdir(parents=True, exist_ok=True)
                 weights = output / "weights.pt"
                 accelerator.save(accelerator.unwrap_model(model).state_dict(), weights)

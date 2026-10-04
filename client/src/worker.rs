@@ -53,13 +53,22 @@ pub struct Settings {
 impl Settings {
     fn resolve(options: &Options, config: &str) -> anyhow::Result<Self> {
         let config: serde_json::Map<String, serde_json::Value> = serde_json::from_str(config)?;
+        let settings = match config.get("tensorlane") {
+            Some(value) => Some(
+                value
+                    .as_object()
+                    .context("config.tensorlane must be an object")?,
+            ),
+            None => None,
+        };
         let count =
             |name: &str, explicit: Option<usize>, default: usize| -> anyhow::Result<usize> {
                 let value = match explicit {
                     Some(value) => value,
-                    None => match config.get(name) {
+                    None => match settings.and_then(|settings| settings.get(name)) {
+                        Some(value) if value.is_null() => default,
                         Some(value) => usize::try_from(value.as_u64().with_context(|| {
-                            format!("config.{name} must be a positive integer")
+                            format!("config.tensorlane.{name} must be a positive integer")
                         })?)?,
                         None => default,
                     },
@@ -491,4 +500,59 @@ async fn end_run(
         .await
         .context("End RPC failed")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::{Options, Settings};
+
+    fn options() -> Options {
+        Options {
+            run_id: "settings-test".into(),
+            addr: String::new(),
+            root: Default::default(),
+            ranks: None,
+            factor: None,
+            num_workers: None,
+            rank: 0,
+        }
+    }
+
+    #[test]
+    fn nested_runtime_config_uses_eight_workers_and_prefetch_eight() {
+        let config = r#"{
+            "tensorlane": {"num_workers": 8, "prefetch_factor": 8},
+            "app": {"num_workers": 99, "prefetch_factor": 99}
+        }"#;
+        let settings = Settings::resolve(&options(), config).unwrap();
+        assert_eq!(
+            (settings.ranks, settings.num_workers, settings.factor),
+            (1, 8, 8)
+        );
+    }
+
+    #[test]
+    fn explicit_arguments_override_nested_runtime_config() {
+        let mut options = options();
+        options.ranks = Some(2);
+        options.num_workers = Some(3);
+        options.factor = Some(4);
+        options.rank = 1;
+        let config = r#"{"tensorlane": {"ranks": 1, "num_workers": 8, "prefetch_factor": 8}}"#;
+        let settings = Settings::resolve(&options, config).unwrap();
+        assert_eq!(
+            (settings.ranks, settings.num_workers, settings.factor),
+            (2, 3, 4)
+        );
+    }
+
+    #[test]
+    fn missing_runtime_config_uses_defaults_and_ignores_app_fields() {
+        let config = r#"{"app": {"ranks": 2, "num_workers": 8, "prefetch_factor": 8}}"#;
+        let settings = Settings::resolve(&options(), config).unwrap();
+        assert_eq!(
+            (settings.ranks, settings.num_workers, settings.factor),
+            (1, 5, 2)
+        );
+    }
 }
