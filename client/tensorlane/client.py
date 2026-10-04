@@ -288,6 +288,7 @@ def init(
     num_workers: int | None = None,
     collate_fn=None,
     addr: str | None = None,
+    api_key: str | None = None,
     ipc_dir: str | Path | None = None,
     timeout: float | None = None,
     performance_metrics: bool = True,
@@ -355,6 +356,7 @@ def init(
         prefetch_factor,
         num_workers,
         rank,
+        api_key if api_key is not None else os.environ.get("TENSORLANE_API_KEY"),
     )
     daemon = TensorLane(
         root,

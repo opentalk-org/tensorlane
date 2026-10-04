@@ -55,8 +55,22 @@ def wait_for(check, timeout=15):
         time.sleep(0.02)
 
 
+class Authorization(grpc.ServerInterceptor):
+    def __init__(self, key):
+        self.key = key
+        self.methods = set()
+
+    def intercept_service(self, continuation, details):
+        if dict(details.invocation_metadata).get("authorization") != f"Bearer {self.key}":
+            def deny(request, context):
+                context.abort(grpc.StatusCode.UNAUTHENTICATED, "Unauthorized")
+            return grpc.unary_unary_rpc_method_handler(deny)
+        self.methods.add(details.method.rsplit("/", 1)[-1])
+        return continuation(details)
+
+
 class Fixture(rpc.TensorLaneServicer):
-    def __init__(self):
+    def __init__(self, authorization=None):
         self.streams = {"training": 5, "validation": 3, "evaluation": 2}
         self.config = {
             "queries": [{"key": key, "sql": "SELECT ..."} for key in self.streams],
@@ -91,6 +105,7 @@ class Fixture(rpc.TensorLaneServicer):
         self.lock = threading.Lock()
         self.server = grpc.server(
             ThreadPoolExecutor(max_workers=12),
+            interceptors=[authorization] if authorization else [],
             options=[("grpc.max_send_message_length", 80 * 1024 * 1024)],
         )
         rpc.add_TensorLaneServicer_to_server(self, self.server)
@@ -290,6 +305,25 @@ class PipelineTests(unittest.TestCase):
                 for item in archive.getmembers()
                 if item.isfile()
             }
+
+    def test_api_key_from_environment_authenticates_every_rpc(self):
+        key = "0123456789abcdef0123456789abcdef"
+        auth = Authorization(key)
+        self.service.close()
+        self.service = Fixture(auth)
+        self.service.assets = {"model": (str(uuid.uuid4()), b"input")}
+        with patch.dict("os.environ", {"TENSORLANE_API_KEY": key}):
+            self.start()
+        wait_for(lambda: "Heartbeat" in auth.methods)
+        self.daemon.metric(1, "loss", 0.5)
+        self.daemon.save_asset("model", self.file())
+        self.daemon.flush()
+        with self.daemon.batches("training") as batches:
+            list(batches)
+        self.daemon.close()
+        self.assertEqual(auth.methods, {"Init", "Data", "Asset", "SaveAsset", "Metrics", "Heartbeat", "End"})
+        with self.assertRaisesRegex(RuntimeError, "Unauthorized"):
+            self.start()
 
     def test_config_callbacks_and_three_streams(self):
         self.start(collate_fn={"training": collate})

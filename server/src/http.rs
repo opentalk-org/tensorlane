@@ -93,8 +93,20 @@ struct RunResponse {
 pub async fn serve(
     port: u16,
     run_repo: RunRepo,
+    auth: crate::auth::Auth,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
+    let app = router(run_repo, auth);
+    let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    info!(%address, "HTTP server listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown.cancelled_owned())
+        .await?;
+    Ok(())
+}
+
+fn router(run_repo: RunRepo, auth: crate::auth::Auth) -> Router {
     let app = Router::new()
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run))
@@ -108,14 +120,12 @@ pub async fn serve(
             )
         })
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            auth,
+            crate::auth::http,
+        ))
         .with_state(run_repo);
-    let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    info!(%address, "HTTP server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await?;
-    Ok(())
+    app
 }
 
 async fn create_run(
@@ -207,4 +217,77 @@ async fn run_assets(
         .map(|asset| asset.info())
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Json(assets))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn authentication_covers_routes_fallbacks_and_wrong_methods() {
+        let app = router(
+            RunRepo::new(clickhouse::Client::default()),
+            crate::auth::Auth::new(Some(KEY), false).unwrap(),
+        );
+        for (method, path) in [
+            ("GET", "/runs"),
+            ("POST", "/runs"),
+            ("GET", "/runs/invalid"),
+            ("GET", "/runs/invalid/assets"),
+            ("GET", "/assets/invalid"),
+            ("GET", "/unknown"),
+            ("DELETE", "/runs"),
+            ("OPTIONS", "/runs"),
+        ] {
+            for value in [None, Some("Bearer wrong")] {
+                let mut request = Request::builder().method(method).uri(path);
+                if let Some(value) = value {
+                    request = request.header("authorization", value);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path}"
+                );
+                assert_eq!(response.headers()["www-authenticate"], "Bearer");
+            }
+        }
+        let request = Request::builder()
+            .uri("/runs/invalid")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let request = Request::builder()
+            .uri("/unknown")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        let request = Request::builder()
+            .uri("/unknown")
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("authorization", "Bearer wrong")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
 }

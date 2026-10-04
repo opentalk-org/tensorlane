@@ -3,7 +3,6 @@ use crate::{
     proto::{
         ArtifactChunk, ArtifactMetric, MetricsRequest, MetricsResponse, MetricsStreamMetadata,
         SaveAssetMetadata, SaveAssetRequest, ScalarMetric, metrics_request, save_asset_request,
-        tensor_lane_client::TensorLaneClient,
     },
 };
 use anyhow::{Context, anyhow, bail, ensure};
@@ -27,7 +26,6 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
-use tonic::transport::Channel;
 
 const CHUNK_SIZE: usize = 1024 * 1024;
 
@@ -292,7 +290,7 @@ impl UploadClient {
 
 pub async fn serve(
     listener: UnixListener,
-    grpc: TensorLaneClient<Channel>,
+    grpc: crate::transport::GrpcClient,
     run_id: String,
     stopping: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -330,7 +328,7 @@ pub async fn serve(
 
 async fn receive(
     socket: UnixStream,
-    grpc: TensorLaneClient<Channel>,
+    grpc: crate::transport::GrpcClient,
     run_id: String,
     stopping: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -449,7 +447,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(mut grpc: TensorLaneClient<Channel>, run_id: String, automatic: bool) -> Self {
+    fn new(mut grpc: crate::transport::GrpcClient, run_id: String, automatic: bool) -> Self {
         let (sender, receiver) = mpsc::channel(4);
         let stream = tokio_stream::StreamExt::chain(
             tokio_stream::once(MetricsRequest {
@@ -533,7 +531,7 @@ impl Metrics {
 }
 
 async fn save_asset(
-    mut grpc: TensorLaneClient<Channel>,
+    mut grpc: crate::transport::GrpcClient,
     mut metadata: SaveAssetMetadata,
     path: PathBuf,
 ) -> anyhow::Result<()> {

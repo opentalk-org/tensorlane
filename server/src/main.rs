@@ -2,7 +2,7 @@ use std::{io, path::PathBuf};
 
 use anyhow::Context;
 use aws_config::{BehaviorVersion, retry::RetryConfig};
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{Credentials, Region};
 use clap::{
     CommandFactory, FromArgMatches, Parser, Subcommand,
     builder::{
@@ -17,6 +17,7 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 mod asset_repo;
+mod auth;
 mod db;
 mod grpc;
 mod http;
@@ -54,6 +55,18 @@ const STYLES: Styles = Styles::styled()
 struct Args {
     #[command(subcommand)]
     command: Option<Command>,
+    #[arg(long, env = "TENSORLANE_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+    #[arg(
+        long,
+        env = "TENSORLANE_ALLOW_UNAUTHENTICATED",
+        help = "Disable authentication for local development only."
+    )]
+    allow_unauthenticated: bool,
+    #[arg(long, env = "GRPC_TLS_CERT_FILE", requires = "grpc_tls_key_file")]
+    grpc_tls_cert_file: Option<PathBuf>,
+    #[arg(long, env = "GRPC_TLS_KEY_FILE", requires = "grpc_tls_cert_file")]
+    grpc_tls_key_file: Option<PathBuf>,
     #[arg(
         short,
         long,
@@ -89,6 +102,13 @@ struct Args {
     http_port: u16,
     #[arg(long, env = "AWS_ENDPOINT_URL", help = "Endpoint to S3 bucket.")]
     s3_endpoint: String,
+    #[arg(
+        long,
+        env = "AWS_REGION",
+        default_value = "auto",
+        help = "S3 signing region."
+    )]
+    s3_region: String,
     #[arg(long, env = "AWS_ACCESS_KEY_ID", help = "S3 access key ID.")]
     s3_key: String,
     #[arg(long, env = "AWS_SECRET_ACCESS_KEY", help = "S3 secret key.")]
@@ -137,6 +157,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let args = Args::from_arg_matches(&matches)?;
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let auth = auth::Auth::new(args.api_key.as_deref(), args.allow_unauthenticated)?;
+    let grpc_tls = match (args.grpc_tls_cert_file, args.grpc_tls_key_file) {
+        (Some(cert), Some(key)) => Some(tonic::transport::Identity::from_pem(
+            fs::read(cert)
+                .await
+                .context("reading gRPC TLS certificate")?,
+            fs::read(key)
+                .await
+                .context("reading gRPC TLS private key")?,
+        )),
+        (None, None) => None,
+        _ => anyhow::bail!("gRPC TLS requires both certificate and private key files"),
+    };
 
     let database = clickhouse::Client::default()
         .with_url(&args.clickhouse_url)
@@ -156,7 +190,7 @@ async fn main() -> anyhow::Result<()> {
             None,
             "r2",
         ))
-        .region("")
+        .region(Region::new(args.s3_region))
         .load()
         .await;
     let s3_client = aws_sdk_s3::Client::from_conf(
@@ -187,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
     let mut http_server = tokio::spawn(http::serve(
         args.http_port,
         run_repo.clone(),
+        auth.clone(),
         http_shutdown.clone(),
     ));
     let mut grpc_server = tokio::spawn(grpc::serve(
@@ -199,6 +234,8 @@ async fn main() -> anyhow::Result<()> {
         uploads_cache_dir,
         args.checkpoint_prefix.leak(),
         args.metrics_prefix.leak(),
+        auth,
+        grpc_tls,
         shutdown.clone(),
     ));
     tokio::select! {

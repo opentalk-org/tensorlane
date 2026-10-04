@@ -7,6 +7,7 @@ mod client;
 mod data;
 mod ipc;
 mod semaphore;
+mod transport;
 mod uploads;
 mod worker;
 

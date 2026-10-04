@@ -42,19 +42,7 @@
 
           packages = {
             default = self'.packages.server;
-            server =
-              let
-                manifest = (pkgs.lib.importTOML ./server/Cargo.toml).package;
-              in
-              pkgs.rustPlatform.buildRustPackage {
-                pname = manifest.name;
-                version = manifest.version;
-                cargoLock = {
-                  lockFile = ./Cargo.lock;
-                };
-                src = ./.;
-                buildAndTestSubdir = "server";
-              };
+            server = import ./nix/server.nix { inherit pkgs; src = ./.; };
           };
 
           dnvr.specialArgs = { inherit inputs system; };
@@ -74,6 +62,7 @@
               pkgs.rustfmt
 
               pkgs.protobuf
+              pkgs.openssl
 
               atlas
             ];
@@ -84,6 +73,7 @@
               CLICKHOUSE_PASSWORD = "";
               GRPC_PORT = "8181";
               HTTP_PORT = "8180";
+              TENSORLANE_ALLOW_UNAUTHENTICATED = "true";
 
               AWS_ENDPOINT_URL = "http://127.0.0.1:9001";
               AWS_ACCESS_KEY_ID = "tensorlane";

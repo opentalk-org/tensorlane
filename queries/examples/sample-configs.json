@@ -9,8 +9,9 @@
       "asset_type": "model",
       "assets": {}
     },
-    "queries": {
-      "train": {
+    "queries": [
+      {
+        "key": "training",
         "sql": "WITH ordered AS (\n    SELECT sample_id, metadata_json, blobs_json,\n        toUInt64(row_number() OVER (ORDER BY cityHash64({seed:UInt64}, sample_id), sample_id) - 1) AS position\n    FROM example_samples\n    WHERE dataset_id = {dataset_id:UUID}\n)\nSELECT sample_id,\n    toUInt64(intDiv(position - {dataset_offset:UInt64}, {batch_size:UInt64})) AS batch_idx,\n    position AS sample_idx,\n    metadata_json, blobs_json\nFROM ordered\nWHERE position >= {dataset_offset:UInt64}\n  AND position < {dataset_offset:UInt64} + {batches:UInt64} * {batch_size:UInt64}\nORDER BY batch_idx, sample_idx\n",
         "params": {
           "dataset_id": "e25b39ac-3400-4f9f-9fac-3e9c94e1a92b",
@@ -21,7 +22,8 @@
         },
         "repeat": false
       },
-      "validation": {
+      {
+        "key": "validation",
         "sql": "SELECT sample_id,\n    toUInt64(intDiv(position, {batch_size:UInt64})) AS batch_idx,\n    position AS sample_idx,\n    metadata_json, blobs_json\nFROM (\n    SELECT sample_id, metadata_json, blobs_json,\n        toUInt64(row_number() OVER (ORDER BY sample_id) - 1) AS position\n    FROM example_samples\n    WHERE dataset_id = {dataset_id:UUID}\n    ORDER BY sample_id\n    LIMIT {samples:UInt64}\n)\nORDER BY batch_idx, sample_idx\n",
         "params": {
           "dataset_id": "e25b39ac-3400-4f9f-9fac-3e9c94e1a92b",
@@ -32,7 +34,7 @@
         },
         "repeat": true
       }
-    },
+    ],
     "app": {
       "optimizer": {
         "learning_rate": 0.0001

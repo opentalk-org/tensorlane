@@ -142,6 +142,7 @@ impl TestEnv {
         Self::start_with_history(None).await
     }
     pub async fn start_with_history(history: Option<(Uuid, Value, Value)>) -> Result<Self> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let temp = tempfile::tempdir()?;
         let mut services = Services::default();
         let (clickhouse_url, s3_url) = if std::env::var_os("TENSORLANE_TEST_LOCAL").is_some() {
@@ -301,6 +302,8 @@ impl TestEnv {
                 "test",
                 "--s3-endpoint",
                 &s3_url,
+                "--s3-region",
+                "us-east-1",
                 "--s3-key",
                 "minioadmin",
                 "--s3-secret",
@@ -316,6 +319,10 @@ impl TestEnv {
                 "--metrics-prefix",
                 "metrics",
             ])
+            .arg("--allow-unauthenticated")
+            .env_remove("TENSORLANE_API_KEY")
+            .env_remove("GRPC_TLS_CERT_FILE")
+            .env_remove("GRPC_TLS_KEY_FILE")
             .arg("--cache-dir")
             .arg(&cache_dir)
             .env("RUST_LOG", "tensorlane=warn")

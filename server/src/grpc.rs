@@ -353,6 +353,8 @@ pub async fn serve(
     uploads_dir: &'static Path,
     checkpoint_prefix: &'static str,
     metrics_prefix: &'static str,
+    auth: crate::auth::Auth,
+    tls: Option<tonic::transport::Identity>,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     info!("listening on 0.0.0.0:{port}");
@@ -374,12 +376,17 @@ pub async fn serve(
         uploads.clone(),
         shutdown,
     );
-    let result = Server::builder()
-        .add_service(
+    let mut server = Server::builder();
+    if let Some(identity) = tls {
+        server = server.tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))?;
+    }
+    let result = server
+        .add_service(tonic::service::interceptor::InterceptedService::new(
             TensorLaneServer::new(service.clone())
                 .max_decoding_message_size(MAX_BATCH_BYTES)
                 .max_encoding_message_size(MAX_BATCH_BYTES),
-        )
+            auth,
+        ))
         .serve_with_shutdown(
             SocketAddr::from((Ipv4Addr::new(0, 0, 0, 0), port)),
             service.wait(),

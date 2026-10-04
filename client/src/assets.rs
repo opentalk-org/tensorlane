@@ -1,6 +1,4 @@
-use crate::proto::{
-    AssetRequest, InitResponse, asset_response::Payload, tensor_lane_client::TensorLaneClient,
-};
+use crate::proto::{AssetRequest, InitResponse, asset_response::Payload};
 use anyhow::Context;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use std::{
@@ -8,10 +6,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use tokio::{fs, io::AsyncWriteExt};
-use tonic::transport::Channel;
 
 pub async fn prefetch(
-    grpc: &TensorLaneClient<Channel>,
+    grpc: &crate::transport::GrpcClient,
     initialized: &InitResponse,
     root: &Path,
 ) -> anyhow::Result<(HashMap<String, PathBuf>, HashMap<String, String>)> {
@@ -38,7 +35,7 @@ pub async fn prefetch(
     Ok((paths, metadata))
 }
 async fn download(
-    mut grpc: TensorLaneClient<Channel>,
+    mut grpc: crate::transport::GrpcClient,
     run_id: &str,
     name: &str,
     destination: PathBuf,

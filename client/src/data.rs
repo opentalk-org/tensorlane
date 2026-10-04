@@ -1,7 +1,4 @@
-use crate::{
-    proto::{DataRequest, tensor_lane_client::TensorLaneClient},
-    semaphore::BatchBudget,
-};
+use crate::{proto::DataRequest, semaphore::BatchBudget};
 use anyhow::{Context, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -12,7 +9,6 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tonic::transport::Channel;
 
 #[derive(Serialize, Deserialize)]
 pub enum Work {
@@ -51,7 +47,7 @@ impl Drop for Requests {
     }
 }
 pub async fn prefetch(
-    mut grpc: TensorLaneClient<Channel>,
+    mut grpc: crate::transport::GrpcClient,
     run_id: String,
     stream_name: String,
     budget: Arc<BatchBudget>,

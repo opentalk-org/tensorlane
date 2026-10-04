@@ -1,3 +1,4 @@
+mod auth;
 mod cache;
 mod flow;
 mod metrics;

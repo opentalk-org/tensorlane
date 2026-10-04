@@ -1,10 +1,7 @@
 use crate::{
     data::{Work, prefetch},
     ipc::Sender,
-    proto::{
-        EndRequest, HeartbeatRequest, InitRequest, InitResponse,
-        tensor_lane_client::TensorLaneClient,
-    },
+    proto::{EndRequest, HeartbeatRequest, InitRequest, InitResponse},
     semaphore::BatchBudget,
 };
 use anyhow::{Context, anyhow, ensure};
@@ -27,11 +24,11 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tonic::transport::{Channel, Endpoint};
 
 pub struct Options {
     pub run_id: String,
     pub addr: String,
+    pub api_key: Option<String>,
     pub root: PathBuf,
     pub ranks: Option<usize>,
     pub factor: Option<usize>,
@@ -280,21 +277,10 @@ async fn supervise(
 ) -> anyhow::Result<()> {
     let work_listener = UnixListener::bind(options.root.join("work.sock"))?;
     let upload_listener = UnixListener::bind(options.root.join("uploads.sock"))?;
-    let url = if options.addr.contains("://") {
-        options.addr.clone()
-    } else {
-        format!("http://{}", options.addr)
-    };
     let mut remote = None;
     let mut heartbeat = None;
     let startup = async {
-        let channel = Endpoint::from_shared(url)?
-            .connect_timeout(Duration::from_secs(10))
-            .connect()
-            .await?;
-        let mut grpc = TensorLaneClient::new(channel)
-            .max_decoding_message_size(crate::MAX_BATCH_BYTES)
-            .max_encoding_message_size(crate::MAX_BATCH_BYTES);
+        let mut grpc = crate::transport::connect(&options.addr, options.api_key.as_deref()).await?;
         let initialized = grpc
             .init(InitRequest {
                 run_id: options.run_id.clone(),
@@ -475,7 +461,7 @@ async fn supervise(
 }
 
 async fn send_heartbeats(
-    mut grpc: TensorLaneClient<Channel>,
+    mut grpc: crate::transport::GrpcClient,
     run_id: String,
 ) -> anyhow::Result<()> {
     loop {
@@ -492,7 +478,7 @@ async fn send_heartbeats(
 }
 
 async fn end_run(
-    mut grpc: TensorLaneClient<Channel>,
+    mut grpc: crate::transport::GrpcClient,
     run_id: String,
     failed: bool,
 ) -> anyhow::Result<()> {
@@ -510,6 +496,7 @@ mod settings_tests {
         Options {
             run_id: "settings-test".into(),
             addr: String::new(),
+            api_key: None,
             root: Default::default(),
             ranks: None,
             factor: None,
