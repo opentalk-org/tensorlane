@@ -6,7 +6,6 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tonic::{Request as GrpcRequest, Status, service::Interceptor};
 
 #[derive(Clone)]
 pub struct Auth {
@@ -57,17 +56,6 @@ pub async fn http(State(auth): State<Auth>, request: Request, next: Next) -> Res
     next.run(request).await
 }
 
-impl Interceptor for Auth {
-    fn call(&mut self, request: GrpcRequest<()>) -> Result<GrpcRequest<()>, Status> {
-        let mut values = request.metadata().get_all("authorization").iter();
-        let value = values.next().and_then(|value| value.to_str().ok());
-        if values.next().is_some() || !self.accepts(value) {
-            return Err(Status::unauthenticated("Unauthorized"));
-        }
-        Ok(request)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,9 +64,8 @@ mod tests {
 
     #[test]
     fn authentication_is_optional_but_configured_keys_are_enforced() {
-        let mut anonymous = Auth::new(None).unwrap();
+        let anonymous = Auth::new(None).unwrap();
         assert!(anonymous.accepts(None));
-        assert!(anonymous.call(GrpcRequest::new(())).is_ok());
         for key in ["", "short", "0123456789abcdef0123456789abcdef\n"] {
             assert!(Auth::new(Some(key)).is_err());
         }
@@ -86,35 +73,11 @@ mod tests {
     }
 
     #[test]
-    fn grpc_rejects_missing_wrong_and_duplicate_credentials() {
-        let mut auth = Auth::new(Some(KEY)).unwrap();
+    fn accepts_only_matching_bearer_credentials() {
+        let auth = Auth::new(Some(KEY)).unwrap();
         for value in [None, Some("Basic ignored"), Some("Bearer wrong")] {
-            let mut request = GrpcRequest::new(());
-            if let Some(value) = value {
-                request
-                    .metadata_mut()
-                    .insert("authorization", value.parse().unwrap());
-            }
-            assert_eq!(
-                auth.call(request).unwrap_err().code(),
-                tonic::Code::Unauthenticated
-            );
+            assert!(!auth.accepts(value));
         }
-        let mut request = GrpcRequest::new(());
-        request
-            .metadata_mut()
-            .insert("authorization", format!("bearer {KEY}").parse().unwrap());
-        assert!(auth.call(request).is_ok());
-        let mut request = GrpcRequest::new(());
-        request
-            .metadata_mut()
-            .insert("authorization", format!("Bearer {KEY}").parse().unwrap());
-        request
-            .metadata_mut()
-            .append("authorization", "Bearer wrong".parse().unwrap());
-        assert_eq!(
-            auth.call(request).unwrap_err().code(),
-            tonic::Code::Unauthenticated
-        );
+        assert!(auth.accepts(Some(&format!("bearer {KEY}"))));
     }
 }

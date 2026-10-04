@@ -1,3 +1,4 @@
+mod runtime;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use axum::{
@@ -41,13 +42,13 @@ struct ErrorResponse {
     message: String,
 }
 
-struct AppError {
+pub(super) struct AppError {
     status: StatusCode,
     error: anyhow::Error,
 }
 
 impl AppError {
-    fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
+    pub(super) fn new(status: StatusCode, error: impl Into<anyhow::Error>) -> Self {
         Self {
             status,
             error: error.into(),
@@ -66,7 +67,7 @@ where
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        if self.status.is_server_error() {
+        if self.status == StatusCode::INTERNAL_SERVER_ERROR {
             error!(error = format!("{:#}", self.error), "HTTP request failed");
         }
         (
@@ -95,8 +96,11 @@ pub async fn serve(
     run_repo: RunRepo,
     auth: crate::auth::Auth,
     shutdown: CancellationToken,
+    runtime: crate::runtime::Runtime,
 ) -> anyhow::Result<()> {
-    let app = router(run_repo, auth);
+    let app = router(run_repo, auth.clone())
+        .merge(runtime::router(runtime, auth))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(64));
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, "HTTP server listening");
@@ -107,7 +111,7 @@ pub async fn serve(
 }
 
 fn router(run_repo: RunRepo, auth: crate::auth::Auth) -> Router {
-    let app = Router::new()
+    Router::new()
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run))
         .route("/runs/{run_id}/assets", get(run_assets))
@@ -124,8 +128,7 @@ fn router(run_repo: RunRepo, auth: crate::auth::Auth) -> Router {
             auth,
             crate::auth::http,
         ))
-        .with_state(run_repo);
-    app
+        .with_state(run_repo)
 }
 
 async fn create_run(
@@ -133,6 +136,12 @@ async fn create_run(
     request: Result<Json<CreateRunRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), AppError> {
     let Json(request) = request.map_err(|err| AppError::new(err.status(), err))?;
+    if !request.config.get("queries").is_some_and(Value::is_object) {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            anyhow::anyhow!("config.queries must map stream names to query objects"),
+        ));
+    }
     Config::parse(&request.config).map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err))?;
     let run_id = run_repo
         .create(request.project_id, &request.name, &request.config)

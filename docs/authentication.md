@@ -3,30 +3,22 @@
 The server runs without authentication by default. Set `TENSORLANE_API_KEY` to
 require a shared key. Generate one with `openssl rand -hex 32`. Keys must contain
 at least 32 printable ASCII characters without whitespace. All key holders have
-access to every run, query, asset, and metric; the shared key does not provide user or project isolation.
+access to every run, query, asset, and metric.
 
-When authentication is enabled, HTTP requests use `Authorization: Bearer <key>`.
-Missing, invalid, or duplicate authorization headers return HTTP 401. Every gRPC
-method, including streaming methods, uses the same header in request metadata and returns `UNAUTHENTICATED`
-when credentials are missing or invalid. Keys are compared using constant-time
-comparison of their SHA-256 digests.
+All endpoints use `Authorization: Bearer <key>` when a key is configured.
+Missing, invalid, or duplicate authorization headers return HTTP 401. This also
+covers downloads, uploads, metrics, heartbeats, run completion, unknown routes,
+and unsupported methods. Keys are compared using constant-time comparison of
+their SHA-256 digests.
 
 The Python client reads `TENSORLANE_API_KEY`, or accepts `api_key=` in
-`tensorlane.init`. It attaches the key to all RPCs, including downloads, uploads,
-metrics, heartbeats, and run completion. Secrets are not written to IPC metadata.
-Both `http://` and `https://` addresses are supported with or without an API key.
-A bare `host:port` address uses HTTP. HTTPS verifies the server certificate against
-the system trust store. Use HTTPS for public connections: HTTP transmits the API
-key and request data in plaintext.
+`tensorlane.init`. Secrets are not written to IPC metadata.
 
-Authentication and TLS are independent: a configured key enables authentication
-over HTTP or HTTPS. Empty or invalid configured keys fail startup.
+The server listens on HTTP port 8180 by default. Both `http://` and `https://`
+client addresses are supported. A bare `host:port` address uses HTTP. For HTTPS,
+terminate TLS at a reverse proxy and forward every route to the same HTTP port.
+TensorLane does not need certificate files. HTTPS clients verify the certificate
+against their trust store. HTTP sends the key and request data in plaintext.
 
-Native gRPC uses plaintext HTTP by default. To enable TLS, set both
-`GRPC_TLS_CERT_FILE` and `GRPC_TLS_KEY_FILE` to PEM files. The server loads these
-files at startup. After certificate renewal, restart the server between runs to
-load the new certificate. HTTP can be served through a TLS-terminating reverse
-proxy while gRPC uses TLS passthrough.
-
-`AWS_REGION` sets the S3 signing region and defaults to `auto` for R2. Use the
-region required by your S3 provider.
+Authentication and TLS are independent. Empty or invalid configured keys fail
+startup. `AWS_REGION` sets the S3 signing region and defaults to `auto` for R2.

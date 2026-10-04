@@ -34,7 +34,7 @@ pub struct Daemon {
 #[pymethods]
 impl Daemon {
     #[new]
-    #[pyo3(signature=(run_id, addr, root, ranks=None, prefetch_factor=None, num_workers=None, rank=0, api_key=None))]
+    #[pyo3(signature=(run_id, addr, root, ranks=None, prefetch_factor=None, num_workers=None, rank=0, api_key=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -46,6 +46,7 @@ impl Daemon {
         num_workers: Option<usize>,
         rank: usize,
         api_key: Option<String>,
+        timeout: Option<f64>,
     ) -> anyhow::Result<Self> {
         py.allow_threads(|| {
             let (worker, initialized) = Worker::start(Options {
@@ -57,6 +58,9 @@ impl Daemon {
                 factor: prefetch_factor,
                 num_workers,
                 rank,
+                startup_timeout: timeout
+                    .map(std::time::Duration::try_from_secs_f64)
+                    .transpose()?,
             })?;
             Ok(Self {
                 worker: Mutex::new(Some(worker)),

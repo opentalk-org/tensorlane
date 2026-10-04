@@ -13,13 +13,13 @@ use tokio::sync::Semaphore;
 #[async_trait]
 pub trait Loader: Send + Sync {
     async fn load(&self, reference: &BlobRef) -> Result<Bytes>;
-    async fn load_sample(&self, sample: Sample) -> Result<crate::proto::Sample> {
+    async fn load_sample(&self, sample: Sample) -> Result<tensorlane_protocol::Sample> {
         let mut reads = futures::stream::iter(sample.blobs.into_iter().map(
             |(name, reference)| async move {
                 Ok::<_, anyhow::Error>((name, self.load(&reference).await?))
             },
         ))
-        .buffer_unordered(16);
+        .buffer_unordered(2);
         let mut size = sample.sample_id.len() + sample.metadata_json.len();
         let mut blobs = HashMap::new();
         while let Some((name, bytes)) = reads.try_next().await? {
@@ -31,9 +31,9 @@ pub trait Loader: Send + Sync {
                 size <= MAX_BATCH_BYTES,
                 "sample exceeds the 64 MiB batch limit"
             );
-            blobs.insert(name, bytes);
+            blobs.insert(name, bytes.to_vec());
         }
-        Ok(crate::proto::Sample {
+        Ok(tensorlane_protocol::Sample {
             sample_id: sample.sample_id,
             metadata_json: sample.metadata_json,
             blobs,
@@ -51,7 +51,7 @@ impl S3Loader {
         Self {
             s3_client,
             bucket,
-            slots: Arc::new(Semaphore::new(16)),
+            slots: Arc::new(Semaphore::new(4)),
         }
     }
 }
@@ -84,7 +84,9 @@ impl Loader for S3Loader {
         }
         let mut stream = object.body;
         let mut bytes = BytesMut::new();
-        while let Some(chunk) = stream.try_next().await? {
+        while let Some(chunk) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), stream.try_next()).await??
+        {
             ensure!(
                 bytes.len() + chunk.len() <= MAX_BATCH_BYTES,
                 "blob exceeds the 64 MiB batch limit"

@@ -1,0 +1,17 @@
+syntax = "proto3";
+package tensorlane;
+
+message Sample {
+  string sample_id = 6;
+  string metadata_json = 7;
+  map<string, bytes> blobs = 8;
+}
+
+message DataResponse {
+  repeated Sample batch = 1;
+  string stream = 2;
+  uint64 batch_id = 3;
+  uint64 query_batch_idx = 4;
+  double load_seconds = 5;
+  double server_wait_seconds = 6;
+}

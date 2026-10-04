@@ -21,12 +21,9 @@ pub fn stream_samples(
     sql: &str,
     params: &std::collections::BTreeMap<String, Value>,
 ) -> impl Stream<Item = anyhow::Result<SampleRow>> + Send + use<> {
-    let mut query = client.query(sql);
-    for (name, value) in params {
-        query = query.param(name, value);
-    }
+    let query = crate::query_params::bind(client.query(sql), sql, params);
     async_stream::try_stream! {
-        let mut cursor = query.fetch::<SampleRow>()?;
+        let mut cursor = query?.fetch::<SampleRow>()?;
         while let Some(row) = cursor.next().await? {
             yield row;
         }

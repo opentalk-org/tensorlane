@@ -1,117 +1,223 @@
-use anyhow::{Context, ensure};
-use tonic::{
-    Request, Status,
-    metadata::{Ascii, MetadataValue},
-    service::{Interceptor, interceptor::InterceptedService},
-    transport::{Channel, ClientTlsConfig, Endpoint},
+use anyhow::{Context, Result, bail, ensure};
+use futures_util::StreamExt;
+use reqwest::{
+    Method, StatusCode, Url,
+    header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
-
-use crate::proto::tensor_lane_client::TensorLaneClient;
-
-pub type GrpcClient = TensorLaneClient<InterceptedService<Channel, Authorization>>;
+use serde::{Serialize, de::DeserializeOwned};
+use std::time::Duration;
+use tensorlane_protocol::{EndRequest, InitResponse, SESSION_HEADER};
+use tokio::time::Instant;
 
 #[derive(Clone)]
-pub struct Authorization {
-    value: Option<MetadataValue<Ascii>>,
+pub struct HttpClient {
+    client: reqwest::Client,
+    base: Url,
+    session: String,
+    retry_timeout: Duration,
 }
 
-impl Authorization {
-    fn new(key: Option<&str>) -> anyhow::Result<Self> {
-        let value = key
-            .map(|key| {
-                ensure!(
-                    key.len() >= 32 && key.bytes().all(|byte| byte.is_ascii_graphic()),
-                    "API key must contain at least 32 printable ASCII characters without spaces"
-                );
-                let mut value: MetadataValue<Ascii> =
-                    format!("Bearer {key}").parse().context("invalid API key")?;
-                value.set_sensitive(true);
-                anyhow::Ok(value)
-            })
-            .transpose()?;
-        Ok(Self { value })
-    }
-}
-
-impl Interceptor for Authorization {
-    fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
-        if let Some(value) = &self.value {
-            request
-                .metadata_mut()
-                .insert("authorization", value.clone());
-        }
-        Ok(request)
-    }
-}
-
-fn endpoint(addr: &str) -> anyhow::Result<Endpoint> {
+pub async fn connect(addr: &str, key: Option<&str>, session: String) -> Result<HttpClient> {
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
     let url = if addr.contains("://") {
         addr.to_owned()
     } else {
         format!("http://{addr}")
     };
-    let mut endpoint = Endpoint::from_shared(url)?;
-    let tls = endpoint.uri().scheme_str() == Some("https");
+    let base = Url::parse(&url)?;
     ensure!(
-        tls || endpoint.uri().scheme_str() == Some("http"),
+        matches!(base.scheme(), "http" | "https"),
         "use an http:// or https:// server address"
     );
-    if tls {
-        static PROVIDER: std::sync::Once = std::sync::Once::new();
-        PROVIDER.call_once(|| {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        });
-        endpoint = endpoint.tls_config(ClientTlsConfig::new().with_native_roots())?;
-    }
-    Ok(endpoint.connect_timeout(std::time::Duration::from_secs(10)))
-}
-
-pub async fn connect(addr: &str, key: Option<&str>) -> anyhow::Result<GrpcClient> {
-    let auth = Authorization::new(key)?;
-    let channel = endpoint(addr)?.connect().await?;
-    Ok(TensorLaneClient::with_interceptor(channel, auth)
-        .max_decoding_message_size(crate::MAX_BATCH_BYTES)
-        .max_encoding_message_size(crate::MAX_BATCH_BYTES))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn credentials_are_sensitive_and_follow_cloned_clients() {
-        let mut auth = Authorization::new(Some("0123456789abcdef0123456789abcdef"))
-            .unwrap()
-            .clone();
-        for _ in 0..3 {
-            let request = auth.call(Request::new(())).unwrap();
-            let value = request.metadata().get("authorization").unwrap();
-            assert!(value.is_sensitive());
-            assert_eq!(value, "Bearer 0123456789abcdef0123456789abcdef");
-        }
-        assert!(
-            Authorization::new(None)
-                .unwrap()
-                .call(Request::new(()))
-                .unwrap()
-                .metadata()
-                .is_empty()
+    ensure!(
+        base.username().is_empty()
+            && base.password().is_none()
+            && base.query().is_none()
+            && base.fragment().is_none(),
+        "server address must not contain credentials, query parameters, or a fragment"
+    );
+    let mut headers = HeaderMap::new();
+    if let Some(key) = key {
+        ensure!(
+            key.len() >= 32 && key.bytes().all(|b| b.is_ascii_graphic()),
+            "API key must contain at least 32 printable ASCII characters without spaces"
         );
-        assert!(Authorization::new(Some("")).is_err());
+        let mut value = HeaderValue::from_str(&format!("Bearer {key}"))?;
+        value.set_sensitive(true);
+        headers.insert(AUTHORIZATION, value);
+    }
+    let retry_seconds = std::env::var("TENSORLANE_RETRY_TIMEOUT_SECONDS")
+        .unwrap_or_else(|_| "600".into())
+        .parse()
+        .context("invalid TENSORLANE_RETRY_TIMEOUT_SECONDS")?;
+    Ok(HttpClient {
+        client: reqwest::Client::builder()
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
+        base,
+        session,
+        retry_timeout: Duration::from_secs(retry_seconds),
+    })
+}
+
+impl HttpClient {
+    fn url(&self, parts: &[&str]) -> Result<Url> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("invalid HTTP base address"))?
+            .pop_if_empty()
+            .extend(parts);
+        Ok(url)
     }
 
-    #[tokio::test]
-    async fn supports_http_and_https_addresses() {
-        for addr in [
-            "https://example.com:443",
-            "http://example.com:8181",
-            "example.com:8181",
-            "localhost:8181",
-            "http://127.0.0.1:8181",
-            "http://[::1]:8181",
-        ] {
-            assert!(endpoint(addr).is_ok(), "{addr}");
+    pub async fn request(
+        &self,
+        method: Method,
+        parts: &[&str],
+        body: Option<Vec<u8>>,
+        headers: &[(&str, String)],
+        limit: usize,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        let url = self.url(parts)?;
+        let started = Instant::now();
+        let mut attempt = 0;
+        loop {
+            let remaining = if self.retry_timeout.is_zero() {
+                Duration::from_secs(120)
+            } else {
+                self.retry_timeout
+                    .saturating_sub(started.elapsed())
+                    .max(Duration::from_millis(1))
+            };
+            let mut request = self
+                .client
+                .request(method.clone(), url.clone())
+                .header(SESSION_HEADER, &self.session)
+                .timeout(remaining.min(Duration::from_secs(120)));
+            if let Some(bytes) = &body {
+                request = request.body(bytes.clone());
+            }
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            let result: Result<_> = async {
+                let response = request.send().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let mut stream = response.bytes_stream();
+                let mut bytes = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    ensure!(
+                        bytes
+                            .len()
+                            .checked_add(chunk.len())
+                            .is_some_and(|size| size <= limit),
+                        "HTTP response exceeds its size limit"
+                    );
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok((status, headers, bytes))
+            }
+            .await;
+            let (error, retry_after) = match result {
+                Ok((status, headers, bytes))
+                    if status != StatusCode::ACCEPTED && status.is_success() =>
+                {
+                    return Ok((status, headers, bytes));
+                }
+                Ok((status, headers, bytes)) => {
+                    let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .and_then(|v| v["message"].as_str().map(str::to_owned))
+                        .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+                    let retryable = status == StatusCode::ACCEPTED
+                        || status == StatusCode::REQUEST_TIMEOUT
+                        || status == StatusCode::TOO_MANY_REQUESTS
+                        || status.is_server_error();
+                    if !retryable {
+                        bail!("TensorLane HTTP {status}: {message}");
+                    }
+                    let delay = headers
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(|v| Duration::from_secs(v.min(30)));
+                    (format!("TensorLane HTTP {status}: {message}"), delay)
+                }
+                Err(error) => (format!("{error:#}"), None),
+            };
+            ensure!(
+                self.retry_timeout.is_zero() || started.elapsed() < self.retry_timeout,
+                "HTTP recovery deadline exceeded: {error}"
+            );
+            let delay = retry_after
+                .unwrap_or_else(|| Duration::from_millis((100u64 << attempt.min(7)).min(10_000)));
+            let jitter = Duration::from_millis((uuid::Uuid::new_v4().as_u128() % 100) as u64);
+            let wait = delay + jitter;
+            let wait = if self.retry_timeout.is_zero() {
+                wait
+            } else {
+                wait.min(self.retry_timeout.saturating_sub(started.elapsed()))
+            };
+            tokio::time::sleep(wait).await;
+            attempt += 1;
         }
-        assert!(endpoint("ftp://example.com:8181").is_err());
+    }
+
+    pub async fn json<T: DeserializeOwned, B: Serialize>(
+        &self,
+        method: Method,
+        parts: &[&str],
+        body: &B,
+    ) -> Result<T> {
+        let (_, _, bytes) = self
+            .request(
+                method,
+                parts,
+                Some(serde_json::to_vec(body)?),
+                &[("content-type", "application/json".into())],
+                8 * 1024 * 1024,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    pub async fn initialize(&self, run: &str) -> Result<InitResponse> {
+        self.json(Method::POST, &["runs", run, "init"], &serde_json::json!({}))
+            .await
+    }
+
+    pub async fn heartbeat(&self, run: &str) -> Result<()> {
+        self.request(
+            Method::POST,
+            &["runs", run, "heartbeat"],
+            None,
+            &[],
+            1024 * 1024,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn end(&self, run: &str, failed: bool) -> Result<()> {
+        let mut ending = self.clone();
+        ending.retry_timeout = Duration::from_secs(5);
+        ending
+            .request(
+                Method::POST,
+                &["runs", run, "end"],
+                Some(serde_json::to_vec(&EndRequest { failed })?),
+                &[("content-type", "application/json".into())],
+                1024 * 1024,
+            )
+            .await?;
+        Ok(())
     }
 }

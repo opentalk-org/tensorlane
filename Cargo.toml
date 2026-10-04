@@ -4,6 +4,7 @@ members = [
     "server",
     "client",
     "error-context",
+    "protocol",
 ]
 
 [workspace.dependencies]

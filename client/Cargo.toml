@@ -21,15 +21,16 @@ tar = "0.4"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1.44.2", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros", "fs"] }
-tonic = { version = "0.13.1", features = ["tls-aws-lc", "tls-native-roots"] }
 prost = "0.13.5"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 tokio-stream = "0.1.17"
+tensorlane-protocol = { path = "../protocol" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+sha2 = "0.10.9"
+hex = "0.4.3"
 
 [build-dependencies]
 pyo3-build-config = "0.29.2"
-protox = "0.7.2"
-tonic-build = { version = "0.13.1", default-features = false, features = ["prost"] }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1.17", features = ["net"] }

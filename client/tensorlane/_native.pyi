@@ -11,6 +11,8 @@ class Daemon:
         prefetch_factor: int | None = None,
         num_workers: int | None = None,
         rank: int = 0,
+        api_key: str | None = None,
+        timeout: float | None = None,
     ) -> None: ...
     @property
     def run_id(self) -> str: ...

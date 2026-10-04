@@ -27,26 +27,24 @@ Omit both range fields to fetch the whole object. The Python sample will contain
 Run configuration has three separate sections:
 
 - `tensorlane`: runtime settings (`ranks`, `num_workers`, `prefetch_factor`) and asset settings (`assets`, `asset_type`).
-- `queries`: a list of query objects, each containing `key`, `sql`, `params`, and an optional `repeat` flag.
+- `queries`: an object mapping stream names to `sql`, `params`, and an optional `repeat` flag.
 - `app`: custom application configuration. TensorLane stores it without interpreting its contents.
 
 ```json
 {
   "tensorlane": {"num_workers": 5, "prefetch_factor": 2},
-  "queries": [
-    {
-      "key": "training",
+  "queries": {
+    "training": {
       "sql": "...",
       "params": {"batches": 20, "batch_size": 32},
       "repeat": false
     },
-    {
-      "key": "validation",
+    "validation": {
       "sql": "...",
       "params": {"samples": 1000, "batch_size": 32},
       "repeat": true
     }
-  ],
+  },
   "app": {"optimizer": {"learning_rate": 0.0001}}
 }
 ```
@@ -55,7 +53,7 @@ Parameters use ClickHouse syntax such as `{batch_size:UInt64}` and come only fro
 
 Query keys must be unique and nonempty. Every stream ends when its query result ends unless `repeat` is explicitly `true`; repeating replays the saved query result. Keys such as `training` and `validation` have no special behavior.
 
-This schema replaces the former query-name-to-SQL object and top-level stream settings. Existing stored configurations remain readable, but must be converted to this schema before initializing them with the updated server. Update server and client together; this change does not rewrite stored runs.
+New run configurations use named query objects. Stored lists with `key` fields remain readable without rewriting historical runs.
 
 ## Reading in Python
 
@@ -87,7 +85,7 @@ For files, decode `sample.blobs` inside `transform`. Define callbacks at module 
 
 Automatic performance metrics are reported by rank 0 under `tensorlane/<stream>/`: samples per second and mean server-load, transform, collation, data-wait, and application times. These describe rank 0's batches. Empty measurement windows are skipped; error counts are emitted when they increase. Set `performance_metrics=False` in `tensorlane.init` to disable automatic reporting.
 
-Set `TENSORLANE_RUN_ID` to your run ID and `TENSORLANE_ADDR` to the server address (default `localhost:8181`).
+Set `TENSORLANE_RUN_ID` to your run ID and `TENSORLANE_ADDR` to the server address (default `localhost:8180`).
 
 The [training example](client/examples/train.py) shows a complete PyTorch loop with Accelerate and checkpoint uploads.
 
@@ -143,6 +141,8 @@ nix develop -c uv run --group test python -m unittest discover -s client/tests -
 nix develop -c cargo test -p tensorlane --test e2e -- --test-threads=1
 ```
 
-Integration tests require Docker for ClickHouse and MinIO. Set `TENSORLANE_TEST_PYTHON` to the prepared Python executable to include the training examples.
+Integration tests require Docker for ClickHouse and MinIO. The tests cover HTTP retries, uploads, shared snapshots, and server restarts. Set `TENSORLANE_TEST_PYTHON` to the prepared Python executable to include a CPU training loop against the server.
 
 [Example run configuration](queries/examples/sample-configs.json) · [Resume configuration](queries/examples/sample-configs-stage2.json) · [Load benchmark](client/benchmarks/load_test.py)
+
+[HTTP protocol and recovery](docs/http.md) · [Authentication](docs/authentication.md)

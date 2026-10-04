@@ -1,16 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use anyhow::Context;
-use aws_sdk_s3::{
-    primitives::{ByteStream, Length},
-    types::{CompletedMultipartUpload, CompletedPart},
-};
 use clickhouse::Client;
 use serde::Serialize;
 use time::OffsetDateTime;
-use tokio::fs;
-use tokio_util::task::TaskTracker;
-use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(clickhouse::Row, Serialize)]
@@ -35,8 +27,6 @@ pub struct UploadStore {
     bucket: &'static str,
     checkpoint_prefix: &'static str,
     metrics_prefix: &'static str,
-    staging_dir: &'static Path,
-    tasks: TaskTracker,
 }
 
 impl UploadStore {
@@ -46,7 +36,6 @@ impl UploadStore {
         bucket: &'static str,
         checkpoint_prefix: &'static str,
         metrics_prefix: &'static str,
-        staging_dir: &'static Path,
     ) -> anyhow::Result<Self> {
         let checkpoint_prefix = checkpoint_prefix.trim_matches('/');
         let metrics_prefix = metrics_prefix.trim_matches('/');
@@ -58,47 +47,7 @@ impl UploadStore {
             bucket,
             checkpoint_prefix,
             metrics_prefix,
-            staging_dir,
-            tasks: TaskTracker::new(),
         })
-    }
-
-    pub fn staging_path(&self, id: Uuid) -> PathBuf {
-        self.staging_dir.join(id.to_string())
-    }
-
-    pub fn artifact(
-        &self,
-        id: Uuid,
-        run_id: Uuid,
-        step: u64,
-        timestamp: OffsetDateTime,
-        name: String,
-        content_type: String,
-        size: u64,
-    ) {
-        let store = self.clone();
-        self.tasks.spawn(async move {
-            if let Err(err) = store
-                .upload_artifact(
-                    id,
-                    run_id,
-                    step,
-                    timestamp,
-                    name,
-                    content_type,
-                    size,
-                )
-                .await
-            {
-                error!(artifact = %id, run = %run_id, error = format!("{err:#}"), "metric artifact upload failed");
-            }
-        });
-    }
-
-    pub async fn finish(&self) {
-        self.tasks.close();
-        self.tasks.wait().await;
     }
 
     pub fn asset_key(&self, id: Uuid) -> String {
@@ -121,142 +70,39 @@ impl UploadStore {
         Ok(())
     }
 
-    async fn upload_artifact(
+    pub async fn save_artifact(
         &self,
         id: Uuid,
         run_id: Uuid,
-        step: u64,
-        timestamp: OffsetDateTime,
-        name: String,
-        content_type: String,
-        size_bytes: u64,
+        metadata: &tensorlane_protocol::ArtifactMetric,
+        local_path: &Path,
     ) -> anyhow::Result<()> {
-        let local_path = self.staging_path(id);
         let key = format!("{}/{}", self.metrics_prefix, id);
-        self.upload(&local_path, &key, &content_type).await?;
+        self.upload(local_path, &key, &metadata.content_type)
+            .await?;
         let row = ArtifactRecord {
             id,
             run_id,
-            step,
-            timestamp,
-            name,
-            path: key.clone(),
-            content_type,
-            size_bytes,
+            step: metadata.step,
+            timestamp: OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(metadata.timestamp_unix_ms) * 1_000_000,
+            )?,
+            name: metadata.name.clone(),
+            path: key,
+            content_type: metadata.content_type.clone(),
+            size_bytes: metadata.size_bytes,
         };
-        let mut insert = self.database.insert::<ArtifactRecord>("artifacts").await?;
+        let client = self
+            .database
+            .clone()
+            .with_setting("insert_deduplication_token", id.to_string());
+        let mut insert = client.insert::<ArtifactRecord>("artifacts").await?;
         insert.write(&row).await?;
         insert.end().await?;
-        fs::remove_file(&local_path).await?;
-        info!(artifact = %id, run = %run_id, key, size_bytes, "metric artifact uploaded");
         Ok(())
     }
 
-    async fn upload(&self, local_path: &Path, key: &str, content_type: &str) -> anyhow::Result<()> {
-        let size = fs::metadata(local_path)
-            .await
-            .with_context(|| format!("reading staged upload {}", local_path.display()))?
-            .len();
-        if size == 0 {
-            self.s3
-                .put_object()
-                .bucket(self.bucket)
-                .key(key)
-                .content_type(content_type)
-                .body(ByteStream::from_static(b""))
-                .send()
-                .await
-                .with_context(|| format!("uploading empty object to s3://{}/{key}", self.bucket))?;
-            return Ok(());
-        }
-        let part_size = (64 * 1024 * 1024_u64).max(size.div_ceil(10_000));
-        anyhow::ensure!(
-            part_size <= 5 * 1024 * 1024 * 1024,
-            "upload exceeds S3 multipart size limits"
-        );
-        let upload = self
-            .s3
-            .create_multipart_upload()
-            .bucket(self.bucket)
-            .key(key)
-            .content_type(content_type)
-            .send()
-            .await
-            .with_context(|| format!("starting multipart upload to s3://{}/{key}", self.bucket))?;
-        let upload_id = upload
-            .upload_id()
-            .context("multipart upload response missing upload ID")?;
-        let result: anyhow::Result<()> = async {
-            let mut parts = Vec::new();
-            for index in 0..size.div_ceil(part_size) {
-                let offset = index * part_size;
-                let length = part_size.min(size - offset);
-                let part_number = i32::try_from(index + 1)?;
-                let body = ByteStream::read_from()
-                    .path(local_path)
-                    .offset(offset)
-                    .length(Length::Exact(length))
-                    .build()
-                    .await
-                    .with_context(|| format!("reading upload part {part_number}"))?;
-                let part = self
-                    .s3
-                    .upload_part()
-                    .bucket(self.bucket)
-                    .key(key)
-                    .upload_id(upload_id)
-                    .part_number(part_number)
-                    .body(body)
-                    .send()
-                    .await
-                    .with_context(|| format!("uploading part {part_number}"))?;
-                parts.push(
-                    CompletedPart::builder()
-                        .part_number(part_number)
-                        .e_tag(part.e_tag().context("upload part response missing ETag")?)
-                        .build(),
-                );
-            }
-            self.s3
-                .complete_multipart_upload()
-                .bucket(self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .set_parts(Some(parts))
-                        .build(),
-                )
-                .send()
-                .await
-                .context("completing multipart upload")?;
-            Ok(())
-        }
-        .await;
-        if result.is_err() {
-            if let Err(err) = self
-                .s3
-                .abort_multipart_upload()
-                .bucket(self.bucket)
-                .key(key)
-                .upload_id(upload_id)
-                .send()
-                .await
-            {
-                error!(
-                    key,
-                    upload_id,
-                    error = format!("{err:#}"),
-                    "aborting multipart upload failed"
-                );
-            }
-        }
-        result.with_context(|| {
-            format!(
-                "uploading {} to s3://{}/{key}",
-                local_path.display(),
-                self.bucket
-            )
-        })
+    async fn upload(&self, path: &Path, key: &str, content_type: &str) -> anyhow::Result<()> {
+        crate::s3_upload::upload(&self.s3, self.bucket, path, key, content_type).await
     }
 }

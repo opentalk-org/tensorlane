@@ -83,7 +83,6 @@
               CLICKHOUSE_URL = "http://127.0.0.1:8123";
               CLICKHOUSE_USER = "default";
               CLICKHOUSE_PASSWORD = "";
-              GRPC_PORT = "8181";
               HTTP_PORT = "8180";
 
               AWS_ENDPOINT_URL = "http://127.0.0.1:9001";

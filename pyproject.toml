@@ -1,7 +1,7 @@
 [project]
 name = "tensorlane"
 version = "0.1.0"
-description = "Client for the TensorLane gRPC service."
+description = "Client for the TensorLane HTTP service."
 requires-python = ">=3.11"
 dependencies = [
     "maturin>=1.0,<2.0",
@@ -9,7 +9,7 @@ dependencies = [
 ]
 
 [dependency-groups]
-test = ["grpcio", "grpcio-tools", "accelerate"]
+test = ["accelerate"]
 
 [build-system]
 requires = ["maturin>=1.0,<2.0"]

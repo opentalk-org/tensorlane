@@ -32,7 +32,7 @@ async fn groups_sparse_batches_and_preserves_repeated_samples() {
     let (dir, mut sampler) = sampler(vec![row(0, 0, "a"), row(0, 1, "b"), row(4, 0, "a")], false)
         .await
         .unwrap();
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     let first = sampler.next_batch().await.unwrap().unwrap();
     assert_eq!(
         first
@@ -83,10 +83,39 @@ async fn repeats_identical_plans_without_creating_files_and_empty_repetition_end
             if index % 2 == 0 { "a" } else { "b" }
         );
     }
-    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     assert_eq!(std::fs::read(dir.path().join("plan")).unwrap(), original);
     let (_dir, mut empty) = sampler(vec![], true).await.unwrap();
     assert!(empty.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn persisted_plan_can_be_reopened_and_replayed_by_sequence() {
+    let (dir, mut plan) = sampler(vec![row(7, 0, "a"), row(9, 0, "b")], true)
+        .await
+        .unwrap();
+    plan.persist();
+    drop(plan);
+    let mut first = QuerySampler::open(&dir.path().join("plan"), true)
+        .await
+        .unwrap();
+    let mut second = QuerySampler::open(&dir.path().join("plan"), true)
+        .await
+        .unwrap();
+    for sequence in [0, 9, 1, 8, 9] {
+        let a = first.batch_at(sequence).await.unwrap().unwrap();
+        let b = second.batch_at(sequence).await.unwrap().unwrap();
+        assert_eq!(a.query_batch_idx, b.query_batch_idx);
+        assert_eq!(a.samples[0].sample_id, b.samples[0].sample_id);
+        assert_eq!(
+            a.samples[0].sample_id,
+            if sequence % 2 == 0 { "a" } else { "b" }
+        );
+    }
+    let mut finite = QuerySampler::open(&dir.path().join("plan"), false)
+        .await
+        .unwrap();
+    assert!(finite.batch_at(2).await.unwrap().is_none());
 }
 
 #[tokio::test]
