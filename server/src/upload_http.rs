@@ -78,6 +78,9 @@ pub async fn create(
     } else {
         crate::cache_limits::space(&dir, spec.size).await?;
         write_atomic(&path, &serde_json::to_vec(&spec)?).await?;
+    }
+    let committed = fs::try_exists(dir.join("committed")).await?;
+    if !committed {
         let file = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -86,9 +89,7 @@ pub async fn create(
             .await?;
         file.sync_all().await?;
     }
-    Ok(UploadStatus {
-        committed: fs::try_exists(dir.join("committed")).await?,
-    })
+    Ok(UploadStatus { committed })
 }
 
 pub async fn chunk(

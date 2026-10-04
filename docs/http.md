@@ -46,7 +46,8 @@ errors. Backoff includes jitter. The default recovery deadline is 600 seconds pe
 request; `TENSORLANE_RETRY_TIMEOUT_SECONDS=0` waits indefinitely. Each attempt has
 a 10-second connect timeout, a 30-second read idle timeout, and a 120-second total
 limit. A Python `init(timeout=...)` deadline also covers asset downloads and local
-worker startup. A `flush(timeout=...)` timeout leaves its upload running.
+worker startup. A `flush(timeout=...)` deadline includes queue space and automatic metrics.
+A timeout leaves its upload running.
 
 A missed heartbeat or a lost connection does not fail a run. Server startup and
 shutdown leave run status and saved query results intact. Only explicit run

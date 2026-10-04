@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         .with_url(&args.clickhouse_url)
         .with_user(&args.clickhouse_user)
         .with_password(&args.clickhouse_password)
+        .with_setting("max_execution_time", "300")
         .with_setting("allow_experimental_json_type", "1")
         .with_setting("input_format_binary_read_json_as_string", "1")
         .with_setting("output_format_binary_write_json_as_string", "1");

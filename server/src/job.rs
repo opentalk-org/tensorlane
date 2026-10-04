@@ -28,6 +28,7 @@ pub async fn failed(path: &Path, error: &anyhow::Error) {
         Some(clickhouse::error::Error::BadResponse(message)) => ![
             "SYNTAX_ERROR",
             "UNKNOWN_IDENTIFIER",
+            "UNKNOWN_FUNCTION",
             "UNKNOWN_TABLE",
             "UNKNOWN_DATABASE",
             "BAD_ARGUMENTS",
@@ -48,6 +49,7 @@ pub async fn failed(path: &Path, error: &anyhow::Error) {
         _ => ![
             "exceeds",
             "unordered",
+            "strictly ordered",
             "unexpected size",
             "SHA256 does not match",
             "conflicting retry",
@@ -92,5 +94,26 @@ pub async fn wait_for_file(path: &Path) -> Result<bool> {
             return Ok(false);
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permanent_query_failures_are_not_retried() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("plan.error");
+        for error in [
+            anyhow::anyhow!("query rows must be strictly ordered by batch_idx, sample_idx"),
+            clickhouse::error::Error::BadResponse("UNKNOWN_FUNCTION".into()).into(),
+        ] {
+            failed(&path, &error).await;
+            let failure: Failure = serde_json::from_slice(&fs::read(&path).await?)?;
+            assert!(!failure.retryable);
+            assert!(check(&path).await.is_err());
+        }
+        Ok(())
     }
 }
