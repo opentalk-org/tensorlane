@@ -2,7 +2,7 @@ use std::{io, path::PathBuf};
 
 use anyhow::Context;
 use aws_config::{BehaviorVersion, retry::RetryConfig};
-use aws_sdk_s3::config::{Credentials, Region};
+use aws_sdk_s3::config::{Credentials, Region, timeout::TimeoutConfig};
 use clap::{
     CommandFactory, FromArgMatches, Parser, Subcommand,
     builder::{
@@ -16,22 +16,26 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
+mod asset_commit;
+mod asset_http;
 mod asset_repo;
 mod auth;
+mod batch_http;
+mod cache_limits;
 mod db;
-mod grpc;
 mod http;
+mod job;
 mod loader;
-mod metrics;
-mod prefetch;
+mod metric_http;
+mod query_params;
 mod run;
 mod run_repo;
+mod runtime;
+mod s3_upload;
 mod sampling;
+mod shared_cache;
+mod upload_http;
 mod uploads;
-
-mod proto {
-    tonic::include_proto!("_");
-}
 
 const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 
@@ -57,18 +61,6 @@ struct Args {
     command: Option<Command>,
     #[arg(long, env = "TENSORLANE_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
-    #[arg(long, env = "GRPC_TLS_CERT_FILE", requires = "grpc_tls_key_file")]
-    grpc_tls_cert_file: Option<PathBuf>,
-    #[arg(long, env = "GRPC_TLS_KEY_FILE", requires = "grpc_tls_cert_file")]
-    grpc_tls_key_file: Option<PathBuf>,
-    #[arg(
-        short,
-        long,
-        env = "GRPC_PORT",
-        help = "gRPC server binding port.",
-        default_value = "8181"
-    )]
-    grpc_port: u16,
     #[arg(
         long,
         env = "CLICKHOUSE_URL",
@@ -115,6 +107,8 @@ struct Args {
         help = "Directory for prefetched data, downloaded assets, and staged uploads."
     )]
     cache_dir: PathBuf,
+    #[arg(long, env = "CACHE_BYTES", default_value_t = 8 * 1024 * 1024 * 1024u64)]
+    cache_bytes: u64,
     #[arg(
         long,
         env = "CHECKPOINT_PREFIX",
@@ -153,19 +147,6 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::from_arg_matches(&matches)?;
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let auth = auth::Auth::new(args.api_key.as_deref())?;
-    let grpc_tls = match (args.grpc_tls_cert_file, args.grpc_tls_key_file) {
-        (Some(cert), Some(key)) => Some(tonic::transport::Identity::from_pem(
-            fs::read(cert)
-                .await
-                .context("reading gRPC TLS certificate")?,
-            fs::read(key)
-                .await
-                .context("reading gRPC TLS private key")?,
-        )),
-        (None, None) => None,
-        _ => anyhow::bail!("gRPC TLS requires both certificate and private key files"),
-    };
-
     let database = clickhouse::Client::default()
         .with_url(&args.clickhouse_url)
         .with_user(&args.clickhouse_user)
@@ -177,6 +158,14 @@ async fn main() -> anyhow::Result<()> {
     let s3_config = aws_config::defaults(BehaviorVersion::latest())
         .endpoint_url(&args.s3_endpoint)
         .retry_config(RetryConfig::standard().with_max_attempts(5))
+        .timeout_config(
+            TimeoutConfig::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(30))
+                .operation_attempt_timeout(std::time::Duration::from_secs(120))
+                .operation_timeout(std::time::Duration::from_secs(600))
+                .build(),
+        )
         .credentials_provider(Credentials::new(
             &args.s3_key,
             &args.s3_secret,
@@ -193,60 +182,56 @@ async fn main() -> anyhow::Result<()> {
             .build(),
     );
 
-    let runs_cache_dir: &'static std::path::Path =
-        Box::leak(args.cache_dir.join("runs").into_boxed_path());
-    let uploads_cache_dir: &'static std::path::Path =
-        Box::leak(args.cache_dir.join("uploads").into_boxed_path());
-    fs::create_dir_all(&runs_cache_dir).await?;
-    fs::create_dir_all(&uploads_cache_dir).await?;
-
+    fs::create_dir_all(&args.cache_dir).await?;
+    let bucket = args.bucket.leak();
     let run_repo = run_repo::RunRepo::new(database.clone());
-    for run in run_repo.list().await? {
-        if run.status == Some(run_repo::RunStatus::Running) {
-            run_repo
-                .append_status(run.id, run_repo::RunStatus::Failed)
-                .await?;
-            let _ = fs::remove_dir_all(runs_cache_dir.join(run.id.to_string())).await;
-        }
-    }
     let shutdown = CancellationToken::new();
-    let http_shutdown = CancellationToken::new();
     tokio::spawn(watch_shutdown_signals(shutdown.clone()));
-    let mut http_server = tokio::spawn(http::serve(
-        args.http_port,
-        run_repo.clone(),
-        auth.clone(),
-        http_shutdown.clone(),
-    ));
-    let mut grpc_server = tokio::spawn(grpc::serve(
-        args.grpc_port,
-        s3_client,
-        database,
-        run_repo,
-        args.bucket.leak(),
-        runs_cache_dir,
-        uploads_cache_dir,
+    let uploads = uploads::UploadStore::new(
+        s3_client.clone(),
+        database.clone(),
+        bucket,
         args.checkpoint_prefix.leak(),
         args.metrics_prefix.leak(),
-        auth,
-        grpc_tls,
+    )?;
+    let runtime = runtime::Runtime::new(
+        run_repo.clone(),
+        database,
+        s3_client,
+        bucket,
+        args.cache_dir,
         shutdown.clone(),
-    ));
-    tokio::select! {
-        result = &mut http_server => {
-            shutdown.cancel();
-            let grpc_result = grpc_server.await;
-            result??;
-            grpc_result??;
+        uploads,
+    );
+    let cache_root = runtime.cache.clone();
+    let cache_shutdown = shutdown.clone();
+    runtime.tasks.spawn(async move {
+        loop {
+            if let Err(error) = cache_limits::prune(&cache_root, args.cache_bytes).await {
+                tracing::warn!(error=%error, "cache cleanup failed");
+            }
+            tokio::select! {
+                _ = cache_shutdown.cancelled() => break,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {},
+            }
         }
-        result = &mut grpc_server => {
-            shutdown.cancel();
-            http_shutdown.cancel();
-            let http_result = http_server.await;
-            result??;
-            http_result??;
+    });
+    let serving = http::serve(
+        args.http_port,
+        run_repo,
+        auth,
+        shutdown.clone(),
+        runtime.clone(),
+    );
+    tokio::pin!(serving);
+    tokio::select! {
+        result = &mut serving => result?,
+        _ = shutdown.cancelled() => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut serving).await;
         }
     }
+    runtime.tasks.close();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), runtime.tasks.wait()).await;
     Ok(())
 }
 

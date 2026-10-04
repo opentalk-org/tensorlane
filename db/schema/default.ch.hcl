@@ -77,9 +77,32 @@ table "run_status" {
   }
 }
 
+table "run_sessions" {
+  schema = schema.default
+  engine = sql("ReplacingMergeTree(updated_at)")
+
+  column "run_id" {
+    type = UUID
+  }
+  column "session_id" {
+    type = UUID
+  }
+  column "updated_at" {
+    type = DateTime64(9)
+  }
+
+  primary_key {
+    columns = [column.run_id]
+  }
+  sort {
+    columns = [column.run_id]
+  }
+}
+
 table "metrics" {
   schema = schema.default
   engine = MergeTree
+  settings = { non_replicated_deduplication_window = 1000000 }
 
   column "timestamp" {
     type = DateTime64(9)
@@ -114,6 +137,7 @@ table "metrics" {
 table "array_metrics" {
   schema = schema.default
   engine = MergeTree
+  settings = { non_replicated_deduplication_window = 1000000 }
 
   column "timestamp" {
     type = DateTime64(9)
@@ -174,6 +198,7 @@ table "logs" {
 table "artifacts" {
   schema = schema.default
   engine = MergeTree
+  settings = { non_replicated_deduplication_window = 1000000 }
 
   column "id" {
     type = UUID

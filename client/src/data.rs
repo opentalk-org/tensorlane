@@ -1,14 +1,15 @@
-use crate::{proto::DataRequest, semaphore::BatchBudget};
+use crate::semaphore::BatchBudget;
 use anyhow::{Context, ensure};
+use prost::Message;
+use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
     thread::{self, JoinHandle},
-    time::Duration,
 };
+use tensorlane_protocol::DataResponse;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Serialize, Deserialize)]
 pub enum Work {
@@ -47,7 +48,7 @@ impl Drop for Requests {
     }
 }
 pub async fn prefetch(
-    mut grpc: crate::transport::GrpcClient,
+    http: crate::transport::HttpClient,
     run_id: String,
     stream_name: String,
     budget: Arc<BatchBudget>,
@@ -55,7 +56,6 @@ pub async fn prefetch(
 ) -> anyhow::Result<()> {
     let (requests, receiver) = mpsc::unbounded_channel();
     let waiting = budget.clone();
-    let request_stream = stream_name.clone();
     let mut request_task = Requests {
         budget,
         thread: Some(
@@ -63,13 +63,7 @@ pub async fn prefetch(
                 .name("tensorlane-requests".into())
                 .spawn(move || {
                     while waiting.acquire()? {
-                        if requests
-                            .send(DataRequest {
-                                run_id: run_id.clone(),
-                                stream: request_stream.clone(),
-                            })
-                            .is_err()
-                        {
+                        if requests.send(()).is_err() {
                             break;
                         }
                     }
@@ -77,19 +71,31 @@ pub async fn prefetch(
                 })?,
         ),
     };
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(120),
-        grpc.data(UnboundedReceiverStream::new(receiver)),
-    )
-    .await
-    .context("opening Data stream timed out")??
-    .into_inner();
+    let mut receiver = receiver;
     let mut expected_id = 0;
-    loop {
+    while receiver.recv().await.is_some() {
         let started = std::time::Instant::now();
-        let Some(response) = stream.message().await.context("receiving data batch")? else {
+        let (status, _, bytes) = http
+            .request(
+                Method::GET,
+                &[
+                    "runs",
+                    &run_id,
+                    "streams",
+                    &stream_name,
+                    "batches",
+                    &expected_id.to_string(),
+                ],
+                None,
+                &[],
+                crate::MAX_BATCH_BYTES,
+            )
+            .await
+            .context("receiving data batch")?;
+        if status == StatusCode::NO_CONTENT {
             break;
-        };
+        }
+        let response = DataResponse::decode(bytes.as_slice()).context("invalid data batch")?;
         let timings = [
             response.load_seconds,
             response.server_wait_seconds,

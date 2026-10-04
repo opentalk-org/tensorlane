@@ -8,7 +8,7 @@ from urllib.parse import quote
 from . import _native
 
 INTERVAL = 10.0
-STAGES = ("server_load", "server_wait", "grpc_receive_wait", "transform_work", "collate", "data_wait")
+STAGES = ("server_load", "server_wait", "http_receive_wait", "transform_work", "collate", "data_wait")
 REPORTED_STAGES = {"server_load", "transform_work", "collate", "data_wait"}
 
 

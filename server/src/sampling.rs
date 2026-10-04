@@ -1,5 +1,6 @@
 use crate::db::SampleRow;
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
 use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -39,6 +40,7 @@ pub struct BatchPlan {
     pub query_batch_idx: u64,
     pub samples: Vec<Sample>,
 }
+#[cfg(test)]
 pub trait Sampler: Send {
     fn next_batch(&mut self) -> BoxFuture<'_, Result<Option<BatchPlan>>>;
 }

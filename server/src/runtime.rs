@@ -1,0 +1,234 @@
+use anyhow::{Context, Result, ensure};
+use std::{path::PathBuf, sync::Arc};
+use tensorlane_protocol::InitResponse;
+use tokio::{fs, sync::Semaphore};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use uuid::Uuid;
+
+use crate::{
+    loader::{Loader, S3Loader},
+    run::Config,
+    run_repo::{Run, RunRepo, RunStatus},
+    shared_cache::{Lock, write_atomic},
+};
+
+#[derive(Clone)]
+pub struct Runtime {
+    pub repo: RunRepo,
+    pub database: clickhouse::Client,
+    pub s3: aws_sdk_s3::Client,
+    pub bucket: &'static str,
+    pub cache: Arc<PathBuf>,
+    pub shutdown: CancellationToken,
+    pub tasks: TaskTracker,
+    pub uploads: crate::uploads::UploadStore,
+    pub asset_slots: Arc<Semaphore>,
+    pub upload_slots: Arc<Semaphore>,
+    pub(super) loader: Arc<dyn Loader>,
+    pub(super) plans: Arc<Semaphore>,
+    pub(super) batches: Arc<Semaphore>,
+}
+
+pub enum Batch {
+    Pending,
+    End,
+    Ready(PathBuf),
+}
+
+impl Runtime {
+    pub fn new(
+        repo: RunRepo,
+        database: clickhouse::Client,
+        s3: aws_sdk_s3::Client,
+        bucket: &'static str,
+        cache: PathBuf,
+        shutdown: CancellationToken,
+        uploads: crate::uploads::UploadStore,
+    ) -> Self {
+        Self {
+            loader: Arc::new(S3Loader::new(s3.clone(), bucket)),
+            repo,
+            database,
+            s3,
+            bucket,
+            cache: Arc::new(cache),
+            shutdown,
+            tasks: TaskTracker::new(),
+            uploads,
+            asset_slots: Arc::new(Semaphore::new(8)),
+            upload_slots: Arc::new(Semaphore::new(2)),
+            plans: Arc::new(Semaphore::new(2)),
+            batches: Arc::new(Semaphore::new(2)),
+        }
+    }
+
+    pub fn run_dir(&self, run: Uuid) -> PathBuf {
+        self.cache.join("runs").join(run.to_string())
+    }
+
+    async fn run_lock(&self, run: Uuid) -> Result<Lock> {
+        let dir = self.run_dir(run);
+        fs::create_dir_all(&dir).await?;
+        Lock::acquire(&dir.join("run.lock")).await
+    }
+
+    pub async fn initialize(&self, id: Uuid, session: Uuid) -> Result<InitResponse> {
+        ensure!(!self.shutdown.is_cancelled(), "server is shutting down");
+        let _lock = self.run_lock(id).await?;
+        let record = self.repo.get(id).await?.context("run not found")?;
+        ensure!(
+            matches!(record.status, Some(RunStatus::Queued | RunStatus::Running)),
+            "run is terminal"
+        );
+        let config = Config::parse(&record.config)?;
+        if let Some(existing) = self.repo.session(id).await? {
+            ensure!(
+                existing.session_id == session,
+                "run belongs to another client session"
+            );
+        }
+        self.repo.renew_session(id, session).await?;
+        if record.status != Some(RunStatus::Running) {
+            self.repo.append_status(id, RunStatus::Running).await?;
+        }
+        Ok(InitResponse {
+            run_id: id.to_string(),
+            config: serde_json::to_string(&record.config)?,
+            assets: config.assets.keys().cloned().collect(),
+            streams: config.queries.keys().cloned().collect(),
+        })
+    }
+
+    pub async fn active(&self, id: Uuid, session: Uuid) -> Result<(Run, Config)> {
+        let record = self.repo.get(id).await?.context("run not found")?;
+        ensure!(
+            record.status == Some(RunStatus::Running),
+            "run is not running"
+        );
+        let owner = self
+            .repo
+            .session(id)
+            .await?
+            .context("run is not initialized")?;
+        ensure!(
+            owner.session_id == session,
+            "run belongs to another client session"
+        );
+        let config = Config::parse(&record.config)?;
+        Ok((record, config))
+    }
+
+    pub async fn heartbeat(&self, id: Uuid, session: Uuid) -> Result<()> {
+        let _lock = self.run_lock(id).await?;
+        self.active(id, session).await?;
+        self.repo.renew_session(id, session).await
+    }
+
+    pub async fn end(&self, id: Uuid, session: Uuid, failed: bool) -> Result<()> {
+        let _lock = self.run_lock(id).await?;
+        let record = self.repo.get(id).await?.context("run not found")?;
+        let owner = self
+            .repo
+            .session(id)
+            .await?
+            .context("run is not initialized")?;
+        ensure!(
+            owner.session_id == session,
+            "run belongs to another client session"
+        );
+        if matches!(
+            record.status,
+            Some(RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled)
+        ) {
+            return Ok(());
+        }
+        self.repo
+            .append_status(
+                id,
+                if failed {
+                    RunStatus::Failed
+                } else {
+                    RunStatus::Succeeded
+                },
+            )
+            .await
+    }
+
+    pub async fn asset(&self, id: Uuid, session: Uuid, name: &str) -> Result<AssetSource> {
+        let (_, config) = self.active(id, session).await?;
+        use sha2::{Digest, Sha256};
+        let dir = self.run_dir(id).join("inputs");
+        fs::create_dir_all(&dir).await?;
+        let path = dir
+            .join(hex::encode(Sha256::digest(name.as_bytes())))
+            .with_extension("json");
+        let _lock = Lock::acquire(&path.with_extension("lock")).await?;
+        if fs::try_exists(&path).await? {
+            return Ok(serde_json::from_slice(&fs::read(&path).await?)?);
+        }
+        let input = config.assets.get(name).context("unknown input asset")?;
+        let record = match input.asset_id {
+            Some(id) => Some(
+                self.repo
+                    .assets()
+                    .get(id)
+                    .await?
+                    .context("input asset not found")?,
+            ),
+            None => None,
+        };
+        let object = record
+            .as_ref()
+            .map(|r| r.path.clone())
+            .or_else(|| input.object.clone())
+            .context("missing asset object")?;
+        let head = self
+            .s3
+            .head_object()
+            .bucket(self.bucket)
+            .key(&object)
+            .send()
+            .await?;
+        let etag = head.e_tag().context("asset is missing ETag")?.to_owned();
+        let size = u64::try_from(head.content_length().context("asset is missing size")?)?;
+        let metadata = tensorlane_protocol::AssetMetadata {
+            entrypoint: input.entrypoint.clone(),
+            asset_id: input.asset_id.map(|id| id.to_string()),
+            metadata_json: record
+                .as_ref()
+                .map(|r| r.metadata.clone())
+                .unwrap_or_else(|| "{}".into()),
+            kind: record
+                .as_ref()
+                .map(|r| crate::asset_repo::kind_name(r.kind))
+                .transpose()?
+                .unwrap_or("file")
+                .into(),
+            asset_type: record
+                .as_ref()
+                .map(|r| r.asset_type.clone())
+                .unwrap_or_default(),
+        };
+        let sha256 = record
+            .as_ref()
+            .map(|r| String::from_utf8(r.content_hash.to_vec()))
+            .transpose()?;
+        let source = AssetSource {
+            object,
+            download: tensorlane_protocol::AssetDownload {
+                metadata,
+                size,
+                etag,
+                sha256,
+            },
+        };
+        write_atomic(&path, &serde_json::to_vec(&source)?).await?;
+        Ok(source)
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AssetSource {
+    pub object: String,
+    pub download: tensorlane_protocol::AssetDownload,
+}

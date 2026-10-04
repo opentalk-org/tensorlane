@@ -63,15 +63,6 @@ struct RunConfigRow {
     config: String,
 }
 
-#[derive(clickhouse::Row, Serialize)]
-struct StatusRow {
-    #[serde(with = "clickhouse::serde::time::datetime64::nanos")]
-    timestamp: OffsetDateTime,
-    #[serde(with = "clickhouse::serde::uuid")]
-    run_id: Uuid,
-    status: i8,
-}
-
 #[derive(clickhouse::Row, Deserialize)]
 struct RunRow {
     #[serde(with = "clickhouse::serde::uuid")]
@@ -168,14 +159,42 @@ impl RunRepo {
 
     #[error_context("failed to append a run status")]
     pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> Result<()> {
-        let row = StatusRow {
-            timestamp: OffsetDateTime::now_utc(),
-            run_id,
-            status: status as i8,
-        };
-        let mut insert = self.client.insert::<StatusRow>("run_status").await?;
-        insert.write(&row).await?;
-        insert.end().await?;
+        self.client
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), ?, ? FROM run_status WHERE run_id = ?")
+            .bind(run_id)
+            .bind(status as i8)
+            .bind(run_id)
+            .execute()
+            .await?;
         Ok(())
     }
+
+    pub async fn session(&self, id: Uuid) -> Result<Option<Session>> {
+        Ok(self
+            .client
+            .query("SELECT ?fields FROM run_sessions FINAL WHERE run_id = ?")
+            .bind(id)
+            .fetch_optional()
+            .await?)
+    }
+
+    pub async fn renew_session(&self, id: Uuid, session: Uuid) -> Result<()> {
+        self.client
+            .query(
+                "INSERT INTO run_sessions (run_id, session_id, updated_at) VALUES (?, ?, now64(9))",
+            )
+            .bind(id)
+            .bind(session)
+            .with_setting("async_insert", "1")
+            .with_setting("wait_for_async_insert", "1")
+            .execute()
+            .await?;
+        Ok(())
+    }
+}
+
+#[derive(clickhouse::Row, Deserialize)]
+pub struct Session {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub session_id: Uuid,
 }

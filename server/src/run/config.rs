@@ -10,10 +10,13 @@ pub struct Config {
     pub assets: HashMap<String, AssetConfig>,
     pub asset_type: Option<String>,
 }
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryConfig {
     pub sql: String,
+    #[serde(default)]
     pub params: BTreeMap<String, Value>,
+    #[serde(default)]
     pub repeat: bool,
 }
 #[derive(Clone, Deserialize)]
@@ -29,7 +32,7 @@ pub struct AssetConfig {
 struct Document {
     #[serde(default)]
     tensorlane: TensorlaneConfig,
-    queries: Vec<KeyedQuery>,
+    queries: Queries,
     #[serde(default, rename = "app")]
     _app: Map<String, Value>,
 }
@@ -56,14 +59,34 @@ struct KeyedQuery {
     repeat: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Queries {
+    Named(BTreeMap<String, QueryConfig>),
+    Legacy(Vec<KeyedQuery>),
+}
+
 impl Config {
     pub fn parse(document: &Map<String, Value>) -> Result<Self> {
         let document: Document = serde_json::from_value(Value::Object(document.clone()))
             .map_err(|error| anyhow!("invalid run config: {error}"))?;
-        ensure!(
-            !document.queries.is_empty(),
-            "config.queries must not be empty"
-        );
+        let queries = match document.queries {
+            Queries::Named(queries) => queries.into_iter().collect::<Vec<_>>(),
+            Queries::Legacy(queries) => queries
+                .into_iter()
+                .map(|q| {
+                    (
+                        q.key,
+                        QueryConfig {
+                            sql: q.sql,
+                            params: q.params,
+                            repeat: q.repeat,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        ensure!(!queries.is_empty(), "config.queries must not be empty");
         let settings = document.tensorlane;
         for (name, count) in [
             ("ranks", settings.ranks),
@@ -76,23 +99,16 @@ impl Config {
             );
         }
         let mut compiled = BTreeMap::new();
-        for query in document.queries {
-            ensure!(
-                !query.key.trim().is_empty(),
-                "query key must not be empty"
-            );
-            ensure!(
-                !compiled.contains_key(&query.key),
-                "duplicate query key: {}",
-                query.key
-            );
+        for (key, query) in queries {
+            ensure!(!key.trim().is_empty(), "query key must not be empty");
+            ensure!(!compiled.contains_key(&key), "duplicate query key: {}", key);
             ensure!(
                 !query.sql.trim().is_empty(),
                 "query {} SQL must not be empty",
-                query.key
+                key
             );
             compiled.insert(
-                query.key,
+                key,
                 QueryConfig {
                     sql: query.sql,
                     params: query.params,
@@ -135,11 +151,11 @@ mod tests {
     fn query_parameters_and_application_settings_are_independent() {
         let cfg = parse(json!({
             "tensorlane": {"num_workers": 2},
-            "queries": [
-                {"key": "training", "sql": "SELECT 1", "params": {"seed": 3, "batches": 4, "repeat": "SQL input"}},
-                {"key": "validation", "sql": "SELECT 2"},
-                {"key": "app", "sql": "SELECT 3", "params": {"seed": 9}, "repeat": true}
-            ],
+            "queries": {
+                "training": {"sql": "SELECT 1", "params": {"seed": 3, "batches": 4, "repeat": "SQL input"}},
+                "validation": {"sql": "SELECT 2"},
+                "app": {"sql": "SELECT 3", "params": {"seed": 9}, "repeat": true}
+            },
             "app": {"num_workers": "opaque", "queries": [1, 2], "seed": 100}
         })).unwrap();
         assert_eq!(cfg.queries["training"].params["seed"], 3);
@@ -172,8 +188,7 @@ mod tests {
     #[test]
     fn validates_namespaces_and_runtime_counts() {
         for name in ["ranks", "num_workers", "prefetch_factor"] {
-            let mut value =
-                json!({"tensorlane": {}, "queries": [{"key": "x", "sql": "SELECT 1"}]});
+            let mut value = json!({"tensorlane": {}, "queries": [{"key": "x", "sql": "SELECT 1"}]});
             value["tensorlane"][name] = json!(2);
             assert!(parse(value.clone()).is_ok());
             for invalid in [json!(0), json!(-1), json!(true), json!(1.5)] {

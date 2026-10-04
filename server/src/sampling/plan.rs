@@ -1,7 +1,11 @@
-use super::{BatchPlan, Sampler};
+use super::BatchPlan;
+#[cfg(test)]
+use super::Sampler;
 use crate::{MAX_BATCH_BYTES, db::SampleRow};
 use anyhow::{Context, Result, ensure};
-use futures::{Stream, TryStreamExt, future::BoxFuture};
+#[cfg(test)]
+use futures::future::BoxFuture;
+use futures::{Stream, TryStreamExt};
 use prost::Message;
 use std::path::{Path, PathBuf};
 use tokio::{
@@ -14,10 +18,14 @@ const MAX_BATCH_SAMPLES: usize = 65_536;
 
 struct PlanFile {
     path: PathBuf,
+    keep: bool,
 }
 impl Drop for PlanFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("index"));
+        }
     }
 }
 
@@ -39,12 +47,16 @@ impl QuerySampler {
         let output = File::create_new(&part)
             .await
             .context("creating query plan")?;
-        let mut file = PlanFile { path: part };
+        let mut file = PlanFile {
+            path: part,
+            keep: false,
+        };
         let mut writer = BufWriter::with_capacity(IO_BUFFER_BYTES, output);
         let mut previous = None;
         let (mut batches, mut samples, mut bytes) = (0u64, 0u64, 0u64);
         let (mut batch_bytes, mut batch_samples) = (0usize, 0usize);
         let mut encoded = Vec::new();
+        let mut offsets = Vec::new();
         futures::pin_mut!(rows);
         while let Some(row) = rows.try_next().await? {
             let size = row.encoded_len();
@@ -55,6 +67,7 @@ impl QuerySampler {
                 "query rows must be strictly ordered by batch_idx, sample_idx"
             );
             if previous.is_none_or(|(batch, _)| batch != row.batch_idx) {
+                offsets.extend_from_slice(&bytes.to_le_bytes());
                 batches += 1;
                 batch_bytes = 0;
                 batch_samples = 0;
@@ -72,6 +85,7 @@ impl QuerySampler {
             );
             row.sample()?;
             bytes += size as u64 + 4;
+            ensure!(bytes <= 512 * 1024 * 1024, "query plan exceeds 512 MiB");
             encoded.clear();
             row.encode(&mut encoded)?;
             writer.write_u32_le(size as u32).await?;
@@ -83,6 +97,7 @@ impl QuerySampler {
         drop(writer);
         fs::rename(&file.path, path).await?;
         file.path = path.to_path_buf();
+        crate::shared_cache::write_atomic(&path.with_extension("index"), &offsets).await?;
         let reader = BufReader::with_capacity(IO_BUFFER_BYTES, File::open(path).await?);
         tracing::info!(
             stream = name,
@@ -98,6 +113,39 @@ impl QuerySampler {
             batches,
             _file: file,
         })
+    }
+
+    pub fn persist(&mut self) {
+        self._file.keep = true;
+    }
+
+    pub async fn open(path: &Path, repeat: bool) -> Result<Self> {
+        let length = fs::metadata(path.with_extension("index")).await?.len();
+        ensure!(length % 8 == 0, "invalid query plan index");
+        Ok(Self {
+            reader: BufReader::with_capacity(IO_BUFFER_BYTES, File::open(path).await?),
+            pending: None,
+            repeat,
+            batches: length / 8,
+            _file: PlanFile {
+                path: path.to_owned(),
+                keep: true,
+            },
+        })
+    }
+
+    pub async fn batch_at(&mut self, sequence: u64) -> Result<Option<BatchPlan>> {
+        if self.batches == 0 || (!self.repeat && sequence >= self.batches) {
+            return Ok(None);
+        }
+        let mut index = File::open(self._file.path.with_extension("index")).await?;
+        index
+            .seek(std::io::SeekFrom::Start((sequence % self.batches) * 8))
+            .await?;
+        let offset = index.read_u64_le().await?;
+        self.reader.seek(std::io::SeekFrom::Start(offset)).await?;
+        self.pending = None;
+        self.read_batch().await
     }
 
     async fn read_row(&mut self) -> Result<Option<SampleRow>> {
@@ -154,6 +202,7 @@ impl QuerySampler {
         Ok(Some(batch))
     }
 }
+#[cfg(test)]
 impl Sampler for QuerySampler {
     fn next_batch(&mut self) -> BoxFuture<'_, Result<Option<BatchPlan>>> {
         Box::pin(self.read_batch())

@@ -22,29 +22,26 @@ futures = "0.3.31"
 prost = "0.13.5"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10.9"
 subtle = "2.6.1"
 time = { version = "0.3", features = ["serde-well-known"] }
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-stream = "0.1.17"
-tokio-util = { version = "0.7.19", features = ["rt"] }
-tonic = { version = "0.13.1", features = ["tls-aws-lc"] }
+tokio-util = { version = "0.7.19", features = ["rt", "io"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 uuid = { version = "1.16.0", features = ["v4", "serde"] }
 clickhouse = { version = "0.15.2", features = ["uuid", "time", "rustls-tls", "inserter"] }
+tower = { version = "0.5", features = ["util", "limit"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 serde-big-array = "0.5.1"
 hex = "0.4.3"
 error-context = { workspace = true }
-
-[build-dependencies]
-protox = "0.7.2"
-tonic-build = { version = "0.13.1", default-features = false, features = ["prost"] }
+tensorlane-protocol = { path = "../protocol" }
+fs2 = "0.4"
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 testcontainers-modules = { version = "0.15.0", features = ["clickhouse", "minio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"

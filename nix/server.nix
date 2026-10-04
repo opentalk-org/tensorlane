@@ -16,7 +16,7 @@ pkgs.rustPlatform.buildRustPackage {
       (source + "/client/build.rs")
       (source + "/client/src")
       (source + "/error-context")
-      (source + "/proto")
+      (source + "/protocol")
       (source + "/queries/examples")
     ];
   };
