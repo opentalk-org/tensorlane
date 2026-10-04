@@ -142,8 +142,29 @@ impl UploadClient {
         })
     }
 
-    fn metric(&self, py: Python<'_>, step: u64, name: String, value: f32) -> anyhow::Result<()> {
-        self.send(py, Upload::Metric { step, name, value })
+    #[pyo3(signature = (step, name, value, timeout=None))]
+    fn metric(
+        &self,
+        py: Python<'_>,
+        step: u64,
+        name: String,
+        value: f32,
+        timeout: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let command = Command::Send(Upload::Metric { step, name, value });
+        let Some(timeout) = timeout else {
+            return py.allow_threads(|| self.enqueue(command));
+        };
+        let timeout = Duration::try_from_secs_f64(timeout)?;
+        let sender = self.command_sender()?;
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                tokio::time::timeout(timeout, sender.send(command))
+                    .await
+                    .context("metric enqueue timed out")?
+                    .map_err(|_| self.error())
+            })
+        })
     }
 
     fn metric_artifact(
@@ -204,19 +225,26 @@ impl UploadClient {
     #[pyo3(signature = (timeout=None))]
     fn flush(&self, py: Python<'_>, timeout: Option<f64>) -> anyhow::Result<()> {
         let timeout = timeout.map(Duration::try_from_secs_f64).transpose()?;
+        let sender = self.command_sender()?;
         let (reply, received) = oneshot::channel();
-        py.allow_threads(|| self.enqueue(Command::Flush(reply)))?;
         py.allow_threads(|| {
             self.runtime.block_on(async {
+                let operation = async {
+                    sender
+                        .send(Command::Flush(reply))
+                        .await
+                        .map_err(|_| self.error())?;
+                    received
+                        .await
+                        .map_err(|_| self.error())?
+                        .map_err(|error| anyhow!(error))
+                };
                 let result = match timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, received)
+                    Some(timeout) => tokio::time::timeout(timeout, operation)
                         .await
                         .context("upload flush timed out")?,
-                    None => received.await,
+                    None => operation.await,
                 };
-                let result = result
-                    .map_err(|_| self.error())
-                    .and_then(|reply| reply.map_err(|error| anyhow!(error)));
                 if result.is_err() {
                     self.sender.lock().unwrap().take();
                 }
@@ -262,12 +290,16 @@ impl UploadClient {
                 .unwrap_or_else(|| "upload connection closed".into())
         )
     }
-    fn enqueue(&self, command: Command) -> anyhow::Result<()> {
+    fn command_sender(&self) -> anyhow::Result<mpsc::Sender<Command>> {
         self.sender
             .lock()
             .map_err(|_| anyhow!("upload lock poisoned"))?
             .as_ref()
-            .context("upload client is closed")?
+            .context("upload client is closed")
+            .cloned()
+    }
+    fn enqueue(&self, command: Command) -> anyhow::Result<()> {
+        self.command_sender()?
             .blocking_send(command)
             .map_err(|_| self.error())
     }

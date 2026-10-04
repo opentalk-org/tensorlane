@@ -2,6 +2,7 @@ mod cases;
 mod recovery;
 mod services;
 mod setup;
+mod stress;
 mod training;
 mod uploads;
 

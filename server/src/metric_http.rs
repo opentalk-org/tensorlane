@@ -7,6 +7,7 @@ use tokio::fs;
 use uuid::Uuid;
 
 use crate::{
+    db,
     runtime::Runtime,
     shared_cache::{Lock, write_atomic},
 };
@@ -77,7 +78,9 @@ pub async fn save(
         .clone()
         .with_setting("insert_deduplication_token", request.to_string());
     if !batch.scalars.is_empty() {
-        let mut insert = client.insert::<ScalarRecord>("metrics").await?;
+        let mut insert = db::request(client.insert::<ScalarRecord>("metrics"))
+            .await?
+            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
         for metric in batch.scalars {
             insert
                 .write(&ScalarRecord {
@@ -92,7 +95,9 @@ pub async fn save(
         insert.end().await?;
     }
     if !batch.arrays.is_empty() {
-        let mut insert = client.insert::<ArrayRecord>("array_metrics").await?;
+        let mut insert = db::request(client.insert::<ArrayRecord>("array_metrics"))
+            .await?
+            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
         for metric in batch.arrays {
             insert
                 .write(&ArrayRecord {

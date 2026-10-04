@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::db;
 use clickhouse::Client;
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -61,10 +62,12 @@ impl UploadStore {
         content_type: &str,
     ) -> anyhow::Result<()> {
         self.upload(local_path, &record.path, content_type).await?;
-        let mut insert = self
-            .database
-            .insert::<crate::asset_repo::AssetRecord>("assets")
-            .await?;
+        let mut insert = db::request(
+            self.database
+                .insert::<crate::asset_repo::AssetRecord>("assets"),
+        )
+        .await?
+        .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
         insert.write(record).await?;
         insert.end().await?;
         Ok(())
@@ -96,7 +99,9 @@ impl UploadStore {
             .database
             .clone()
             .with_setting("insert_deduplication_token", id.to_string());
-        let mut insert = client.insert::<ArtifactRecord>("artifacts").await?;
+        let mut insert = db::request(client.insert::<ArtifactRecord>("artifacts"))
+            .await?
+            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
         insert.write(&row).await?;
         insert.end().await?;
         Ok(())

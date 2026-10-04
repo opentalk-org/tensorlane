@@ -112,6 +112,21 @@ async fn checkpoint(
         .send()
         .await?
         .error_for_status()?;
+    if restart {
+        tokio::fs::remove_file(
+            env.cache
+                .join("http-uploads")
+                .join(id.to_string())
+                .join("data"),
+        )
+        .await?;
+        env.restart().await?;
+        env.request(Method::PUT, &path)
+            .json(&spec)
+            .send()
+            .await?
+            .error_for_status()?;
+    }
     for (index, chunk) in body.chunks(TRANSFER_CHUNK_BYTES).enumerate() {
         for _ in 0..2 {
             env.request(Method::PUT, &format!("{path}/chunks/{index}"))

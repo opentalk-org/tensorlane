@@ -48,3 +48,18 @@ class RecoveryTests(PipelineCase):
             self.service.asset_gate.set()
         self.assertLess(time.monotonic() - started, 3)
         self.assertFalse(list(Path(self.temp.name).rglob("init.json")))
+
+    def test_flush_deadline_includes_automatic_metrics_lock(self):
+        self.start(transform_fn=None, workers=1)
+        self.daemon.metric(0, "loss", 0.5)
+        self.daemon.flush(timeout=5)
+        performance = self.daemon._performance_collector()
+        performance.event("test", 0.1)
+        performance._sending.acquire()
+        started = time.monotonic()
+        try:
+            self.daemon.flush(timeout=0.05)
+        finally:
+            performance._sending.release()
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.daemon.flush(timeout=5)

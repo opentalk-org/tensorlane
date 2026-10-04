@@ -8,7 +8,14 @@ from urllib.parse import quote
 from . import _native
 
 INTERVAL = 10.0
-STAGES = ("server_load", "server_wait", "http_receive_wait", "transform_work", "collate", "data_wait")
+STAGES = (
+    "server_load",
+    "server_wait",
+    "http_receive_wait",
+    "transform_work",
+    "collate",
+    "data_wait",
+)
 REPORTED_STAGES = {"server_load", "transform_work", "collate", "data_wait"}
 
 
@@ -29,8 +36,14 @@ class Performance:
     def _state(self, stream):
         if stream not in self._streams:
             self._streams[stream] = dict(
-                batches=0, samples=0, errors=0, reported_errors=0, step=0,
-                application=0.0, intervals=0, timings=[0.0] * len(STAGES),
+                batches=0,
+                samples=0,
+                errors=0,
+                reported_errors=0,
+                step=0,
+                application=0.0,
+                intervals=0,
+                timings=[0.0] * len(STAGES),
                 since=time.monotonic(),
             )
         return self._streams[stream]
@@ -71,7 +84,11 @@ class Performance:
             for stream, state in self._streams.items():
                 batches, samples = state["batches"], state["samples"]
                 elapsed = max(now - state["since"], 1e-9)
-                if not (batches or state["intervals"] or state["errors"] != state["reported_errors"]):
+                if not (
+                    batches
+                    or state["intervals"]
+                    or state["errors"] != state["reported_errors"]
+                ):
                     continue
                 values = {}
                 if batches:
@@ -80,32 +97,62 @@ class Performance:
                         if name in REPORTED_STAGES:
                             values[f"{name}_seconds_mean"] = total / batches
                 if state["intervals"]:
-                    values["application_seconds_mean"] = state["application"] / state["intervals"]
+                    values["application_seconds_mean"] = (
+                        state["application"] / state["intervals"]
+                    )
                 if state["errors"] != state["reported_errors"]:
                     values["errors_total"] = state["errors"]
                 for name, value in values.items():
-                    result.append((state["step"], prefix + quote(stream, safe="") + "/" + name, value))
-                state.update(batches=0, samples=0, application=0.0, intervals=0,
-                             reported_errors=state["errors"], timings=[0.0] * len(STAGES), since=now)
+                    result.append(
+                        (
+                            state["step"],
+                            prefix + quote(stream, safe="") + "/" + name,
+                            value,
+                        )
+                    )
+                state.update(
+                    batches=0,
+                    samples=0,
+                    application=0.0,
+                    intervals=0,
+                    reported_errors=state["errors"],
+                    timings=[0.0] * len(STAGES),
+                    since=now,
+                )
             for name, (count, total) in self._events.items():
                 result.append((0, prefix + name, total / count))
             self._events.clear()
         return result
 
-    def flush(self):
-        with self._sending:
+    def flush(self, *, deadline=None):
+        deadline = (
+            min(deadline, time.monotonic() + 5)
+            if deadline is not None
+            else time.monotonic() + 5
+        )
+        if not self._sending.acquire(timeout=max(0, deadline - time.monotonic())):
+            return
+        try:
             values = self.snapshot()
             if not values:
                 return
             try:
                 if self._client is None:
-                    self._client = _native.UploadClient(self._root / "uploads.sock", automatic=True)
+                    self._client = _native.UploadClient(
+                        self._root / "uploads.sock", automatic=True
+                    )
                 for step, name, value in values:
-                    self._client.metric(step, name, value)
-                self._client.flush(timeout=5)
+                    self._client.metric(
+                        step, name, value, timeout=max(0, deadline - time.monotonic())
+                    )
+                self._client.flush(timeout=max(0, deadline - time.monotonic()))
             except Exception as error:
-                logging.getLogger("tensorlane").warning("performance metrics upload failed: %s", error)
+                logging.getLogger("tensorlane").warning(
+                    "performance metrics upload failed: %s", error
+                )
                 self._client = None
+        finally:
+            self._sending.release()
 
     def _run(self):
         while not self._stopped.wait(INTERVAL):

@@ -1,3 +1,4 @@
+use crate::db;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -83,12 +84,13 @@ impl AssetRepo {
         Self { client }
     }
     pub async fn get(&self, id: Uuid) -> Result<Option<AssetRecord>> {
-        Ok(self
-            .client
-            .query("SELECT ?fields FROM assets FINAL WHERE id = ? AND NOT deleted")
-            .bind(id)
-            .fetch_optional()
-            .await?)
+        Ok(db::request(
+            self.client
+                .query("SELECT ?fields FROM assets FINAL WHERE id = ? AND NOT deleted")
+                .bind(id)
+                .fetch_optional(),
+        )
+        .await?)
     }
     pub async fn for_run(&self, id: Uuid, name: Option<&str>) -> Result<Vec<AssetRecord>> {
         let sql = if name.is_some() {
@@ -100,6 +102,6 @@ impl AssetRepo {
         if let Some(name) = name {
             query = query.bind(name);
         }
-        Ok(query.fetch_all().await?)
+        Ok(db::request(query.fetch_all()).await?)
     }
 }

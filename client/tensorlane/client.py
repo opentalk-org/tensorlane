@@ -238,17 +238,19 @@ class TensorLane:
     def flush(self, *, timeout: float | None = None) -> None:
         if self._closed:
             raise RuntimeError("TensorLane handle is closed")
+        deadline = None if timeout is None else time.monotonic() + timeout
         if self._uploads is not None:
             started = time.monotonic()
+            remaining = None if deadline is None else max(0, deadline - started)
             try:
-                self._uploads.flush(timeout)
+                self._uploads.flush(remaining)
             finally:
                 if self._performance is not None:
                     self._performance.event(
                         "uploads/flush_seconds", time.monotonic() - started
                     )
         if self._performance is not None:
-            self._performance.flush()
+            self._performance.flush(deadline=deadline)
 
     async def flush_async(self, *, timeout: float | None = None) -> None:
         await asyncio.to_thread(self.flush, timeout=timeout)

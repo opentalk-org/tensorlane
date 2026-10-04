@@ -175,8 +175,12 @@ impl TestEnv {
         Ok(())
     }
     pub async fn restart(&mut self) -> Result<()> {
+        self.restart_after(Duration::ZERO).await
+    }
+    pub async fn restart_after(&mut self, downtime: Duration) -> Result<()> {
         self.server.kill()?;
         self.server.wait()?;
+        tokio::time::sleep(downtime).await;
         self.server = self.command.spawn()?;
         self.ready().await
     }
