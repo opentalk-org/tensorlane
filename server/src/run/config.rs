@@ -217,8 +217,6 @@ mod tests {
     #[test]
     fn bundled_configurations_use_the_keyed_query_schema() {
         for source in [
-            include_str!("../../../sample-configs.json"),
-            include_str!("../../../sample-configs-stage2.json"),
             include_str!("../../../queries/examples/sample-configs.json"),
             include_str!("../../../queries/examples/sample-configs-stage2.json"),
         ] {

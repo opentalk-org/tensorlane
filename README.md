@@ -145,4 +145,4 @@ nix develop -c cargo test -p tensorlane --test e2e -- --test-threads=1
 
 Integration tests require Docker for ClickHouse and MinIO. Set `TENSORLANE_TEST_PYTHON` to the prepared Python executable to include the training examples.
 
-[Example run configuration](sample-configs.json) · [Resume configuration](queries/examples/sample-configs-stage2.json) · [Load benchmark](client/benchmarks/load_test.py)
+[Example run configuration](queries/examples/sample-configs.json) · [Resume configuration](queries/examples/sample-configs-stage2.json) · [Load benchmark](client/benchmarks/load_test.py)
