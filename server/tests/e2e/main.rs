@@ -1,4 +1,5 @@
 mod cases;
+mod performance;
 mod recovery;
 mod services;
 mod setup;
