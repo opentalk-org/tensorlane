@@ -1,7 +1,6 @@
 use std::path::Path;
 
-use crate::db;
-use clickhouse::Client;
+use crate::{db, runtime::Runtime};
 use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -21,36 +20,7 @@ struct ArtifactRecord {
     size_bytes: u64,
 }
 
-#[derive(Clone)]
-pub struct UploadStore {
-    s3: aws_sdk_s3::Client,
-    database: Client,
-    bucket: &'static str,
-    checkpoint_prefix: &'static str,
-    metrics_prefix: &'static str,
-}
-
-impl UploadStore {
-    pub fn new(
-        s3: aws_sdk_s3::Client,
-        database: Client,
-        bucket: &'static str,
-        checkpoint_prefix: &'static str,
-        metrics_prefix: &'static str,
-    ) -> anyhow::Result<Self> {
-        let checkpoint_prefix = checkpoint_prefix.trim_matches('/');
-        let metrics_prefix = metrics_prefix.trim_matches('/');
-        anyhow::ensure!(!checkpoint_prefix.is_empty(), "checkpoint prefix is empty");
-        anyhow::ensure!(!metrics_prefix.is_empty(), "metrics prefix is empty");
-        Ok(Self {
-            s3,
-            database,
-            bucket,
-            checkpoint_prefix,
-            metrics_prefix,
-        })
-    }
-
+impl Runtime {
     pub fn asset_key(&self, id: Uuid) -> String {
         format!("{}/{}", self.checkpoint_prefix, id)
     }

@@ -19,8 +19,8 @@ pub async fn save(
     path: &Path,
 ) -> Result<()> {
     let run = metadata.run_id.parse()?;
-    let (_, config) = engine.active(run, session).await?;
-    if let Some(existing) = engine.repo.assets().get(id).await? {
+    let config = engine.active(run, session).await?;
+    if let Some(existing) = engine.repo.get_asset(id).await? {
         ensure!(
             existing.run_id == run
                 && existing.name == metadata.name
@@ -37,15 +37,11 @@ pub async fn save(
     let record: AssetRecord = if fs::try_exists(&intent).await? {
         serde_json::from_slice(&fs::read(&intent).await?)?
     } else {
-        let mut previous = engine
-            .repo
-            .assets()
-            .for_run(run, Some(&metadata.name))
-            .await?;
+        let mut previous = engine.repo.run_assets(run, Some(&metadata.name)).await?;
         let parent = match previous.pop() {
             Some(parent) => Some(parent),
             None => match config.assets.get(&metadata.name).and_then(|a| a.asset_id) {
-                Some(id) => engine.repo.assets().get(id).await?,
+                Some(id) => engine.repo.get_asset(id).await?,
                 None => None,
             },
         };
@@ -61,7 +57,7 @@ pub async fn save(
             kind: crate::asset_repo::kind_value(&metadata.kind)?,
             name: metadata.name.clone(),
             step: metadata.step,
-            path: engine.uploads.asset_key(id),
+            path: engine.asset_key(id),
             size,
             content_hash: hash.as_bytes().try_into()?,
             asset_type: metadata
@@ -79,7 +75,6 @@ pub async fn save(
         record
     };
     engine
-        .uploads
         .save_asset(&record, path, &metadata.content_type)
         .await
 }

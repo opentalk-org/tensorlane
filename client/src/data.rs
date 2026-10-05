@@ -5,11 +5,10 @@ use prost::Message;
 use reqwest::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
     sync::Arc,
     thread::{self, JoinHandle},
 };
-use tensorlane_protocol::DataResponse;
+use tensorlane_protocol::{DataResponse, Sample};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -21,9 +20,7 @@ pub enum Work {
         query_batch_idx: u64,
         timings: [f64; 3],
         index: usize,
-        sample_id: String,
-        metadata_json: String,
-        blobs: HashMap<String, Vec<u8>>,
+        sample: Sample,
     },
     End {
         stream: String,
@@ -130,9 +127,7 @@ pub async fn prefetch(
                 query_batch_idx: response.query_batch_idx,
                 timings,
                 index,
-                sample_id: sample.sample_id,
-                metadata_json: sample.metadata_json,
-                blobs: sample.blobs,
+                sample,
             })
             .context("transform worker disconnected")?;
         }

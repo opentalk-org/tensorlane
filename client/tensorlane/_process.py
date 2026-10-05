@@ -57,11 +57,14 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
         ended = set()
         with torch.no_grad():
             while not stopped.is_set():
-                message = receiver.recv()
+                message = receiver.recv() if len(ended) < len(streams) else None
                 if not errors.empty():
                     raise RuntimeError(
                         "transformed sample queue failed"
                     ) from errors.get()
+                if len(ended) == len(streams):
+                    stopped.wait(0.1)
+                    continue
                 if message is None:
                     if stopped.is_set():
                         return
@@ -104,13 +107,6 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                     ended.add(stream)
                 else:
                     raise RuntimeError("unexpected work message")
-                if len(ended) == len(streams):
-                    while not stopped.wait(0.1):
-                        if not errors.empty():
-                            raise RuntimeError(
-                                "transformed sample queue failed"
-                            ) from errors.get()
-                    return
     except Exception:
         if not stopped.is_set():
             raise
@@ -219,6 +215,6 @@ def collate_worker(
         while next_batch[stream] in completed[stream]:
             batch_id = next_batch[stream]
             outputs[stream][batch_id % ranks].put(
-                ("batch", (batch_id, completed[stream].pop(batch_id)))
+                ("batch", completed[stream].pop(batch_id))
             )
             next_batch[stream] += 1

@@ -72,6 +72,7 @@ def init(
     transform = _validate_callbacks(transform)
     collate_fn = _validate_callbacks(collate_fn)
     root = _root(run_id, ipc_dir)
+    native = None
     if not start_daemon:
         metadata_path = root / "init.json"
         while not metadata_path.exists():
@@ -86,47 +87,46 @@ def init(
         _stream_callbacks(collate_fn, metadata["streams"])
         if rank >= int((root / "ranks").read_text()):
             raise ValueError("invalid rank")
-        return TensorLane(
+    else:
+        native = _native.Daemon(
+            run_id,
+            addr or os.environ.get("TENSORLANE_ADDR", "localhost:8180"),
             root,
-            metadata["run_id"],
-            metadata["config"],
+            ranks,
+            prefetch_factor,
+            num_workers,
             rank,
-            assets={name: Path(path) for name, path in metadata["assets"].items()},
-            streams=metadata["streams"],
-            asset_metadata=metadata["asset_metadata"],
-            ranks=metadata["ranks"],
-            num_workers=metadata["num_workers"],
-            prefetch_factor=metadata["prefetch_factor"],
-            performance_metrics=performance_metrics,
+            api_key if api_key is not None else os.environ.get("TENSORLANE_API_KEY"),
+            timeout,
         )
-
-    native = _native.Daemon(
-        run_id,
-        addr or os.environ.get("TENSORLANE_ADDR", "localhost:8180"),
-        root,
-        ranks,
-        prefetch_factor,
-        num_workers,
-        rank,
-        api_key if api_key is not None else os.environ.get("TENSORLANE_API_KEY"),
-        timeout,
-    )
+        metadata = {
+            "run_id": native.run_id,
+            "config": json.loads(native.config),
+            "assets": {name: str(path) for name, path in native.assets.items()},
+            "streams": native.streams,
+            "asset_metadata": {
+                name: json.loads(value) for name, value in native.asset_metadata.items()
+            },
+            "ranks": native.ranks,
+            "num_workers": native.num_workers,
+            "prefetch_factor": native.prefetch_factor,
+        }
     daemon = TensorLane(
         root,
-        native.run_id,
-        native.config,
+        metadata["run_id"],
+        metadata["config"],
         rank,
         native,
-        assets={name: Path(path) for name, path in native.assets.items()},
-        streams=native.streams,
-        asset_metadata={
-            name: json.loads(value) for name, value in native.asset_metadata.items()
-        },
-        ranks=native.ranks,
-        num_workers=native.num_workers,
-        prefetch_factor=native.prefetch_factor,
+        assets={name: Path(path) for name, path in metadata["assets"].items()},
+        streams=metadata["streams"],
+        asset_metadata=metadata["asset_metadata"],
+        ranks=metadata["ranks"],
+        num_workers=metadata["num_workers"],
+        prefetch_factor=metadata["prefetch_factor"],
         performance_metrics=performance_metrics,
     )
+    if native is None:
+        return daemon
 
     ranks = daemon.ranks
     num_workers = daemon.num_workers
@@ -165,7 +165,6 @@ def init(
         daemon._processes.append(process)
         daemon._monitor = threading.Thread(
             target=daemon._supervise_processes,
-            args=(root,),
             name="tensorlane-process-monitor",
             daemon=True,
         )
@@ -180,22 +179,7 @@ def init(
                 raise TimeoutError("TensorLane workers did not become ready")
             time.sleep(0.02)
         temporary = root / "init.tmp"
-        temporary.write_text(
-            json.dumps(
-                {
-                    "run_id": daemon.run_id,
-                    "ranks": daemon.ranks,
-                    "num_workers": daemon.num_workers,
-                    "prefetch_factor": daemon.prefetch_factor,
-                    "config": daemon.config,
-                    "streams": daemon.streams,
-                    "asset_metadata": daemon.asset_metadata,
-                    "assets": {
-                        name: str(path) for name, path in daemon._assets.items()
-                    },
-                }
-            )
-        )
+        temporary.write_text(json.dumps(metadata))
         temporary.replace(root / "init.json")
         native.check()
         return daemon

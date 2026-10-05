@@ -247,11 +247,12 @@ async fn input_bytes(
         .get("range")
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
-    crate::asset_http::parse_range(range, source.download.size)
+    let range = crate::asset_http::parse_range(range, source.download.size)
         .map_err(|e| AppError::new(StatusCode::RANGE_NOT_SATISFIABLE, e))?;
     if headers
         .get("if-match")
-        .and_then(|h| h.to_str().ok())
+        .map(|tag| tag.to_str())
+        .transpose()?
         .is_some_and(|tag| tag != source.download.etag)
     {
         return Err(AppError::new(
@@ -259,7 +260,7 @@ async fn input_bytes(
             anyhow::anyhow!("input asset changed during download"),
         ));
     }
-    crate::asset_http::download(engine, source, headers)
+    crate::asset_http::download(engine, source, range)
         .await
         .map_err(Into::into)
 }

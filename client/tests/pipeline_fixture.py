@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -57,6 +58,21 @@ class Authorization:
         self.methods = set()
 
 
+class Handler(BaseHTTPRequestHandler):
+    def __init__(self, fixture, request, client_address, server):
+        self.fixture = fixture
+        super().__init__(request, client_address, server)
+
+    def do_GET(self):
+        self.fixture.handle(self)
+
+    do_POST = do_GET
+    do_PUT = do_GET
+
+    def log_message(self, *args):
+        pass
+
+
 class Fixture:
     def __init__(self, authorization=None):
         self.streams = {"training": 5, "validation": 3, "evaluation": 2}
@@ -97,19 +113,7 @@ class Fixture:
         self.end_gate.set()
         self.lock = threading.Lock()
         self.authorization = authorization
-        fixture = self
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                fixture.handle(self)
-
-            do_POST = do_GET
-            do_PUT = do_GET
-
-            def log_message(self, *args):
-                pass
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), partial(Handler, self))
         self.port = self.server.server_port
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()

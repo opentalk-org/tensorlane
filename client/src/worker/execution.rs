@@ -30,15 +30,15 @@ pub(super) async fn supervise(
     let work_listener = UnixListener::bind(options.root.join("work.sock"))?;
     let upload_listener = UnixListener::bind(options.root.join("uploads.sock"))?;
     let mut remote = None;
-    let mut heartbeat = None;
     let startup_timeout = options.startup_timeout;
     let startup = async {
         let http =
             crate::transport::connect(&options.addr, options.api_key.as_deref(), session).await?;
         let initialized = http.initialize(&options.run_id).await?;
         remote = Some((http.clone(), initialized.run_id.clone()));
-        heartbeat = Some(tokio_util::task::AbortOnDropHandle::new(tokio::spawn(
-            send_heartbeats(http.clone(), initialized.run_id.clone()),
+        let heartbeat = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(send_heartbeats(
+            http.clone(),
+            initialized.run_id.clone(),
         )));
         let settings = Settings::resolve(&options, &initialized.config)?;
         std::fs::write(options.root.join("ranks"), settings.ranks.to_string())?;
@@ -81,15 +81,11 @@ pub(super) async fn supervise(
                 settings,
             }))
             .map_err(|_| anyhow!("initializer disconnected"))?;
-        let mut sockets = Vec::new();
-        for _ in 0..settings.num_workers {
-            sockets.push(work_listener.accept().await?.0);
-        }
         let mut work = Vec::new();
-        for socket in sockets {
-            work.push(Sender::<Work, _>::new(socket));
+        for _ in 0..settings.num_workers {
+            work.push(Sender::<Work, _>::new(work_listener.accept().await?.0));
         }
-        anyhow::Ok((http, initialized, work))
+        anyhow::Ok((http, initialized, work, heartbeat))
     };
     let started = tokio::select! {
         result = startup => result.map(Some),
@@ -101,7 +97,7 @@ pub(super) async fn supervise(
             }
         } => Err(anyhow!("TensorLane startup timed out")),
     };
-    let (http, initialized, work) = match started {
+    let (http, initialized, work, mut heartbeat) = match started {
         Ok(Some(started)) => started,
         result => {
             let ended = match remote {
@@ -117,7 +113,6 @@ pub(super) async fn supervise(
             return result.map(|_| ()).and(ended);
         }
     };
-    let mut heartbeat = heartbeat.context("heartbeat task was not started")?;
     let uploads_stopping = CancellationToken::new();
     let mut uploads = tokio::spawn(crate::uploads::serve(
         upload_listener,

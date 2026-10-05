@@ -24,9 +24,7 @@ class BatchReader(Iterator[Batch]):
     ) -> None:
         if rank < 0 or timeout <= 0:
             raise ValueError("rank must be nonnegative and timeout must be positive")
-        self._root = root
         self._check = check
-        self._rank = rank
         self._performance = performance
         self._stream = stream
         self._returned = None
@@ -39,11 +37,11 @@ class BatchReader(Iterator[Batch]):
         deadline = time.monotonic() + timeout
         try:
             self._check()
-            if rank >= int((self._root / "ranks").read_text()):
+            if rank >= int((root / "ranks").read_text()):
                 raise RuntimeError("invalid rank")
-            key = (self._root / "auth").read_bytes()
+            key = (root / "auth").read_bytes()
             multiprocessing.current_process().authkey = key
-            directory = self._root / "streams" / str(stream_index)
+            directory = root / "streams" / str(stream_index)
             self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
             try:
                 self._listener = Listener(
@@ -79,9 +77,6 @@ class BatchReader(Iterator[Batch]):
             self.close()
             raise
 
-    def __iter__(self) -> BatchReader:
-        return self
-
     def __next__(self) -> Batch:
         if self._closed:
             raise StopIteration
@@ -101,7 +96,7 @@ class BatchReader(Iterator[Batch]):
                 raise RuntimeError(value)
             if kind != "batch":
                 raise RuntimeError(f"unexpected rank message: {kind}")
-            _batch_id, batch = value
+            batch = value
             self._semaphore.post()
             self._returned = time.monotonic()
             if self._performance is not None:

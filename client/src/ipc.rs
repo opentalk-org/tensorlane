@@ -78,9 +78,11 @@ mod tests {
             query_batch_idx: 4,
             timings: [0.0; 3],
             index: 0,
-            sample_id: "sample".into(),
-            metadata_json: "{}".into(),
-            blobs: Default::default(),
+            sample: tensorlane_protocol::Sample {
+                sample_id: "sample".into(),
+                metadata_json: "{}".into(),
+                blobs: Default::default(),
+            },
         })
         .await?;
         assert!(matches!(

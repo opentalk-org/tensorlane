@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{db, run_config::Config};
+use crate::{asset_repo::AssetRecord, db};
 
 const SELECT_RUNS: &str = "
 select ?fields from runs
@@ -43,12 +43,15 @@ impl TryFrom<i8> for RunStatus {
     }
 }
 
+#[derive(Serialize)]
 pub struct Run {
+    #[serde(rename = "run_id")]
     pub id: Uuid,
     pub project_id: Uuid,
     pub name: String,
     pub config: Map<String, Value>,
     pub status: Option<RunStatus>,
+    #[serde(with = "time::serde::rfc3339::option")]
     pub status_timestamp: Option<OffsetDateTime>,
 }
 
@@ -106,7 +109,6 @@ impl RunRepo {
         name: &str,
         config: &Map<String, Value>,
     ) -> Result<Option<Uuid>> {
-        Config::parse(config)?;
         let project = db::request(
             self.client
                 .query("SELECT 1 FROM projects WHERE id = ? LIMIT 1")
@@ -132,8 +134,26 @@ impl RunRepo {
         Ok(Some(row.id))
     }
 
-    pub fn assets(&self) -> crate::asset_repo::AssetRepo {
-        crate::asset_repo::AssetRepo::new(self.client.clone())
+    pub async fn get_asset(&self, id: Uuid) -> Result<Option<AssetRecord>> {
+        Ok(db::request(
+            self.client
+                .query("SELECT ?fields FROM assets FINAL WHERE id = ? AND NOT deleted")
+                .bind(id)
+                .fetch_optional(),
+        )
+        .await?)
+    }
+    pub async fn run_assets(&self, id: Uuid, name: Option<&str>) -> Result<Vec<AssetRecord>> {
+        let sql = if name.is_some() {
+            "SELECT ?fields FROM assets FINAL WHERE run_id = ? AND NOT deleted AND name = ? ORDER BY updated_at, id"
+        } else {
+            "SELECT ?fields FROM assets FINAL WHERE run_id = ? AND NOT deleted ORDER BY updated_at, id"
+        };
+        let mut query = self.client.query(sql).bind(id);
+        if let Some(name) = name {
+            query = query.bind(name);
+        }
+        Ok(db::request(query.fetch_all()).await?)
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Run>> {

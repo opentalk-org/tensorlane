@@ -8,7 +8,9 @@ use std::{
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
 
-pub struct Lock(File);
+pub struct Lock {
+    _file: File,
+}
 impl Lock {
     pub async fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let path = path.to_owned();
@@ -20,7 +22,7 @@ impl Lock {
                 .truncate(false)
                 .open(path)?;
             match file.try_lock_exclusive() {
-                Ok(()) => Ok(Some(Self(file))),
+                Ok(()) => Ok(Some(Self { _file: file })),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
                 Err(e) => Err(e.into()),
             }
@@ -40,7 +42,7 @@ impl Lock {
         .await??;
         loop {
             match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self(file)),
+                Ok(()) => return Ok(Self { _file: file }),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -49,12 +51,6 @@ impl Lock {
         }
     }
 }
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
 pub struct TemporaryFile(pub PathBuf);
 impl Drop for TemporaryFile {
     fn drop(&mut self) {
@@ -63,11 +59,11 @@ impl Drop for TemporaryFile {
 }
 
 pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    crate::cache_limits::space(
-        path.parent().context("cache file has no parent")?,
-        bytes.len() as u64,
-    )
-    .await?;
+    let parent = path
+        .parent()
+        .context("cache file has no parent")?
+        .to_owned();
+    crate::cache_limits::space(&parent, bytes.len() as u64).await?;
     let part = TemporaryFile(path.with_extension(format!("{}.part", Uuid::new_v4())));
     let mut file = fs::File::create(&part.0).await?;
     file.write_all(bytes).await?;
@@ -76,10 +72,6 @@ pub async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&part.0, path)
         .await
         .context("publishing shared cache file")?;
-    let parent = path
-        .parent()
-        .context("cache file has no parent")?
-        .to_owned();
     tokio::task::spawn_blocking(move || File::open(parent)?.sync_all()).await??;
     Ok(())
 }
