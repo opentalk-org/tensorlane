@@ -7,7 +7,7 @@ from pipeline_fixture import PipelineCase, wait_for
 
 class RecoveryTests(PipelineCase):
     def test_parallel_batch_requests_preserve_order_and_credit_limit(self):
-        self.service.streams.update(training=5, validation=0, evaluation=0)
+        self.service.streams.update(training=18, validation=0, evaluation=0)
         gate = threading.Event()
         started = set()
         completed = set()
@@ -27,18 +27,18 @@ class RecoveryTests(PipelineCase):
         self.service.data = delayed_data
         try:
             self.start(
-                factor=3, workers=1, transform_fn=None, performance_metrics=False
+                factor=16, workers=1, transform_fn=None, performance_metrics=False
             )
-            wait_for(lambda: {1, 2}.issubset(completed))
-            self.assertEqual(started, {0, 1, 2})
+            wait_for(lambda: set(range(1, 16)).issubset(completed))
+            self.assertEqual(started, set(range(16)))
             self.assertNotIn(0, completed)
             gate.set()
             with self.daemon.batches("training") as reader:
                 batches = list(reader)
-            self.assertEqual([batch.batch_id for batch in batches], list(range(5)))
+            self.assertEqual([batch.batch_id for batch in batches], list(range(18)))
             self.assertEqual(
                 [batch.samples[0].metadata["position"] for batch in batches],
-                list(range(5)),
+                list(range(18)),
             )
         finally:
             gate.set()

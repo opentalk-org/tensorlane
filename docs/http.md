@@ -27,12 +27,12 @@ For a repeating stream, the sequence keeps increasing while the saved query
 result repeats. The protobuf messages are defined in `protocol/batch.proto`.
 Run management routes remain JSON HTTP APIs.
 
-Each stream fetches up to `min(ranks * prefetch_factor, 8)` batches concurrently.
+Each stream fetches up to `ranks * prefetch_factor` batches concurrently.
 The same prefetch credits cover outstanding requests and completed batches, so
 concurrency does not increase the configured buffer capacity. Responses reach
 transform workers in batch sequence order, even when requests finish out of order.
-Batch preparation loads up to four samples concurrently and emits them in saved
-query order. These changes preserve seeded sampling and replay order.
+Batch preparation loads samples and blobs concurrently and emits them in saved
+query order, preserving seeded sampling and replay order.
 
 Asset initialization does not fetch input contents. The first range request
 streams bytes from S3 to the client while caching them. Interrupted ranges are
@@ -61,10 +61,14 @@ shutdown leave run status and saved query results intact. Only explicit run
 completion changes a running run to succeeded or failed. Abandoned clients leave
 running records; `run_sessions.updated_at` exposes their last heartbeat.
 
-Per server process, preparation allows two queries, two batches, two upload
-commits, four sample-blob reads, and eight asset range requests at once. Upload
-queues have bounded capacity. Batches are limited to 64 MiB and query snapshots
-to 512 MiB. Uploads are limited to 16 GiB.
+Server batch-loading admission uses `config.tensorlane.max_load_memory_bytes`
+(default 256 MiB per run per server process), divided into independent stream
+pools. A batch exceeding its stream's share may run alone within that stream;
+its reservation lasts through cache publication. This is an estimated working-set
+target. Query preparation uses independent stream locks. Each server process
+allows two upload commits and eight asset range requests at once. Upload queues
+have bounded capacity. Batches are limited to 64 MiB and query snapshots to
+512 MiB. Uploads are limited to 16 GiB.
 
 CPU tensor storage is shared between Python transform workers, the collate worker,
 and readers. IPC still serializes Python metadata and tensor storage handles.
