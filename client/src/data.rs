@@ -112,7 +112,8 @@ pub async fn prefetch(
         if status == StatusCode::NO_CONTENT {
             break;
         }
-        let response = DataResponse::decode(bytes.as_slice()).context("invalid data batch")?;
+        let response =
+            DataResponse::decode(bytes::Bytes::from(bytes)).context("invalid data batch")?;
         let timings = [
             response.load_seconds,
             response.server_wait_seconds,

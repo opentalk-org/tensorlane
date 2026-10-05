@@ -37,7 +37,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
         assert_eq!(batch.batch_id, sequence);
         assert_eq!(batch.query_batch_idx, sequence);
         assert_eq!(batch.batch[0].sample_id, format!("sample-{sequence}"));
-        assert_eq!(batch.batch[0].blobs["payload"], b"payload");
+        assert_eq!(batch.batch[0].blobs["payload"].as_ref(), b"payload");
     }
     assert!(env.batch(&id, "training", 4).await?.is_none());
     assert_eq!(

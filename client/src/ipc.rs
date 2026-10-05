@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
 
 use anyhow::{Result, ensure};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
@@ -14,22 +14,29 @@ fn codec() -> LengthDelimitedCodec {
 }
 
 pub struct Sender<T, Socket = UnixStream> {
-    framed: FramedWrite<Socket, LengthDelimitedCodec>,
+    socket: Socket,
     marker: PhantomData<T>,
 }
 
 impl<T: Serialize, Socket: AsyncWrite + Unpin> Sender<T, Socket> {
     pub fn new(socket: Socket) -> Self {
         Self {
-            framed: FramedWrite::new(socket, codec()),
+            socket,
             marker: PhantomData,
         }
     }
 
     pub async fn send(&mut self, value: &T) -> Result<()> {
-        self.framed
-            .send(postcard::to_allocvec(value)?.into())
+        let bytes = postcard::to_allocvec(value)?;
+        ensure!(
+            bytes.len() <= crate::MAX_BATCH_BYTES,
+            "IPC message exceeds its size limit"
+        );
+        self.socket
+            .write_all(&(bytes.len() as u32).to_be_bytes())
             .await?;
+        self.socket.write_all(&bytes).await?;
+        self.socket.flush().await?;
         Ok(())
     }
 }
@@ -62,20 +69,25 @@ impl<T: DeserializeOwned, Socket: AsyncRead + Unpin> Receiver<T, Socket> {
 mod tests {
     use super::*;
     use crate::data::Work;
+    use futures_util::SinkExt;
     use tokio::{
         io::AsyncWriteExt,
         time::{Duration, timeout},
     };
+    use tokio_util::codec::FramedWrite;
 
     #[test]
     fn sample_blob_encoding_preserves_wire_format() -> Result<()> {
+        let blobs = std::collections::HashMap::from([("audio".to_owned(), vec![23; 100_000])]);
         let sample = tensorlane_protocol::Sample {
             sample_id: "audio".into(),
             metadata_json: "{}".into(),
-            blobs: std::collections::HashMap::from([("audio".into(), vec![23; 100_000])]),
+            blobs: blobs
+                .iter()
+                .map(|(name, bytes)| (name.clone(), bytes.clone().into()))
+                .collect(),
         };
-        let legacy =
-            postcard::to_allocvec(&(&sample.sample_id, &sample.metadata_json, &sample.blobs))?;
+        let legacy = postcard::to_allocvec(&(&sample.sample_id, &sample.metadata_json, &blobs))?;
         assert_eq!(postcard::to_allocvec(&sample)?, legacy);
         assert_eq!(
             postcard::from_bytes::<tensorlane_protocol::Sample>(&legacy)?,
@@ -174,6 +186,20 @@ mod tests {
             .write_all(&((crate::MAX_BATCH_BYTES + 1) as u32).to_be_bytes())
             .await?;
         assert!(Receiver::<Vec<u8>>::new(receiver).recv().await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_message_is_rejected_before_writing() -> Result<()> {
+        let (socket, receiver) = UnixStream::pair()?;
+        let mut sender = Sender::new(socket);
+        let bytes = bytes::Bytes::from(vec![0; crate::MAX_BATCH_BYTES + 1]);
+        assert!(sender.send(&bytes).await.is_err());
+        assert!(
+            timeout(Duration::from_millis(50), receiver.readable())
+                .await
+                .is_err()
+        );
         Ok(())
     }
 

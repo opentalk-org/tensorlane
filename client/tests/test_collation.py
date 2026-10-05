@@ -35,22 +35,27 @@ class CollationTests(unittest.TestCase):
                     "tensorlane._process.queue.Queue", side_effect=[*outputs, errors]
                 ),
             ):
-                incoming_get = incoming.get
 
-                def get(timeout):
+                def available(connections, timeout):
                     if incoming.empty():
                         stopped.set()
-                        raise queue.Empty
-                    return incoming_get(timeout=timeout)
+                        return []
+                    return connections
 
-                with patch.object(incoming, "get", side_effect=get):
+                with (
+                    patch("tensorlane._process.wait", side_effect=available),
+                    patch(
+                        "tensorlane._process._ipc.recv",
+                        side_effect=lambda connection: connection.get_nowait(),
+                    ),
+                ):
                     collate_worker(
                         root,
                         1,
                         1,
                         ("training", "validation", "evaluation"),
                         collate_fn,
-                        incoming,
+                        [incoming],
                         stopped,
                         ready,
                     )

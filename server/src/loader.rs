@@ -2,6 +2,7 @@ use crate::{MAX_BATCH_BYTES, sampling::BlobRef};
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
+use bytes::Bytes;
 use futures::future::try_join_all;
 use tokio::io::AsyncReadExt;
 
@@ -20,7 +21,7 @@ struct BlobRead {
 pub async fn load_blobs(
     loader: &dyn Loader,
     references: Vec<(BlobRef, usize)>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Vec<Bytes>> {
     let mut references: Vec<_> = references.into_iter().enumerate().collect();
     references.sort_unstable_by(|(_, (a, _)), (_, (b, _))| {
         (&a.object, a.byte_offset).cmp(&(&b.object, b.byte_offset))
@@ -54,14 +55,14 @@ pub async fn load_blobs(
              size,
              parts,
          }| async move {
-            let bytes = loader.load(&reference, size).await?;
+            let bytes: Bytes = loader.load(&reference, size).await?.into();
             ensure!(bytes.len() == size, "blob returned an unexpected size");
             if parts.len() == 1 {
                 return anyhow::Ok(vec![(parts[0].0, bytes)]);
             }
             Ok(parts
                 .into_iter()
-                .map(|(index, start, size)| (index, bytes[start..start + size].to_vec()))
+                .map(|(index, start, size)| (index, bytes.slice(start..start + size)))
                 .collect())
         },
     ))

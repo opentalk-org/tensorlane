@@ -5,8 +5,8 @@ from pathlib import Path
 from collections.abc import Callable, Iterator
 from multiprocessing.connection import Listener
 import socket
-import multiprocessing
 from . import _native
+from . import _ipc
 from .data import Batch
 from ._performance import Performance
 
@@ -41,7 +41,6 @@ class BatchReader(Iterator[Batch]):
             if rank >= int((root / "ranks").read_text()):
                 raise RuntimeError("invalid rank")
             key = (root / "auth").read_bytes()
-            multiprocessing.current_process().authkey = key
             directory = root / "streams" / str(stream_index)
             self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
             self._memory_semaphore = _native.Semaphore(
@@ -92,7 +91,7 @@ class BatchReader(Iterator[Batch]):
         try:
             while not connection.poll(0.1):
                 self._check()
-            kind, value = connection.recv()
+            kind, value = _ipc.recv(connection)
             if kind == "end":
                 self.close()
                 raise StopIteration

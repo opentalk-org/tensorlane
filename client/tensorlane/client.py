@@ -72,7 +72,7 @@ class TensorLane:
         self._closed = False
         self._native = native
         self._processes = []
-        self._queue = None
+        self._connections = []
         self._stopped = None
         self._monitor = None
         self._uploads = None
@@ -183,10 +183,9 @@ class TensorLane:
                 process.close()
             self._processes.clear()
         finally:
-            if self._queue is not None:
-                self._queue.close()
-                self._queue.join_thread()
-                self._queue = None
+            for connection in self._connections:
+                connection.close()
+            self._connections.clear()
             self._native.close()
 
     def _upload_client(self):

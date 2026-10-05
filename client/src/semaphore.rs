@@ -268,4 +268,53 @@ mod tests {
         rank.post()?;
         Ok(())
     }
+
+    #[tokio::test]
+    async fn memory_reservations_preserve_sequence_and_allow_oversized_batches() -> Result<()> {
+        let memory = Arc::new(MemoryBudget::new(2 * MEMORY_UNIT)?);
+        let later = {
+            let memory = memory.clone();
+            tokio::spawn(async move { memory.acquire(1, 4 * MEMORY_UNIT).await })
+        };
+        let first = memory.acquire(0, MEMORY_UNIT).await?;
+        assert_eq!(first.units, 1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!later.is_finished());
+        drop(first);
+        let oversized = tokio::time::timeout(Duration::from_secs(2), later).await???;
+        assert_eq!(oversized.units, 2);
+        let following = {
+            let memory = memory.clone();
+            tokio::spawn(async move { memory.acquire(2, MEMORY_UNIT).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!following.is_finished());
+        drop(oversized);
+        let _last = tokio::time::timeout(Duration::from_secs(2), following).await???;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_memory_and_sequence_waiters() -> Result<()> {
+        let memory = Arc::new(MemoryBudget::new(MEMORY_UNIT)?);
+        let _first = memory.acquire(0, MEMORY_UNIT).await?;
+        let mut waiters = Vec::new();
+        for sequence in [1, 2] {
+            let memory = memory.clone();
+            waiters.push(tokio::spawn(async move {
+                memory.acquire(sequence, MEMORY_UNIT).await
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+        memory.cancel();
+        for waiter in waiters {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), waiter)
+                    .await??
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 }
