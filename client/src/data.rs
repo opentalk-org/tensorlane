@@ -101,7 +101,7 @@ pub async fn prefetch(
         })
         // Credits bound both outstanding requests and unconsumed batches.
         // Ordered buffering keeps worker delivery independent of HTTP completion order.
-        .buffered(request_task.budget.capacity.min(8));
+        .buffered(request_task.budget.capacity);
     futures_util::pin_mut!(batches);
     while let Some(batch) = batches.next().await {
         let (expected_id, status, bytes, receive_seconds) = batch?;
