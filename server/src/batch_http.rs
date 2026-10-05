@@ -81,7 +81,7 @@ impl Runtime {
         let engine = self.clone();
         let result_path = cached.clone();
         let name = name.to_owned();
-        self.tasks.spawn(async move {
+        let preparation = self.tasks.spawn(async move {
             let _lock = lock;
             let result = async {
                 let Some((response, _memory)) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, limit).await? else {
@@ -95,7 +95,15 @@ impl Runtime {
                 crate::job::failed(&cached.with_extension("error"), &error).await;
             }
         });
-        if crate::job::wait_for_file(&result_path).await? {
+        let ready = tokio::select! {
+            result = crate::job::wait_for_file(&result_path) => result?,
+            result = preparation => {
+                result?;
+                crate::job::check(&result_path.with_extension("error")).await?;
+                fs::try_exists(&result_path).await?
+            }
+        };
+        if ready {
             Ok(Batch::Ready(result_path))
         } else {
             Ok(Batch::Pending)

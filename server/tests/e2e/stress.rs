@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 use std::{path::Path, time::Duration};
 use uuid::Uuid;
 
-struct TrainingClient {
-    process: tokio::process::Child,
-    group: i32,
+pub(super) struct TrainingClient {
+    pub process: tokio::process::Child,
+    pub group: i32,
 }
 
 impl Drop for TrainingClient {

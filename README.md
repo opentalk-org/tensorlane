@@ -145,6 +145,8 @@ nix develop -c cargo test -p tensorlane --test e2e -- --test-threads=1
 
 Integration tests require Docker for ClickHouse and MinIO. The tests cover HTTP retries, uploads, shared snapshots, and server restarts. Set `TENSORLANE_TEST_PYTHON` to the prepared Python executable to include a CPU training loop against the server.
 
+Run the optional throughput sweep and uninterrupted five-minute client/server test with `cargo test -p tensorlane --test e2e performance:: -- --ignored --test-threads=1 --nocapture` in the development shell. The sweep checks four runs with three streams each, 1/4/8 concurrent requests per stream, and 1 KiB/6 MiB/96 MiB run memory targets. It verifies uncached payloads and reports throughput and request latency; the five-minute test checks repeated batches and shared-memory tensors across three streams. The latter requires `TENSORLANE_TEST_PYTHON`.
+
 [Example run configuration](queries/examples/sample-configs.json) · [Resume configuration](queries/examples/sample-configs-stage2.json) · [Load benchmark](client/benchmarks/load_test.py)
 
 [HTTP protocol and recovery](docs/http.md) · [Authentication](docs/authentication.md)
