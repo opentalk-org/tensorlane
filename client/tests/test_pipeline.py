@@ -1,5 +1,6 @@
 from __future__ import annotations
 import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 from collections import UserDict
 from unittest.mock import patch
 import time
@@ -25,6 +26,37 @@ def read_rank(run_id, rank, root, output, stream="training"):
 
 
 class PipelineTests(PipelineCase):
+    def test_two_runs_share_batches_without_changing_process_authentication(self):
+        key = multiprocessing.current_process().authkey
+        self.service.blob_size = 1024 * 1024
+        first = self.start(workers=1, performance_metrics=False)
+        with tensorlane.init(
+            str(uuid.uuid4()),
+            transform,
+            num_workers=1,
+            addr=f"localhost:{self.service.port}",
+            ipc_dir=self.temp.name,
+            performance_metrics=False,
+            timeout=20,
+        ) as second:
+            self.assertEqual(multiprocessing.current_process().authkey, key)
+
+            def consume(lane):
+                with lane.batches("training") as reader:
+                    for index, batch in enumerate(reader):
+                        self.assertEqual(batch.batch_id, index)
+                        for sample in batch:
+                            self.assertEqual(sample["value"][0].item(), index)
+                            self.assertTrue(sample["value"].is_shared())
+                            self.assertEqual(sample["nested"][1][0], b"x" * 1024 * 1024)
+                    return index + 1
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(consume, lane) for lane in (first, second)]
+                self.assertEqual(
+                    [future.result(timeout=30) for future in futures], [5, 5]
+                )
+
     def test_transformed_and_collated_tensors_use_shared_memory(self):
         self.start(collate_fn=collate)
         with self.daemon.batches("training") as reader:
@@ -177,6 +209,22 @@ class PipelineTests(PipelineCase):
             wait_for(lambda: len(self.service.requests["training"]) == 2)
             time.sleep(0.1)
             self.assertEqual(len(self.service.requests["training"]), 2)
+
+    def test_oversized_prefetch_batches_drain_independent_streams(self):
+        self.service.config["tensorlane"]["max_prefetch_memory_bytes"] = 3 * 1024 * 1024
+        self.service.blob_size = 2 * 1024 * 1024
+        self.start(factor=4, workers=3)
+        wait_for(lambda: bool(self.service.requests["training"]))
+        for name in ("validation", "evaluation", "training"):
+            with self.daemon.batches(name) as reader:
+                batches = list(reader)
+            self.assertEqual(
+                [batch.batch_id for batch in batches],
+                list(range(self.service.streams[name])),
+            )
+            for batch in batches:
+                self.assertEqual(len(batch), batch.batch_id % 3 + 1)
+                self.assertTrue(all(sample["value"].is_shared() for sample in batch))
 
     def test_multiple_workers_preserve_order(self):
         self.service.streams["training"] = 10

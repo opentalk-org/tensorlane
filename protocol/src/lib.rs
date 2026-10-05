@@ -111,35 +111,7 @@ pub struct Sample {
     #[prost(string, tag = "7")]
     pub metadata_json: String,
     #[prost(map = "string, bytes", tag = "8")]
-    #[serde(with = "blob_bytes")]
-    pub blobs: HashMap<String, Vec<u8>>,
-}
-
-mod blob_bytes {
-    use super::*;
-    use serde::ser::SerializeMap;
-
-    pub fn serialize<S: serde::Serializer>(
-        blobs: &HashMap<String, Vec<u8>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(blobs.len()))?;
-        for (name, bytes) in blobs {
-            map.serialize_entry(name, serde_bytes::Bytes::new(bytes))?;
-        }
-        map.end()
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<HashMap<String, Vec<u8>>, D::Error> {
-        HashMap::<String, serde_bytes::ByteBuf>::deserialize(deserializer).map(|blobs| {
-            blobs
-                .into_iter()
-                .map(|(name, bytes)| (name, bytes.into_vec()))
-                .collect()
-        })
-    }
+    pub blobs: HashMap<String, bytes::Bytes>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -156,4 +128,27 @@ pub struct DataResponse {
     pub load_seconds: f64,
     #[prost(double, tag = "6")]
     pub server_wait_seconds: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn protobuf_blobs_share_the_response_buffer() -> Result<(), prost::DecodeError> {
+        let sample = Sample {
+            sample_id: "sample".into(),
+            metadata_json: "{}".into(),
+            blobs: HashMap::from([("audio".into(), bytes::Bytes::from_static(b"payload"))]),
+        };
+        let encoded = bytes::Bytes::from(sample.encode_to_vec());
+        let decoded = Sample::decode(encoded.clone())?;
+        assert_eq!(decoded, sample);
+        let start = encoded.as_ptr() as usize;
+        let blob = &decoded.blobs["audio"];
+        let position = blob.as_ptr() as usize;
+        assert!(position >= start && position + blob.len() <= start + encoded.len());
+        Ok(())
+    }
 }

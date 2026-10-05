@@ -1,16 +1,15 @@
 from __future__ import annotations
 
 import json
-from multiprocessing.connection import Client
+from multiprocessing.connection import Client, wait
 from pathlib import Path
 import queue
 import threading
 import traceback
 import time
 
-import multiprocessing
-
 from . import _native
+from . import _ipc
 from .data import Batch, RawSample
 
 
@@ -46,23 +45,15 @@ def share(value):
 
 
 def transform_worker(root: Path, transform, streams, output, stopped) -> None:
-    multiprocessing.current_process().authkey = (root / "auth").read_bytes()
     receiver = _native.Listener(root / "work.sock")
     try:
         import torch
 
         torch.set_num_threads(1)
-        output.cancel_join_thread()
-        errors = queue.SimpleQueue()
-        output._on_queue_feeder_error = lambda error, _message: errors.put(error)
         ended = set()
         with torch.no_grad():
             while not stopped.is_set():
                 message = receiver.recv() if len(ended) < len(streams) else None
-                if not errors.empty():
-                    raise RuntimeError(
-                        "transformed sample queue failed"
-                    ) from errors.get()
                 if len(ended) == len(streams):
                     stopped.wait(0.1)
                     continue
@@ -95,7 +86,8 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                             raise RuntimeError(
                                 f"stream {stream} batch {message['batch']} sample {item['index']}: {error}"
                             ) from error
-                    output.put(
+                    _ipc.send(
+                        output,
                         (
                             "samples",
                             stream,
@@ -106,16 +98,18 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                                 message["timings"],
                                 message["memory_units"],
                             ),
-                        )
+                        ),
                     )
                 elif message["kind"] == "end":
-                    output.put(("end", stream, None))
+                    _ipc.send(output, ("end", stream, None))
                     ended.add(stream)
                 else:
                     raise RuntimeError("unexpected work message")
     except Exception:
         if not stopped.is_set():
             raise
+    finally:
+        output.close()
 
 
 def collate_worker(
@@ -130,7 +124,6 @@ def collate_worker(
 ) -> None:
     collate_fn = collate_fn or {}
     key = (root / "auth").read_bytes()
-    multiprocessing.current_process().authkey = key
     outputs = {name: [queue.Queue() for _ in range(ranks)] for name in streams}
     errors = queue.Queue()
 
@@ -148,7 +141,7 @@ def collate_worker(
                     if connection.poll():
                         raise RuntimeError(f"rank {rank} disconnected")
                     continue
-                connection.send(message)
+                _ipc.send(connection, message)
                 if message[0] == "end":
                     return
                 del message
@@ -172,10 +165,18 @@ def collate_worker(
     while not stopped.is_set():
         if not errors.empty():
             raise RuntimeError(errors.get())
-        try:
-            kind, stream, value = incoming.get(timeout=0.1)
-        except queue.Empty:
+        available = wait(incoming, timeout=0.1)
+        if not available:
             continue
+        connection = available[0]
+        try:
+            kind, stream, value = _ipc.recv(connection)
+        except (EOFError, OSError):
+            if stopped.is_set():
+                return
+            raise
+        incoming.remove(connection)
+        incoming.append(connection)
         if stream not in outputs:
             raise RuntimeError("unexpected stream")
         if kind == "end":

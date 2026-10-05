@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow = "1.0.104"
+bytes = "1"
 sem_safe = { version = "0.2.1", default-features = false, features = ["named"] }
 pyo3 = { version = "0.24.0", features = ["anyhow"] }
 serde = { version = "1", features = ["derive"] }

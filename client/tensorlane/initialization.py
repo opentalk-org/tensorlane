@@ -137,16 +137,18 @@ def init(
     try:
         transform = _stream_callbacks(transform, daemon.streams)
         collate_fn = _stream_callbacks(collate_fn, daemon.streams)
-        daemon._queue = context.Queue()
         daemon._stopped = context.Event()
         collator_ready = context.Event()
         for worker_index in range(num_workers):
+            incoming, output = context.Pipe()
+            daemon._connections.append(incoming)
             process = context.Process(
                 name=f"tensorlane-transform-{worker_index}",
                 target=transform_worker,
-                args=(root, transform, daemon.streams, daemon._queue, daemon._stopped),
+                args=(root, transform, daemon.streams, output, daemon._stopped),
             )
-            process.start()
+            with output:
+                process.start()
             daemon._processes.append(process)
         process = context.Process(
             name="tensorlane-collate",
@@ -157,13 +159,16 @@ def init(
                 num_workers,
                 daemon.streams,
                 collate_fn,
-                daemon._queue,
+                daemon._connections,
                 daemon._stopped,
                 collator_ready,
             ),
         )
         process.start()
         daemon._processes.append(process)
+        for connection in daemon._connections:
+            connection.close()
+        daemon._connections.clear()
         daemon._monitor = threading.Thread(
             target=daemon._supervise_processes,
             name="tensorlane-process-monitor",
