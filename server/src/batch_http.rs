@@ -35,9 +35,6 @@ impl Runtime {
             let Some(lock) = Lock::try_acquire(&path.with_extension("lock")).await? else {
                 return Ok(Batch::Pending);
             };
-            let Ok(slot) = self.plans.clone().try_acquire_owned() else {
-                return Ok(Batch::Pending);
-            };
             if !fs::try_exists(path.with_extension("ready")).await? {
                 let engine = self.clone();
                 let ready = path.with_extension("ready");
@@ -45,7 +42,7 @@ impl Runtime {
                 let query = query.clone();
                 let name = name.to_owned();
                 self.tasks.spawn(async move {
-                    let (_lock, _slot) = (lock, slot);
+                    let _lock = lock;
                     let result = async {
                         crate::cache_limits::space(&engine.cache, 512*1024*1024).await?;
                         let _ = fs::remove_file(path.with_extension("part")).await;
@@ -79,14 +76,15 @@ impl Runtime {
         let Some(lock) = Lock::try_acquire(&cached.with_extension("lock")).await? else {
             return Ok(Batch::Pending);
         };
-        let memory = self.loading_memory(id, config.max_load_memory_bytes)?;
+        let limit = (config.max_load_memory_bytes / config.queries.len()).max(1);
+        let memory = self.loading_memory(id, name, limit)?;
         let engine = self.clone();
         let result_path = cached.clone();
         let name = name.to_owned();
         self.tasks.spawn(async move {
             let _lock = lock;
             let result = async {
-                let Some((response, _memory)) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, config.max_load_memory_bytes).await? else {
+                let Some((response, _memory)) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, limit).await? else {
                     return Ok(());
                 };
                 write_atomic(&cached, &response.encode_to_vec()).await?;
