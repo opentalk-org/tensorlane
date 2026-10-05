@@ -1,5 +1,9 @@
 use anyhow::{Context, Result, ensure};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, Weak},
+};
 use tensorlane_protocol::InitResponse;
 use tokio::{fs, sync::Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -27,7 +31,7 @@ pub struct Runtime {
     pub upload_slots: Arc<Semaphore>,
     pub(super) loader: Arc<dyn Loader>,
     pub(super) plans: Arc<Semaphore>,
-    pub(super) batches: Arc<Semaphore>,
+    load_memory: Arc<Mutex<HashMap<Uuid, Weak<Semaphore>>>>,
 }
 
 pub enum Batch {
@@ -64,12 +68,26 @@ impl Runtime {
             asset_slots: Arc::new(Semaphore::new(8)),
             upload_slots: Arc::new(Semaphore::new(2)),
             plans: Arc::new(Semaphore::new(2)),
-            batches: Arc::new(Semaphore::new(2)),
+            load_memory: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn run_dir(&self, run: Uuid) -> PathBuf {
         self.cache.join("runs").join(run.to_string())
+    }
+
+    pub(super) fn loading_memory(&self, run: Uuid, bytes: usize) -> Result<Arc<Semaphore>> {
+        let mut runs = self
+            .load_memory
+            .lock()
+            .map_err(|_| anyhow::anyhow!("loading memory lock poisoned"))?;
+        runs.retain(|_, budget| budget.strong_count() > 0);
+        if let Some(budget) = runs.get(&run).and_then(Weak::upgrade) {
+            return Ok(budget);
+        }
+        let budget = Arc::new(Semaphore::new(bytes));
+        runs.insert(run, Arc::downgrade(&budget));
+        Ok(budget)
     }
 
     async fn run_lock(&self, run: Uuid) -> Result<Lock> {
@@ -235,4 +253,38 @@ impl Runtime {
 pub struct AssetSource {
     pub object: String,
     pub download: tensorlane_protocol::AssetDownload,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn loading_memory_is_shared_within_a_run_and_independent_between_runs() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("test"))
+            .build();
+        let runtime = Runtime::new(
+            clickhouse::Client::default(),
+            aws_sdk_s3::Client::from_conf(config),
+            "test",
+            PathBuf::from("unused"),
+            CancellationToken::new(),
+            "checkpoints",
+            "metrics",
+        )?;
+        let first_id = Uuid::new_v4();
+        let first = runtime.loading_memory(first_id, 100)?;
+        let same = runtime.clone().loading_memory(first_id, 100)?;
+        assert!(Arc::ptr_eq(&first, &same));
+        let second = runtime.loading_memory(Uuid::new_v4(), 100)?;
+        let occupied = first.clone().acquire_many_owned(100).await?;
+        assert_eq!(same.available_permits(), 0);
+        assert_eq!(second.available_permits(), 100);
+        drop(occupied);
+        assert_eq!(same.available_permits(), 100);
+        Ok(())
+    }
 }

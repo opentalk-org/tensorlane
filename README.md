@@ -133,6 +133,8 @@ Save checkpoints with `lane.save_asset("model", path, kind="checkpoint")`, then 
 
 Use `lane.metric(step, name, value)` to record scalars and `lane.metric_artifact(...)` for files. Throughput and timing metrics are enabled by default. The full run configuration is available as `lane.config`; application settings are in `lane.config["app"]`. Runtime defaults are one rank, five workers, and two prefetched batches per rank and stream. Explicit `init` arguments override `config.tensorlane` settings. Always select a stream by name with `lane.batches("training")`.
 
+Set `config.tensorlane.max_load_memory_bytes` to control server batch-loading memory for each run (default: 268435456, or 256 MiB). All streams in that run share the budget; other runs have independent budgets. Before reading blob payloads, the server reserves an estimated working set covering payloads, protobuf encoding, descriptors, and stream buffers. Reservations remain held until the encoded batch is cached. Whole-object sizes are inspected with S3 HEAD; byte ranges use their declared lengths. Busy budgets return pending responses, while a batch larger than its run budget fails. This replaces fixed sample, blob, S3-read, and batch-preparation concurrency caps. The budget applies per run per server process and excludes query preparation, input asset downloads, uploads, SDK internals, and allocator overhead; it is not a process RSS limit.
+
 ## Development
 
 ```sh

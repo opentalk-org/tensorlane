@@ -9,6 +9,7 @@ pub struct Config {
     pub queries: BTreeMap<String, QueryConfig>,
     pub assets: HashMap<String, AssetConfig>,
     pub asset_type: Option<String>,
+    pub max_load_memory_bytes: usize,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +44,7 @@ struct TensorlaneConfig {
     ranks: Option<u64>,
     num_workers: Option<u64>,
     prefetch_factor: Option<u64>,
+    max_load_memory_bytes: Option<usize>,
     #[serde(default)]
     assets: HashMap<String, AssetConfig>,
     asset_type: Option<String>,
@@ -88,6 +90,12 @@ impl Config {
         };
         ensure!(!queries.is_empty(), "config.queries must not be empty");
         let settings = document.tensorlane;
+        let max_load_memory_bytes = settings.max_load_memory_bytes.unwrap_or(256 * 1024 * 1024);
+        ensure!(
+            max_load_memory_bytes > 0
+                && max_load_memory_bytes <= tokio::sync::Semaphore::MAX_PERMITS,
+            "config.tensorlane.max_load_memory_bytes must be a positive supported byte count"
+        );
         for (name, count) in [
             ("ranks", settings.ranks),
             ("num_workers", settings.num_workers),
@@ -136,6 +144,7 @@ impl Config {
             queries: compiled,
             assets: settings.assets,
             asset_type: settings.asset_type,
+            max_load_memory_bytes,
         })
     }
 }
@@ -247,6 +256,27 @@ mod tests {
         ] {
             value["tensorlane"]["assets"]["model"] = invalid;
             assert!(parse(value.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn loading_memory_is_configured_per_run() {
+        let mut document = json!({"queries": {"training": {"sql": "SELECT 1"}}, "tensorlane": {}});
+        assert_eq!(
+            parse(document.clone()).unwrap().max_load_memory_bytes,
+            256 * 1024 * 1024
+        );
+        document["tensorlane"]["max_load_memory_bytes"] = json!(1024);
+        assert_eq!(parse(document.clone()).unwrap().max_load_memory_bytes, 1024);
+        for invalid in [
+            json!(0),
+            json!(-1),
+            json!(true),
+            json!(1.5),
+            json!(u64::MAX),
+        ] {
+            document["tensorlane"]["max_load_memory_bytes"] = invalid;
+            assert!(parse(document.clone()).is_err());
         }
     }
 
