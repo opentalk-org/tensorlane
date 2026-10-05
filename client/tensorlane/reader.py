@@ -71,6 +71,10 @@ class BatchReader(Iterator[Batch]):
             kind, value = self._connection.recv()
             if kind != "ready":
                 raise RuntimeError(value)
+        except (EOFError, OSError) as error:
+            self.close()
+            self._check()
+            raise RuntimeError("TensorLane collater disconnected") from error
         except BaseException:
             self.close()
             raise

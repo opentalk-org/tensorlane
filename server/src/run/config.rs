@@ -111,14 +111,7 @@ impl Config {
                 "query {} SQL must not be empty",
                 key
             );
-            compiled.insert(
-                key,
-                QueryConfig {
-                    sql: query.sql,
-                    params: query.params,
-                    repeat: query.repeat,
-                },
-            );
+            compiled.insert(key, query);
         }
         for (name, asset) in &settings.assets {
             ensure!(!name.is_empty(), "asset name must not be empty");

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import multiprocessing
+from collections import UserDict
 from unittest.mock import patch
 import time
 import uuid
@@ -24,6 +25,19 @@ def read_rank(run_id, rank, root, output, stream="training"):
 
 
 class PipelineTests(PipelineCase):
+    def test_callbacks_accept_non_dict_mappings(self):
+        self.start(
+            transform_fn=UserDict({"training": transform}),
+            collate_fn=UserDict({"training": collate}),
+        )
+        with self.daemon.batches("training") as reader:
+            batches = list(reader)
+        self.assertEqual(len(batches), self.service.streams["training"])
+        for index, batch in enumerate(batches):
+            self.assertEqual(batch.data["values"][:, 0].tolist(), [index] * len(batch))
+        with self.daemon.batches("evaluation") as reader:
+            self.assertIsInstance(next(reader).samples[0], tensorlane.RawSample)
+
     def test_api_key_from_environment_authenticates_every_endpoint(self):
         key = "0123456789abcdef0123456789abcdef"
         auth = Authorization(key)

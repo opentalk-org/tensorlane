@@ -10,6 +10,13 @@ from pipeline_fixture import PipelineCase
 
 
 class PipelineTests(PipelineCase):
+    def test_reader_handshake_disconnect_is_reported_and_socket_is_cleaned(self):
+        self.start()
+        with patch("tensorlane.reader.Listener.accept", side_effect=ConnectionResetError):
+            with self.assertRaisesRegex(RuntimeError, "collater disconnected"):
+                self.daemon.batches("training")
+        self.assertFalse(list(self.daemon._root.rglob("rank-0.sock")))
+
     def test_duplicate_daemon_is_rejected(self):
         self.start()
         with self.assertRaisesRegex(RuntimeError, "already active"):

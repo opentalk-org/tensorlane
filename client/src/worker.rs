@@ -107,16 +107,7 @@ impl Resources {
             .open(root.join("lock"))?;
         lock.try_lock_exclusive()
             .context("a daemon is already active for this run")?;
-        for entry in std::fs::read_dir(root)? {
-            let entry = entry?;
-            if entry.file_name() != "lock" && entry.file_name() != "session" {
-                if entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
-                } else {
-                    std::fs::remove_file(entry.path())?;
-                }
-            }
-        }
+        Self::clear(root)?;
         let mut auth = File::create(root.join("auth"))?;
         auth.write_all(uuid::Uuid::new_v4().as_bytes())?;
         auth.write_all(uuid::Uuid::new_v4().as_bytes())?;
@@ -127,20 +118,24 @@ impl Resources {
             _lock: lock,
         })
     }
-}
-impl Drop for Resources {
-    fn drop(&mut self) {
-        if let Ok(entries) = std::fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
-                if entry.file_name() != "lock" && entry.file_name() != "session" {
-                    if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                        let _ = std::fs::remove_dir_all(entry.path());
-                    } else {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
+
+    fn clear(root: &Path) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_name() != "lock" && entry.file_name() != "session" {
+                if entry.file_type()?.is_dir() {
+                    std::fs::remove_dir_all(entry.path())?;
+                } else {
+                    std::fs::remove_file(entry.path())?;
                 }
             }
         }
+        Ok(())
+    }
+}
+impl Drop for Resources {
+    fn drop(&mut self) {
+        let _ = Self::clear(&self.root);
     }
 }
 impl Worker {

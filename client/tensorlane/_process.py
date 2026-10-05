@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
 from multiprocessing.connection import Client
 from pathlib import Path
 import queue
@@ -22,10 +21,6 @@ def _connect(path: Path, key: bytes, stopped):
         except (FileNotFoundError, ConnectionRefusedError):
             time.sleep(0.02)
     raise RuntimeError("daemon stopped during connection")
-
-
-def callback(spec, stream):
-    return spec.get(stream) if isinstance(spec, Mapping) else spec
 
 
 def share(value):
@@ -83,7 +78,7 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                         sample = RawSample(
                             message["sample_id"], stream, metadata, message["blobs"]
                         )
-                        transform_fn = callback(transform, stream)
+                        transform_fn = transform.get(stream)
                         transformed = share(
                             transform_fn(sample) if transform_fn else sample
                         )
@@ -131,6 +126,7 @@ def collate_worker(
     stopped,
     ready,
 ) -> None:
+    collate_fn = collate_fn or {}
     key = (root / "auth").read_bytes()
     multiprocessing.current_process().authkey = key
     outputs = {name: [queue.Queue() for _ in range(ranks)] for name in streams}
@@ -209,11 +205,15 @@ def collate_worker(
             samples = tuple(parts[index][0] for index in range(size))
             timings = (*timings[:3], sum(part[1][3] for part in parts.values()))
             started = time.monotonic()
-            collator = callback(collate_fn, stream)
+            collator = collate_fn.get(stream)
             data = share(collator(samples)) if collator else samples
             completed[stream][batch_id] = Batch(
-                stream, batch_id, query_idx, samples, data,
-                (*timings, time.monotonic() - started)
+                stream,
+                batch_id,
+                query_idx,
+                samples,
+                data,
+                (*timings, time.monotonic() - started),
             )
             del pending[stream][batch_id]
         while next_batch[stream] in completed[stream]:
