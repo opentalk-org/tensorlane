@@ -85,6 +85,7 @@ impl Drop for PosixSemaphore {
 
 pub struct BatchBudget {
     pub semaphore: PosixSemaphore,
+    pub capacity: usize,
     cancelled: AtomicBool,
 }
 
@@ -92,6 +93,7 @@ impl BatchBudget {
     pub fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             semaphore: PosixSemaphore::create(capacity)?,
+            capacity,
             cancelled: AtomicBool::new(false),
         })
     }

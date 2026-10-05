@@ -53,11 +53,15 @@ async fn download(
         .await?;
     let info: AssetDownload = serde_json::from_slice(&bytes)?;
     let entrypoint = info.metadata.entrypoint.clone();
-    let metadata =
-        serde_json::json!({"asset_id":info.metadata.asset_id,"entrypoint":info.metadata.entrypoint,
-        "metadata":serde_json::from_str::<serde_json::Value>(&info.metadata.metadata_json)?,
-        "kind":info.metadata.kind,"asset_type":info.metadata.asset_type})
-        .to_string();
+    let asset_metadata: serde_json::Value = serde_json::from_str(&info.metadata.metadata_json)?;
+    let metadata = serde_json::json!({
+        "asset_id": info.metadata.asset_id,
+        "entrypoint": info.metadata.entrypoint,
+        "metadata": asset_metadata,
+        "kind": info.metadata.kind,
+        "asset_type": info.metadata.asset_type,
+    })
+    .to_string();
     fs::create_dir_all(&destination).await?;
     let partial = destination.join("download.part");
     let path = destination.join("data");

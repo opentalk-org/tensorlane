@@ -25,6 +25,13 @@ def read_rank(run_id, rank, root, output, stream="training"):
 
 
 class PipelineTests(PipelineCase):
+    def test_transformed_and_collated_tensors_use_shared_memory(self):
+        self.start(collate_fn=collate)
+        with self.daemon.batches("training") as reader:
+            batch = next(reader)
+            self.assertTrue(batch.samples[0]["value"].is_shared())
+            self.assertTrue(batch.data["values"].is_shared())
+
     def test_callbacks_accept_non_dict_mappings(self):
         self.start(
             transform_fn=UserDict({"training": transform}),
