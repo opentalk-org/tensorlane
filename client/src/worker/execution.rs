@@ -105,14 +105,13 @@ pub(super) async fn supervise(
         Ok(Some(started)) => started,
         result => {
             let ended = match remote {
-                Some((http, run_id)) => {
-                    end_run(
-                        http,
-                        run_id,
+                Some((http, run_id)) => http
+                    .end(
+                        &run_id,
                         result.is_err() || options.root.join("failed").exists(),
                     )
                     .await
-                }
+                    .context("ending run failed"),
                 None => Ok(()),
             };
             return result.map(|_| ()).and(ended);
@@ -219,7 +218,10 @@ pub(super) async fn supervise(
         result
     };
     let failed = result.is_err() || options.root.join("failed").exists();
-    let ended = end_run(http, initialized.run_id, failed).await;
+    let ended = http
+        .end(&initialized.run_id, failed)
+        .await
+        .context("ending run failed");
     result.and(ended)
 }
 
@@ -230,15 +232,4 @@ async fn send_heartbeats(http: crate::transport::HttpClient, run_id: String) -> 
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
-}
-
-async fn end_run(
-    http: crate::transport::HttpClient,
-    run_id: String,
-    failed: bool,
-) -> anyhow::Result<()> {
-    http.end(&run_id, failed)
-        .await
-        .context("ending run failed")?;
-    Ok(())
 }

@@ -1,11 +1,10 @@
-use anyhow::Result;
-use error_context::error_context;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{db, run::Config};
+use crate::{db, run_config::Config};
 
 const SELECT_RUNS: &str = "
 select ?fields from runs
@@ -138,7 +137,15 @@ impl RunRepo {
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Run>> {
-        self.current(id).await?.map(Run::try_from).transpose()
+        db::request(
+            self.client
+                .query(&format!("{SELECT_RUNS} where id = ?"))
+                .bind(id.to_string())
+                .fetch_optional::<RunRow>(),
+        )
+        .await?
+        .map(Run::try_from)
+        .transpose()
     }
 
     pub async fn list(&self) -> Result<Vec<Run>> {
@@ -153,18 +160,6 @@ impl RunRepo {
         .collect()
     }
 
-    async fn current(&self, id: Uuid) -> Result<Option<RunRow>> {
-        db::request(
-            self.client
-                .query(&format!("{SELECT_RUNS} where id = ?"))
-                .bind(id.to_string())
-                .fetch_optional(),
-        )
-        .await
-        .map_err(Into::into)
-    }
-
-    #[error_context("failed to append a run status")]
     pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> Result<()> {
         db::request(self.client
             .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), ?, ? FROM run_status WHERE run_id = ?")
@@ -172,8 +167,8 @@ impl RunRepo {
             .bind(status as i8)
             .bind(run_id)
             .execute())
-            .await?;
-        Ok(())
+            .await
+            .context("failed to append a run status")
     }
 
     pub async fn session(&self, id: Uuid) -> Result<Option<Session>> {

@@ -1,4 +1,4 @@
-use super::{BlobRef, QuerySampler, Sampler};
+use super::{BlobRef, plan::QuerySampler};
 use crate::db::SampleRow;
 use futures::stream;
 

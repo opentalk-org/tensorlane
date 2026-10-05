@@ -3,7 +3,7 @@ use crate::{
     db::stream_samples,
     loader::Loader,
     runtime::{Batch, Runtime},
-    sampling::{BatchPlan, QuerySampler},
+    sampling::{BatchPlan, plan::QuerySampler},
     shared_cache::{Lock, write_atomic},
 };
 use anyhow::{Context, Result, ensure};

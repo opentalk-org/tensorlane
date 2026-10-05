@@ -61,7 +61,14 @@ impl UploadStore {
         local_path: &Path,
         content_type: &str,
     ) -> anyhow::Result<()> {
-        self.upload(local_path, &record.path, content_type).await?;
+        crate::s3_upload::upload(
+            &self.s3,
+            self.bucket,
+            local_path,
+            &record.path,
+            content_type,
+        )
+        .await?;
         let mut insert = db::request(
             self.database
                 .insert::<crate::asset_repo::AssetRecord>("assets"),
@@ -81,8 +88,14 @@ impl UploadStore {
         local_path: &Path,
     ) -> anyhow::Result<()> {
         let key = format!("{}/{}", self.metrics_prefix, id);
-        self.upload(local_path, &key, &metadata.content_type)
-            .await?;
+        crate::s3_upload::upload(
+            &self.s3,
+            self.bucket,
+            local_path,
+            &key,
+            &metadata.content_type,
+        )
+        .await?;
         let row = ArtifactRecord {
             id,
             run_id,
@@ -105,9 +118,5 @@ impl UploadStore {
         insert.write(&row).await?;
         insert.end().await?;
         Ok(())
-    }
-
-    async fn upload(&self, path: &Path, key: &str, content_type: &str) -> anyhow::Result<()> {
-        crate::s3_upload::upload(&self.s3, self.bucket, path, key, content_type).await
     }
 }

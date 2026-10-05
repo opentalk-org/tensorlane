@@ -1,10 +1,6 @@
 use super::BatchPlan;
-#[cfg(test)]
-use super::Sampler;
 use crate::{MAX_BATCH_BYTES, db::SampleRow};
 use anyhow::{Context, Result, ensure};
-#[cfg(test)]
-use futures::future::BoxFuture;
 use futures::{Stream, TryStreamExt};
 use prost::Message;
 use std::path::{Path, PathBuf};
@@ -144,7 +140,7 @@ impl QuerySampler {
         let offset = index.read_u64_le().await?;
         self.reader.seek(std::io::SeekFrom::Start(offset)).await?;
         self.pending = None;
-        self.read_batch().await
+        self.next_batch().await
     }
 
     async fn read_row(&mut self) -> Result<Option<SampleRow>> {
@@ -167,7 +163,7 @@ impl QuerySampler {
         ))
     }
 
-    async fn read_batch(&mut self) -> Result<Option<BatchPlan>> {
+    pub(super) async fn next_batch(&mut self) -> Result<Option<BatchPlan>> {
         let mut first = match self.pending.take() {
             Some(row) => Some(row),
             None => self.read_row().await?,
@@ -199,11 +195,5 @@ impl QuerySampler {
             batch.samples.push(row.sample()?);
         }
         Ok(Some(batch))
-    }
-}
-#[cfg(test)]
-impl Sampler for QuerySampler {
-    fn next_batch(&mut self) -> BoxFuture<'_, Result<Option<BatchPlan>>> {
-        Box::pin(self.read_batch())
     }
 }

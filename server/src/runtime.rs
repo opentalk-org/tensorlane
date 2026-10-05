@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     loader::{Loader, S3Loader},
-    run::Config,
+    run_config::Config,
     run_repo::{Run, RunRepo, RunStatus},
     shared_cache::{Lock, write_atomic},
 };
