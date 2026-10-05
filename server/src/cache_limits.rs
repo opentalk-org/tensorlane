@@ -46,13 +46,24 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 let reusable = name.ends_with(".batch")
+                    || name.ends_with(".plan")
                     || name
                         .split_once('-')
                         .is_some_and(|(a, b)| a.parse::<u64>().is_ok() && b.parse::<u64>().is_ok());
                 if reusable {
+                    let mut size = metadata.len();
+                    if name.ends_with(".plan") {
+                        for extension in ["index", "ready", "error"] {
+                            match std::fs::metadata(entry.path().with_extension(extension)) {
+                                Ok(metadata) => size += metadata.len(),
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                    }
                     entries.push(Entry {
                         path: entry.path(),
-                        size: metadata.len(),
+                        size,
                         modified: metadata.modified()?,
                     });
                 }
@@ -67,7 +78,8 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
         if used <= limit {
             break;
         }
-        let lock_path = if entry.path.extension().is_some_and(|ext| ext == "batch") {
+        let plan = entry.path.extension().is_some_and(|ext| ext == "plan");
+        let lock_path = if plan || entry.path.extension().is_some_and(|ext| ext == "batch") {
             entry.path.with_extension("lock")
         } else {
             entry
@@ -79,11 +91,20 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
         let Some(_lock) = Lock::try_acquire(&lock_path).await? else {
             continue;
         };
-        match fs::remove_file(entry.path).await {
-            Ok(()) => used = used.saturating_sub(entry.size),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        let paths = std::iter::once(entry.path.clone()).chain(
+            ["index", "ready", "error"]
+                .into_iter()
+                .filter(|_| plan)
+                .map(|extension| entry.path.with_extension(extension)),
+        );
+        for path in paths {
+            match fs::remove_file(path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        used = used.saturating_sub(entry.size);
     }
     Ok(())
 }
@@ -92,23 +113,39 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn pruning_preserves_plans_receipts_and_locked_ranges() -> Result<()> {
+    async fn pruning_clears_query_plans_and_preserves_receipts_and_locked_entries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let dir = temp.path().join("assets/a");
         fs::create_dir_all(&dir).await?;
         fs::write(dir.join("0-3"), b"abcd").await?;
         let run = temp.path().join("runs/r");
-        fs::create_dir_all(&run).await?;
-        fs::write(run.join("0.batch"), b"data").await?;
-        fs::write(run.join("0.plan"), b"plan").await?;
+        let plans = run.join("plans");
+        let data = run.join("data");
+        fs::create_dir_all(&plans).await?;
+        fs::create_dir_all(&data).await?;
+        fs::write(data.join("0.batch"), b"data").await?;
+        fs::write(plans.join("0.plan"), b"plan").await?;
+        fs::write(plans.join("0.index"), b"index").await?;
+        fs::write(plans.join("0.ready"), b"ready").await?;
+        fs::write(plans.join("0.error"), b"error").await?;
+        fs::write(run.join("receipt.json"), b"receipt").await?;
         let lock = Lock::acquire(&dir.join("asset.lock")).await?;
+        let plan_lock = Lock::acquire(&plans.join("0.lock")).await?;
         prune(temp.path(), 0).await?;
         assert!(dir.join("0-3").exists());
-        assert!(run.join("0.plan").exists());
-        assert!(!run.join("0.batch").exists());
+        assert!(plans.join("0.plan").exists());
+        assert!(plans.join("0.index").exists());
+        assert!(plans.join("0.ready").exists());
+        assert!(plans.join("0.error").exists());
+        assert!(!data.join("0.batch").exists());
         drop(lock);
+        drop(plan_lock);
         prune(temp.path(), 0).await?;
         assert!(!dir.join("0-3").exists());
+        for extension in ["plan", "index", "ready", "error"] {
+            assert!(!plans.join(format!("0.{extension}")).exists());
+        }
+        assert!(run.join("receipt.json").exists());
         Ok(())
     }
 }

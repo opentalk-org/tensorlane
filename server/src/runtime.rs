@@ -97,30 +97,42 @@ impl Runtime {
         Ok(budget)
     }
 
-    async fn run_lock(&self, run: Uuid) -> Result<Lock> {
-        let dir = self.run_dir(run);
-        fs::create_dir_all(&dir).await?;
-        Lock::acquire(&dir.join("run.lock")).await
-    }
-
     pub async fn initialize(&self, id: Uuid, session: Uuid) -> Result<InitResponse> {
         ensure!(!self.shutdown.is_cancelled(), "server is shutting down");
-        let _lock = self.run_lock(id).await?;
         let record = self.repo.get(id).await?.context("run not found")?;
         ensure!(
             matches!(record.status, Some(RunStatus::Queued | RunStatus::Running)),
             "run is terminal"
         );
         let config = Config::parse(&record.config)?;
-        if let Some(existing) = self.repo.session(id).await? {
+        let existing = self.repo.session(id).await?;
+        if let Some(existing) = &existing {
             ensure!(
                 existing.session_id == session,
                 "run belongs to another client session"
             );
+        } else {
+            ensure!(
+                record.status == Some(RunStatus::Queued),
+                "run is already started"
+            );
         }
+        let started_at = time::OffsetDateTime::now_utc().max(
+            record
+                .status_timestamp
+                .context("run has no status timestamp")?
+                + time::Duration::nanoseconds(1),
+        );
+        let owner = self
+            .create_state(
+                &format!("runs/{id}/session"),
+                &(session, i64::try_from(started_at.unix_timestamp_nanos())?),
+            )
+            .await?;
+        ensure!(owner.0 == session, "run belongs to another client session");
         self.repo.renew_session(id, session).await?;
         if record.status != Some(RunStatus::Running) {
-            self.repo.append_status(id, RunStatus::Running).await?;
+            self.repo.start(id, owner.1).await?;
         }
         Ok(InitResponse {
             run_id: id.to_string(),
@@ -149,13 +161,11 @@ impl Runtime {
     }
 
     pub async fn heartbeat(&self, id: Uuid, session: Uuid) -> Result<()> {
-        let _lock = self.run_lock(id).await?;
         self.active(id, session).await?;
         self.repo.renew_session(id, session).await
     }
 
     pub async fn end(&self, id: Uuid, session: Uuid, failed: bool) -> Result<()> {
-        let _lock = self.run_lock(id).await?;
         let record = self.repo.get(id).await?.context("run not found")?;
         let owner = self
             .repo
@@ -172,16 +182,21 @@ impl Runtime {
         ) {
             return Ok(());
         }
-        self.repo
-            .append_status(
-                id,
-                if failed {
+        let status = self
+            .create_state(
+                &format!("runs/{id}/end"),
+                &if failed {
                     RunStatus::Failed
                 } else {
                     RunStatus::Succeeded
                 },
             )
-            .await
+            .await?;
+        let (_, started_at): (Uuid, i64) = self
+            .read_state(&format!("runs/{id}/session"))
+            .await?
+            .context("run is not initialized")?;
+        self.repo.append_status(id, status, started_at).await
     }
 
     pub async fn asset(&self, id: Uuid, session: Uuid, name: &str) -> Result<AssetSource> {

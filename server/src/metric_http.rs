@@ -3,14 +3,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tensorlane_protocol::MetricBatch;
 use time::OffsetDateTime;
-use tokio::fs;
 use uuid::Uuid;
 
-use crate::{
-    db,
-    runtime::Runtime,
-    shared_cache::{Lock, write_atomic},
-};
+use crate::{db, runtime::Runtime};
 
 #[derive(clickhouse::Row, Serialize)]
 struct ScalarRecord {
@@ -59,24 +54,18 @@ pub async fn save(
         );
     }
     engine.active(run, session).await?;
-    let dir = engine.run_dir(run).join("metrics");
-    fs::create_dir_all(&dir).await?;
-    let _lock = Lock::acquire(&dir.join(format!("{request}.lock"))).await?;
+    let intent = format!("metrics/{run}/{request}");
     let hash = hex::encode(Sha256::digest(serde_json::to_vec(&batch)?));
-    let intent = dir.join(format!("{request}.intent"));
-    if let Ok(existing) = fs::read_to_string(&intent).await {
-        ensure!(existing == hash, "conflicting retry of metric request ID");
-    } else {
-        write_atomic(&intent, hash.as_bytes()).await?;
-    }
-    let receipt = dir.join(format!("{request}.committed"));
-    if fs::try_exists(&receipt).await? {
+    let existing = engine.create_state(&intent, &hash).await?;
+    ensure!(existing == hash, "conflicting retry of metric request ID");
+    let receipt = format!("{intent}/committed");
+    if engine.read_state::<bool>(&receipt).await? == Some(true) {
         return Ok(());
     }
     let client = engine
         .database
         .clone()
-        .with_setting("insert_deduplication_token", request.to_string());
+        .with_setting("insert_deduplication_token", format!("{run}/{request}"));
     if !batch.scalars.is_empty() {
         let mut insert = db::request(client.insert::<ScalarRecord>("metrics"))
             .await?
@@ -111,7 +100,8 @@ pub async fn save(
         }
         insert.end().await?;
     }
-    write_atomic(&receipt, hash.as_bytes()).await
+    engine.create_state(&receipt, &true).await?;
+    Ok(())
 }
 
 fn timestamp(ms: i64) -> Result<OffsetDateTime> {

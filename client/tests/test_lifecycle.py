@@ -7,12 +7,15 @@ import uuid
 import tensorlane
 from fixture_transforms import transform, fail, fail_collate, slow, invalid
 from pipeline_fixture import PipelineCase
+from tensorlane.client import _root
 
 
 class PipelineTests(PipelineCase):
     def test_reader_handshake_disconnect_is_reported_and_socket_is_cleaned(self):
         self.start()
-        with patch("tensorlane.reader.Listener.accept", side_effect=ConnectionResetError):
+        with patch(
+            "tensorlane.reader.Listener.accept", side_effect=ConnectionResetError
+        ):
             with self.assertRaisesRegex(RuntimeError, "collater disconnected"):
                 self.daemon.batches("training")
         self.assertFalse(list(self.daemon._root.rglob("rank-0.sock")))
@@ -23,6 +26,32 @@ class PipelineTests(PipelineCase):
             tensorlane.init(
                 self.run_id, ranks=1, rank=0, start_daemon=True, ipc_dir=self.temp.name
             )
+
+    def test_crashed_clients_session_file_cannot_rejoin_the_old_run(self):
+        previous = str(uuid.uuid4())
+        root = _root(self.run_id, self.temp.name)
+        root.mkdir()
+        (root / "session").write_text(previous)
+        handle = self.service.handle
+
+        def initialized_run(handler):
+            if (
+                handler.path.endswith("/init")
+                and handler.headers.get("x-tensorlane-session") != previous
+            ):
+                self.service.reply(
+                    handler,
+                    409,
+                    {"message": "run belongs to another client session"},
+                )
+                return
+            handle(handler)
+
+        self.service.handle = initialized_run
+        with self.assertRaisesRegex(RuntimeError, "another client session"):
+            self.start(workers=1, performance_metrics=False)
+        self.assertEqual(self.service.requests["training"], [])
+        self.assertFalse((root / "session").exists())
 
     def test_callback_and_stream_errors_reach_readers(self):
         for transform_fn, collate_fn, error in [
@@ -161,9 +190,7 @@ class PipelineTests(PipelineCase):
             self.daemon.close()
         self.assertTrue(self.service.end_requests[-1].failed)
         follower.close()
-        self.assertEqual(
-            {path.name for path in self.daemon._root.iterdir()}, {"lock", "session"}
-        )
+        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
         self.assertEqual(len(self.service.end_requests), 1)
 
     def test_second_process_start_failure_does_not_publish_readiness(self):

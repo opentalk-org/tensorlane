@@ -1,7 +1,7 @@
 use super::AppError;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -20,9 +20,10 @@ pub(super) fn router(runtime: crate::runtime::Runtime, auth: crate::auth::Auth) 
         .route("/runs/{run_id}/inputs/{name}", get(input_asset))
         .route("/runs/{run_id}/inputs/{name}/bytes", get(input_bytes))
         .route("/runs/{run_id}/metrics/{request_id}", put(save_metrics))
-        .route("/uploads/{upload_id}", put(create_upload))
-        .route("/uploads/{upload_id}/chunks/{index}", put(upload_chunk))
-        .route("/uploads/{upload_id}/commit", post(commit_upload))
+        .route(
+            "/uploads/{upload_id}",
+            put(save_upload).layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             tensorlane_protocol::TRANSFER_CHUNK_BYTES,
         ))
@@ -45,44 +46,17 @@ async fn save_metrics(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn create_upload(
+async fn save_upload(
     State(engine): State<crate::runtime::Runtime>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
-    Json(spec): Json<tensorlane_protocol::UploadSpec>,
+    multipart: Multipart,
 ) -> Result<Json<tensorlane_protocol::UploadStatus>, AppError> {
     Ok(Json(
-        crate::upload_http::create(&engine, id, session(&headers)?, spec)
+        crate::upload_http::save(&engine, id, session(&headers)?, multipart)
             .await
             .map_err(runtime_error)?,
     ))
-}
-
-async fn upload_chunk(
-    State(engine): State<crate::runtime::Runtime>,
-    Path((id, index)): Path<(Uuid, u64)>,
-    headers: HeaderMap,
-    bytes: axum::body::Bytes,
-) -> Result<StatusCode, AppError> {
-    crate::upload_http::chunk(&engine, id, session(&headers)?, index, &bytes)
-        .await
-        .map_err(runtime_error)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn commit_upload(
-    State(engine): State<crate::runtime::Runtime>,
-    Path(id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Response, AppError> {
-    let status = crate::upload_http::commit(&engine, id, session(&headers)?)
-        .await
-        .map_err(runtime_error)?;
-    if status.committed {
-        Ok(Json(status).into_response())
-    } else {
-        Ok((StatusCode::ACCEPTED, [("retry-after", "1")], Json(status)).into_response())
-    }
 }
 
 fn session(headers: &HeaderMap) -> Result<Uuid, AppError> {
@@ -100,6 +74,12 @@ fn session(headers: &HeaderMap) -> Result<Uuid, AppError> {
 }
 
 fn runtime_error(error: anyhow::Error) -> AppError {
+    if error
+        .downcast_ref::<axum::extract::multipart::MultipartError>()
+        .is_some()
+    {
+        return AppError::new(StatusCode::BAD_REQUEST, error);
+    }
     if let Some(failure) = error.downcast_ref::<crate::job::Failure>() {
         let status = if failure.retryable {
             StatusCode::SERVICE_UNAVAILABLE
@@ -113,6 +93,7 @@ fn runtime_error(error: anyhow::Error) -> AppError {
             StatusCode::NOT_FOUND
         }
         "run is terminal"
+        | "run is already started"
         | "run is not running"
         | "run belongs to another client session"
         | "run is not initialized" => StatusCode::CONFLICT,
@@ -132,10 +113,12 @@ fn runtime_error(error: anyhow::Error) -> AppError {
         | "artifact name must not be empty"
         | "artifact size does not match upload size"
         | "asset kind must be checkpoint or file"
-        | "upload chunk offset overflows"
-        | "upload chunk is outside the file"
-        | "upload chunk has unexpected size"
-        | "upload is missing chunks"
+        | "upload must start with its spec"
+        | "upload spec exceeds 4 MiB"
+        | "upload is missing its file"
+        | "upload has unexpected size"
+        | "upload SHA256 does not match"
+        | "upload contains unexpected fields"
         | "metric request ID must not be nil"
         | "metric requests must not exceed 1000 metrics"
         | "invalid scalar metric"

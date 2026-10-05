@@ -7,8 +7,10 @@ use reqwest::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{sync::Arc, time::Duration};
-use tensorlane_protocol::{EndRequest, InitResponse, SESSION_HEADER};
+use tensorlane_protocol::{EndRequest, InitResponse, SESSION_HEADER, UploadSpec, UploadStatus};
 use tokio::time::Instant;
+use tokio::{fs::File, io::AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
 pub struct HttpClient {
@@ -16,6 +18,11 @@ pub struct HttpClient {
     base: Url,
     session: String,
     retry_timeout: Duration,
+}
+
+enum RequestBody<'a> {
+    Bytes(Vec<u8>),
+    Upload(&'a UploadSpec, &'a File),
 }
 
 pub async fn connect(addr: &str, key: Option<&str>, session: String) -> Result<HttpClient> {
@@ -90,9 +97,30 @@ impl HttpClient {
         limit: usize,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
         let (status, headers, bytes, _) = self
-            .request_inner(method, parts, body, headers, limit, None)
+            .request_inner(
+                method,
+                parts,
+                body.map(RequestBody::Bytes),
+                headers,
+                limit,
+                None,
+            )
             .await?;
         Ok((status, headers, bytes))
+    }
+
+    pub async fn upload(&self, id: &str, spec: &UploadSpec, file: &File) -> Result<UploadStatus> {
+        let (_, _, bytes, _) = self
+            .request_inner(
+                Method::PUT,
+                &["uploads", id],
+                Some(RequestBody::Upload(spec, file)),
+                &[],
+                1024 * 1024,
+                None,
+            )
+            .await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub async fn batch(
@@ -122,7 +150,7 @@ impl HttpClient {
         &self,
         method: Method,
         parts: &[&str],
-        body: Option<Vec<u8>>,
+        body: Option<RequestBody<'_>>,
         headers: &[(&str, String)],
         limit: usize,
         memory: Option<(Arc<MemoryBudget>, u64)>,
@@ -143,11 +171,34 @@ impl HttpClient {
                 .client
                 .request(method.clone(), url.clone())
                 .header(SESSION_HEADER, &self.session);
-            if memory.is_none() {
-                request = request.timeout(remaining.min(Duration::from_secs(120)));
+            if memory.is_none()
+                && !(self.retry_timeout.is_zero() && matches!(&body, Some(RequestBody::Upload(..))))
+            {
+                let timeout = if matches!(&body, Some(RequestBody::Upload(..))) {
+                    remaining
+                } else {
+                    remaining.min(Duration::from_secs(120))
+                };
+                request = request.timeout(timeout);
             }
-            if let Some(bytes) = &body {
-                request = request.body(bytes.clone());
+            if let Some(body) = &body {
+                request = match body {
+                    RequestBody::Bytes(bytes) => request.body(bytes.clone()),
+                    RequestBody::Upload(spec, file) => {
+                        let mut input = file.try_clone().await?;
+                        input.seek(std::io::SeekFrom::Start(0)).await?;
+                        let part = reqwest::multipart::Part::stream_with_length(
+                            reqwest::Body::wrap_stream(ReaderStream::new(input)),
+                            spec.size,
+                        )
+                        .file_name("file");
+                        request.multipart(
+                            reqwest::multipart::Form::new()
+                                .text("spec", serde_json::to_string(spec)?)
+                                .part("file", part),
+                        )
+                    }
+                };
             }
             for (name, value) in headers {
                 request = request.header(*name, value);

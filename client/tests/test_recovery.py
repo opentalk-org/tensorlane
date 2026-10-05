@@ -29,11 +29,11 @@ class RecoveryTests(PipelineCase):
             self.start(
                 factor=16, workers=1, transform_fn=None, performance_metrics=False
             )
-            wait_for(lambda: set(range(1, 16)).issubset(completed))
-            self.assertEqual(started, set(range(16)))
-            self.assertNotIn(0, completed)
-            gate.set()
             with self.daemon.batches("training") as reader:
+                wait_for(lambda: set(range(1, 16)).issubset(completed))
+                self.assertEqual(started, set(range(16)))
+                self.assertNotIn(0, completed)
+                gate.set()
                 batches = list(reader)
             self.assertEqual([batch.batch_id for batch in batches], list(range(18)))
             self.assertEqual(
@@ -93,6 +93,17 @@ class RecoveryTests(PipelineCase):
             self.assertEqual([batch.batch_id for batch in batches], list(range(5)))
         self.assertEqual(self.service.transient_batches, 0)
         self.assertEqual(self.service.end_requests, [])
+
+    def test_lost_upload_reply_retries_the_whole_file_without_duplicate_asset(self):
+        self.start(workers=1, performance_metrics=False)
+        body = bytes(range(251)) * 20000
+        self.service.drop_upload_reply = True
+        asset_id = self.daemon.save_asset("model", self.file(content=body))
+        self.daemon.flush()
+        self.assertEqual(len(self.service.saved), 1)
+        self.assertEqual(self.service.saved[0][0].asset_id, asset_id)
+        self.assertEqual(self.service.saved[0][2], body)
+        self.assertFalse(self.service.drop_upload_reply)
 
     def test_lost_metric_reply_reuses_the_request_id(self):
         self.start(transform_fn=None, workers=1, performance_metrics=False)

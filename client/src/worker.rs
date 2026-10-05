@@ -118,7 +118,7 @@ impl Resources {
     fn clear(root: &Path) -> std::io::Result<()> {
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
-            if entry.file_name() != "lock" && entry.file_name() != "session" {
+            if entry.file_name() != "lock" {
                 if entry.file_type()?.is_dir() {
                     std::fs::remove_dir_all(entry.path())?;
                 } else {
@@ -148,15 +148,8 @@ impl Worker {
         }
         let resources = Resources::new(&options.root)?;
         let session_path = options.root.join("session");
-        let session = match std::fs::read_to_string(&session_path) {
-            Ok(session) => session,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let session = uuid::Uuid::new_v4().to_string();
-                std::fs::write(session_path, &session)?;
-                session
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let session = uuid::Uuid::new_v4().to_string();
+        std::fs::write(session_path, &session)?;
         let budgets = resources.budgets.clone();
         let root = options.root.clone();
         let (stop, stopped) = oneshot::channel();

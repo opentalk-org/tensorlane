@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
@@ -20,7 +20,7 @@ pub struct QueryConfig {
     #[serde(default)]
     pub repeat: bool,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetConfig {
     pub object: Option<String>,

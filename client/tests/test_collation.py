@@ -53,6 +53,7 @@ class CollationTests(unittest.TestCase):
                         root,
                         1,
                         1,
+                        1,
                         ("training", "validation", "evaluation"),
                         collate_fn,
                         [incoming],

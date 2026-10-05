@@ -157,15 +157,21 @@ impl TestEnv {
         Ok(env)
     }
     pub fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        self.request_at(&self.url, method, path)
+    }
+    pub fn request_at(&self, url: &str, method: Method, path: &str) -> reqwest::RequestBuilder {
         self.http
-            .request(method, format!("{}{path}", self.url))
+            .request(method, format!("{url}{path}"))
             .bearer_auth(KEY)
             .header(SESSION_HEADER, self.session.to_string())
     }
     pub async fn ready(&self) -> Result<()> {
+        self.ready_at(&self.url).await
+    }
+    pub async fn ready_at(&self, url: &str) -> Result<()> {
         eventually("server", || async {
             Ok(self
-                .request(Method::GET, "/runs")
+                .request_at(url, Method::GET, "/runs")
                 .send()
                 .await
                 .ok()
@@ -190,6 +196,13 @@ impl TestEnv {
         let mut args: Vec<_> = self.command.get_args().map(|a| a.to_os_string()).collect();
         let index = args.iter().position(|a| a == "--http-port").unwrap();
         args[index + 1] = url.rsplit(':').next().unwrap().into();
+        let cache = self
+            .cache
+            .parent()
+            .unwrap()
+            .join(format!("replica-{}", url.rsplit(':').next().unwrap()));
+        let index = args.iter().position(|a| a == "--cache-dir").unwrap();
+        args[index + 1] = cache.into_os_string();
         command
             .args(args)
             .env("RUST_LOG", "tensorlane=warn")
@@ -231,9 +244,19 @@ impl TestEnv {
         stream: &str,
         sequence: u64,
     ) -> Result<Option<DataResponse>> {
+        self.batch_at(&self.url, id, stream, sequence).await
+    }
+    pub async fn batch_at(
+        &self,
+        url: &str,
+        id: &str,
+        stream: &str,
+        sequence: u64,
+    ) -> Result<Option<DataResponse>> {
         eventually("batch", || async {
             let response = self
-                .request(
+                .request_at(
+                    url,
                     Method::GET,
                     &format!("/runs/{id}/streams/{stream}/batches/{sequence}"),
                 )

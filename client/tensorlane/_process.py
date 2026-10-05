@@ -116,6 +116,7 @@ def collate_worker(
     root: Path,
     ranks: int,
     num_workers: int,
+    prefetch_factor: int,
     streams,
     collate_fn,
     incoming,
@@ -126,6 +127,8 @@ def collate_worker(
     key = (root / "auth").read_bytes()
     outputs = {name: [queue.Queue() for _ in range(ranks)] for name in streams}
     errors = queue.Queue()
+    activated = set()
+    activation = threading.Lock()
 
     def deliver(rank: int, stream: str, stream_index: int) -> None:
         connection = None
@@ -134,6 +137,13 @@ def collate_worker(
                 root / "streams" / str(stream_index) / f"rank-{rank}.sock", key, stopped
             )
             connection.send(("ready", None))
+            with activation:
+                if stream not in activated:
+                    directory = root / "streams" / str(stream_index)
+                    _native.Semaphore((directory / "semaphore").read_text()).post(
+                        ranks * prefetch_factor
+                    )
+                    activated.add(stream)
             while not stopped.is_set():
                 try:
                     message = outputs[stream][rank].get(timeout=0.1)

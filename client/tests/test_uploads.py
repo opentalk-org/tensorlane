@@ -162,9 +162,7 @@ class PipelineTests(PipelineCase):
             closed.result(timeout=15)
         self.assertEqual(len(self.service.saved), 1)
         self.assertEqual(len(self.service.end_requests), 1)
-        self.assertEqual(
-            {path.name for path in self.daemon._root.iterdir()}, {"lock", "session"}
-        )
+        self.assertEqual({path.name for path in self.daemon._root.iterdir()}, {"lock"})
 
     def test_follower_close_does_not_end_run(self):
         self.start()

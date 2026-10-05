@@ -17,7 +17,7 @@ left join (
 ) latest on latest.run_id = runs.id
 ";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum RunStatus {
@@ -130,7 +130,7 @@ impl RunRepo {
             .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
         insert.write(&row).await?;
         insert.end().await?;
-        self.append_status(row.id, RunStatus::Queued).await?;
+        self.append_status(row.id, RunStatus::Queued, 0).await?;
         Ok(Some(row.id))
     }
 
@@ -180,15 +180,30 @@ impl RunRepo {
         .collect()
     }
 
-    pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> Result<()> {
+    pub async fn append_status(
+        &self,
+        run_id: Uuid,
+        status: RunStatus,
+        after_ns: i64,
+    ) -> Result<()> {
         db::request(self.client
-            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), ?, ? FROM run_status WHERE run_id = ?")
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND, fromUnixTimestamp64Nano(?) + INTERVAL 1 NANOSECOND), ?, ? FROM run_status WHERE run_id = ?")
+            .bind(after_ns)
             .bind(run_id)
             .bind(status as i8)
             .bind(run_id)
             .execute())
             .await
             .context("failed to append a run status")
+    }
+
+    pub async fn start(&self, run_id: Uuid, timestamp_ns: i64) -> Result<()> {
+        db::request(self.client
+            .query("INSERT INTO run_status (timestamp, run_id, status) VALUES (fromUnixTimestamp64Nano(?), ?, 1)")
+            .bind(timestamp_ns)
+            .bind(run_id)
+            .execute()).await
+            .context("failed to start run")
     }
 
     pub async fn session(&self, id: Uuid) -> Result<Option<Session>> {

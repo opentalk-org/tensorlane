@@ -1,12 +1,6 @@
-use crate::{
-    asset_repo::AssetRecord,
-    runtime::Runtime,
-    shared_cache::{Lock, write_atomic},
-};
+use crate::{asset_repo::AssetRecord, runtime::Runtime};
 use anyhow::{Result, ensure};
-use std::path::Path;
 use tensorlane_protocol::SaveAssetMetadata;
-use tokio::fs;
 use uuid::Uuid;
 
 pub async fn save(
@@ -16,7 +10,6 @@ pub async fn save(
     metadata: &SaveAssetMetadata,
     hash: &str,
     size: u64,
-    path: &Path,
 ) -> Result<()> {
     let run = metadata.run_id.parse()?;
     let config = engine.active(run, session).await?;
@@ -32,10 +25,9 @@ pub async fn save(
         );
         return Ok(());
     }
-    let _lineage = Lock::acquire(&engine.run_dir(run).join("lineage.lock")).await?;
-    let intent = path.with_extension("asset.json");
-    let record: AssetRecord = if fs::try_exists(&intent).await? {
-        serde_json::from_slice(&fs::read(&intent).await?)?
+    let intent = format!("assets/{id}");
+    let record: AssetRecord = if let Some(record) = engine.read_state(&intent).await? {
+        record
     } else {
         let mut previous = engine.repo.run_assets(run, Some(&metadata.name)).await?;
         let parent = match previous.pop() {
@@ -71,10 +63,7 @@ pub async fn save(
             ancestor_asset_id: parent.map(|p| p.id).unwrap_or(Uuid::nil()),
             deleted: false,
         };
-        write_atomic(&intent, &serde_json::to_vec(&record)?).await?;
-        record
+        engine.create_state(&intent, &record).await?
     };
-    engine
-        .save_asset(&record, path, &metadata.content_type)
-        .await
+    engine.save_asset(&record).await
 }
