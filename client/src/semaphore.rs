@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use sem_safe::named::{OpenFlags, Semaphore};
 use std::{
     ffi::CString,
@@ -15,7 +15,6 @@ pub struct PosixSemaphore {
 
 impl PosixSemaphore {
     pub fn create(capacity: usize) -> Result<Self> {
-        ensure!(capacity > 0, "semaphore capacity must be positive");
         let capacity = u32::try_from(capacity).context("semaphore capacity too large")?;
         let identifier = uuid::Uuid::new_v4().simple().to_string();
         let name = CString::new(format!("/tl-{}", &identifier[..20]))?;

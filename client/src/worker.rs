@@ -53,18 +53,19 @@ impl Settings {
         };
         let count =
             |name: &str, explicit: Option<usize>, default: usize| -> anyhow::Result<usize> {
-                let value = match explicit {
-                    Some(value) => value,
-                    None => match settings.and_then(|settings| settings.get(name)) {
-                        Some(value) if value.is_null() => default,
-                        Some(value) => usize::try_from(value.as_u64().with_context(|| {
-                            format!("config.tensorlane.{name} must be a positive integer")
-                        })?)?,
-                        None => default,
-                    },
-                };
-                ensure!(value > 0, "{name} must be positive");
-                Ok(value)
+                if let Some(value) = explicit {
+                    return Ok(value);
+                }
+                match settings.and_then(|settings| settings.get(name)) {
+                    Some(value) if !value.is_null() => {
+                        let value =
+                            value.as_u64().filter(|value| *value > 0).with_context(|| {
+                                format!("config.tensorlane.{name} must be a positive integer")
+                            })?;
+                        Ok(usize::try_from(value)?)
+                    }
+                    _ => Ok(default),
+                }
             };
         let settings = Self {
             ranks: count("ranks", options.ranks, 1)?,
@@ -72,13 +73,6 @@ impl Settings {
             num_workers: count("num_workers", options.num_workers, 5)?,
         };
         ensure!(options.rank < settings.ranks, "invalid rank");
-        u32::try_from(
-            settings
-                .ranks
-                .checked_mul(settings.factor)
-                .context("prefetch capacity overflow")?,
-        )
-        .context("prefetch capacity too large")?;
         Ok(settings)
     }
 }

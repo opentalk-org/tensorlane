@@ -60,7 +60,6 @@ impl QuerySampler {
         futures::pin_mut!(rows);
         while let Some(row) = rows.try_next().await? {
             let size = row.encoded_len();
-            ensure!(size <= MAX_BATCH_BYTES, "sample descriptor exceeds 64 MiB");
             let key = (row.batch_idx, row.sample_idx);
             ensure!(
                 previous.is_none_or(|last| last < key),
