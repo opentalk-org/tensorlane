@@ -43,6 +43,24 @@ class RecoveryTests(PipelineCase):
         finally:
             gate.set()
 
+    def test_pending_batches_poll_without_exponential_backoff(self):
+        attempts = []
+        data = self.service.data
+
+        def pending_data(handler, run, stream, index):
+            if stream == "training" and index == 0 and len(attempts) < 6:
+                attempts.append(time.monotonic())
+                self.service.reply(handler, 202, {})
+                return
+            data(handler, run, stream, index)
+
+        self.service.data = pending_data
+        self.start(factor=1, workers=1, transform_fn=None, performance_metrics=False)
+        with self.daemon.batches("training") as reader:
+            self.assertEqual([batch.batch_id for batch in reader], list(range(5)))
+        self.assertEqual(len(attempts), 6)
+        self.assertLess(attempts[-1] - attempts[0], 1)
+
     def test_eof_discards_errors_from_speculative_requests(self):
         self.service.streams.update(training=0, validation=0, evaluation=0)
         data = self.service.data

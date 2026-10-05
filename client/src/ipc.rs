@@ -67,27 +67,54 @@ mod tests {
         time::{Duration, timeout},
     };
 
+    #[test]
+    fn sample_blob_encoding_preserves_wire_format() -> Result<()> {
+        let sample = tensorlane_protocol::Sample {
+            sample_id: "audio".into(),
+            metadata_json: "{}".into(),
+            blobs: std::collections::HashMap::from([("audio".into(), vec![23; 100_000])]),
+        };
+        let legacy =
+            postcard::to_allocvec(&(&sample.sample_id, &sample.metadata_json, &sample.blobs))?;
+        assert_eq!(postcard::to_allocvec(&sample)?, legacy);
+        assert_eq!(
+            postcard::from_bytes::<tensorlane_protocol::Sample>(&legacy)?,
+            sample
+        );
+        assert_eq!(
+            serde_json::to_value(&sample)?["blobs"]["audio"]
+                .as_array()
+                .unwrap()
+                .len(),
+            100_000
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn work_delivery_without_readiness_messages() -> Result<()> {
         let (daemon, worker) = UnixStream::pair()?;
         let mut data = Sender::new(daemon);
         let mut batches = Receiver::<Work>::new(worker);
-        data.send(&Work::Sample {
+        data.send(&Work::Batch {
             stream: "evaluation".into(),
             batch: (0, 1),
             query_batch_idx: 4,
             timings: [0.0; 3],
-            index: 0,
-            sample: tensorlane_protocol::Sample {
-                sample_id: "sample".into(),
-                metadata_json: "{}".into(),
-                blobs: Default::default(),
-            },
+            memory_units: 0,
+            samples: vec![(
+                0,
+                tensorlane_protocol::Sample {
+                    sample_id: "sample".into(),
+                    metadata_json: "{}".into(),
+                    blobs: Default::default(),
+                },
+            )],
         })
         .await?;
         assert!(matches!(
             batches.recv().await?,
-            Some(Work::Sample {
+            Some(Work::Batch {
                 batch: (0, 1),
                 query_batch_idx: 4,
                 ..

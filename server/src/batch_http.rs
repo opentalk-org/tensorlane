@@ -1,7 +1,7 @@
 use crate::{
     MAX_BATCH_BYTES,
     db::stream_samples,
-    loader::Loader,
+    loader::{Loader, load_blobs},
     runtime::{Batch, LOAD_MEMORY_UNIT, Runtime},
     sampling::{BatchPlan, plan::QuerySampler},
     shared_cache::{Lock, write_atomic},
@@ -162,23 +162,21 @@ async fn load_batch(
         permit
     };
     let mut encoded_bytes = response.encoded_len();
-    let samples = try_join_all(prepared.into_iter().map(|(sample, sizes)| async move {
-        let blobs = try_join_all(sample.blobs.into_iter().zip(sizes).map(
-            |((name, blob), size)| async move {
-                let bytes = loader.load(&blob, size).await?;
-                ensure!(bytes.len() == size, "blob returned an unexpected size");
-                anyhow::Ok((name, bytes))
-            },
-        ))
-        .await?;
-        anyhow::Ok(tensorlane_protocol::Sample {
+    let references = prepared
+        .iter()
+        .flat_map(|(sample, sizes)| sample.blobs.values().cloned().zip(sizes.iter().copied()))
+        .collect();
+    let mut blobs = load_blobs(loader, references).await?.into_iter();
+    for (sample, _) in prepared {
+        let sample = tensorlane_protocol::Sample {
             sample_id: sample.sample_id,
             metadata_json: sample.metadata_json,
-            blobs: blobs.into_iter().collect(),
-        })
-    }))
-    .await?;
-    for sample in samples {
+            blobs: sample
+                .blobs
+                .into_keys()
+                .map(|name| (name, blobs.next().unwrap()))
+                .collect(),
+        };
         encoded_bytes += prost::encoding::message::encoded_len(1, &sample);
         ensure!(
             encoded_bytes <= MAX_BATCH_BYTES - 64,

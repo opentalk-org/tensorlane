@@ -45,6 +45,7 @@ struct TensorlaneConfig {
     num_workers: Option<u64>,
     prefetch_factor: Option<u64>,
     max_load_memory_bytes: Option<usize>,
+    max_prefetch_memory_bytes: Option<u64>,
     #[serde(default)]
     assets: HashMap<String, AssetConfig>,
     asset_type: Option<String>,
@@ -100,6 +101,10 @@ impl Config {
             ("ranks", settings.ranks),
             ("num_workers", settings.num_workers),
             ("prefetch_factor", settings.prefetch_factor),
+            (
+                "max_prefetch_memory_bytes",
+                settings.max_prefetch_memory_bytes,
+            ),
         ] {
             ensure!(
                 count.is_none_or(|count| count > 0),

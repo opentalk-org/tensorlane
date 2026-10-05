@@ -13,6 +13,14 @@ class CollationTests(unittest.TestCase):
     def run_collator(self, messages, collate_fn=None):
         incoming = queue.Queue()
         for message in messages:
+            kind, stream, value = message
+            if kind == "sample":
+                batch, query_idx, index, sample, timings = value
+                message = (
+                    "samples",
+                    stream,
+                    (batch, query_idx, [(index, sample, timings[3])], timings[:3], 0),
+                )
             incoming.put(message)
         outputs = [queue.Queue() for _ in range(3)]
         errors = queue.Queue()
@@ -70,6 +78,29 @@ class CollationTests(unittest.TestCase):
         self.assertEqual(outputs[0].get_nowait(), ("end", None))
         self.assertEqual(outputs[1].get_nowait(), ("end", None))
         self.assertEqual(outputs[2].get_nowait()[1].data, (4,))
+
+    def test_grouped_parts_preserve_sample_order_and_timings(self):
+        outputs = self.run_collator(
+            [
+                (
+                    "samples",
+                    "training",
+                    ((0, 4), 9, [(3, 4, 0.4), (1, 2, 0.2)], (1, 2, 3), 0),
+                ),
+                (
+                    "samples",
+                    "training",
+                    ((0, 4), 9, [(2, 3, 0.3), (0, 1, 0.1)], (1, 2, 3), 0),
+                ),
+                ("end", "training", None),
+            ],
+            {"training": sum},
+        )
+        batch = outputs[0].get_nowait()[1]
+        self.assertEqual(batch.samples, (1, 2, 3, 4))
+        self.assertEqual(batch.data, 10)
+        self.assertEqual(batch.query_batch_idx, 9)
+        self.assertAlmostEqual(batch._timings[3], 1)
 
     def test_duplicate_positions_and_inconsistent_sizes_fail(self):
         for second in [((0, 2), 1, 0, 2), ((0, 3), 1, 1, 2), ((0, 2), 2, 1, 2)]:

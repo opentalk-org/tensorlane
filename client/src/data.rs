@@ -2,7 +2,7 @@ use crate::semaphore::BatchBudget;
 use anyhow::{Context, ensure};
 use futures_util::StreamExt;
 use prost::Message;
-use reqwest::{Method, StatusCode};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::{
     sync::Arc,
@@ -14,13 +14,13 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Serialize, Deserialize)]
 pub enum Work {
-    Sample {
+    Batch {
         stream: String,
         batch: (u64, usize),
         query_batch_idx: u64,
         timings: [f64; 3],
-        index: usize,
-        sample: Sample,
+        samples: Vec<(usize, Sample)>,
+        memory_units: usize,
     },
     End {
         stream: String,
@@ -72,16 +72,17 @@ pub async fn prefetch(
                 })?,
         ),
     };
+    let memory = request_task.budget.memory.clone();
     let batches = UnboundedReceiverStream::new(receiver)
         .map(|sequence| {
             let http = http.clone();
             let run_id = run_id.clone();
             let stream_name = stream_name.clone();
+            let memory = memory.clone();
             async move {
                 let started = std::time::Instant::now();
-                let (status, _, bytes) = http
-                    .request(
-                        Method::GET,
+                let (status, bytes, lease) = http
+                    .batch(
                         &[
                             "runs",
                             &run_id,
@@ -90,21 +91,24 @@ pub async fn prefetch(
                             "batches",
                             &sequence.to_string(),
                         ],
-                        None,
-                        &[],
-                        crate::MAX_BATCH_BYTES,
+                        memory,
+                        sequence,
                     )
                     .await
                     .context("receiving data batch")?;
-                anyhow::Ok((sequence, status, bytes, started.elapsed().as_secs_f64()))
+                anyhow::Ok((
+                    sequence,
+                    status,
+                    bytes,
+                    lease,
+                    started.elapsed().as_secs_f64(),
+                ))
             }
         })
-        // Credits bound both outstanding requests and unconsumed batches.
-        // Ordered buffering keeps worker delivery independent of HTTP completion order.
         .buffered(request_task.budget.capacity);
     futures_util::pin_mut!(batches);
     while let Some(batch) = batches.next().await {
-        let (expected_id, status, bytes, receive_seconds) = batch?;
+        let (expected_id, status, bytes, lease, receive_seconds) = batch?;
         if status == StatusCode::NO_CONTENT {
             break;
         }
@@ -120,17 +124,16 @@ pub async fn prefetch(
         );
         let batch_size = response.batch.len();
         ensure!(batch_size > 0, "empty batches are unsupported");
-        for (index, sample) in response.batch.into_iter().enumerate() {
-            work.send(Work::Sample {
-                stream: stream_name.clone(),
-                batch: (response.batch_id, batch_size),
-                query_batch_idx: response.query_batch_idx,
-                timings,
-                index,
-                sample,
-            })
-            .context("transform worker disconnected")?;
-        }
+        work.send(Work::Batch {
+            stream: stream_name.clone(),
+            batch: (response.batch_id, batch_size),
+            query_batch_idx: response.query_batch_idx,
+            timings,
+            samples: response.batch.into_iter().enumerate().collect(),
+            memory_units: lease.units,
+        })
+        .context("transform worker disconnected")?;
+        lease.transfer();
     }
     request_task.finish()?;
     work.send(Work::End {
