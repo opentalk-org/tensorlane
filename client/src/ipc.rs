@@ -7,11 +7,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
-const MAX_FRAME_LENGTH: usize = crate::MAX_BATCH_BYTES;
-
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
-        .max_frame_length(MAX_FRAME_LENGTH)
+        .max_frame_length(crate::MAX_BATCH_BYTES)
         .new_codec()
 }
 
@@ -144,7 +142,7 @@ mod tests {
     async fn oversized_header_is_rejected() -> Result<()> {
         let (mut sender, receiver) = UnixStream::pair()?;
         sender
-            .write_all(&((MAX_FRAME_LENGTH + 1) as u32).to_be_bytes())
+            .write_all(&((crate::MAX_BATCH_BYTES + 1) as u32).to_be_bytes())
             .await?;
         assert!(Receiver::<Vec<u8>>::new(receiver).recv().await.is_err());
         Ok(())

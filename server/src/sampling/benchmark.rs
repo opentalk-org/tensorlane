@@ -1,7 +1,7 @@
-use super::{QuerySampler, Sampler};
+use super::plan::QuerySampler;
 use crate::{
     db::{SampleRow, stream_samples},
-    run::Config,
+    run_config::Config,
 };
 use std::{env, time::Instant};
 

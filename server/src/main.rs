@@ -28,7 +28,7 @@ mod job;
 mod loader;
 mod metric_http;
 mod query_params;
-mod run;
+mod run_config;
 mod run_repo;
 mod runtime;
 mod s3_upload;
@@ -37,7 +37,7 @@ mod shared_cache;
 mod upload_http;
 mod uploads;
 
-const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+use tensorlane_protocol::MAX_BATCH_BYTES;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))

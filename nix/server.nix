@@ -15,7 +15,6 @@ pkgs.rustPlatform.buildRustPackage {
       (source + "/client/Cargo.toml")
       (source + "/client/build.rs")
       (source + "/client/src")
-      (source + "/error-context")
       (source + "/protocol")
       (source + "/queries/examples")
     ];

@@ -253,8 +253,8 @@ mod tests {
     #[test]
     fn bundled_configurations_use_the_keyed_query_schema() {
         for source in [
-            include_str!("../../../queries/examples/sample-configs.json"),
-            include_str!("../../../queries/examples/sample-configs-stage2.json"),
+            include_str!("../../queries/examples/sample-configs.json"),
+            include_str!("../../queries/examples/sample-configs-stage2.json"),
         ] {
             let value: Value = serde_json::from_str(source).unwrap();
             let cfg = Config::parse(value["config"].as_object().unwrap()).unwrap();

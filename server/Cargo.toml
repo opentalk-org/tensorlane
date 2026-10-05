@@ -37,7 +37,6 @@ tower = { version = "0.5", features = ["util", "limit"] }
 tower-http = { version = "0.7.1", features = ["trace"] }
 serde-big-array = "0.5.1"
 hex = "0.4.3"
-error-context = { workspace = true }
 tensorlane-protocol = { path = "../protocol" }
 fs2 = "0.4"
 

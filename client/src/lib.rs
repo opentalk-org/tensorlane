@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 
-const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
+use tensorlane_protocol::MAX_BATCH_BYTES;
 
 mod assets;
 mod client;

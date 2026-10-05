@@ -1431,14 +1431,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "error-context"
-version = "0.1.0"
-dependencies = [
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "etcetera"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3940,7 +3932,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "clickhouse",
- "error-context",
  "fs2",
  "futures",
  "hex",

@@ -20,7 +20,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    run::Config,
+    run_config::Config,
     run_repo::{Run, RunRepo, RunStatus},
 };
 
