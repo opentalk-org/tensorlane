@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub(super) const LOAD_MEMORY_UNIT: usize = 1024;
+type LoadingPools = HashMap<(Uuid, String), Weak<Semaphore>>;
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -32,8 +33,7 @@ pub struct Runtime {
     pub asset_slots: Arc<Semaphore>,
     pub upload_slots: Arc<Semaphore>,
     pub(super) loader: Arc<dyn Loader>,
-    pub(super) plans: Arc<Semaphore>,
-    load_memory: Arc<Mutex<HashMap<Uuid, Weak<Semaphore>>>>,
+    load_memory: Arc<Mutex<LoadingPools>>,
 }
 
 pub enum Batch {
@@ -69,7 +69,6 @@ impl Runtime {
             metrics_prefix,
             asset_slots: Arc::new(Semaphore::new(8)),
             upload_slots: Arc::new(Semaphore::new(2)),
-            plans: Arc::new(Semaphore::new(2)),
             load_memory: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -78,17 +77,23 @@ impl Runtime {
         self.cache.join("runs").join(run.to_string())
     }
 
-    pub(super) fn loading_memory(&self, run: Uuid, bytes: usize) -> Result<Arc<Semaphore>> {
-        let mut runs = self
+    pub(super) fn loading_memory(
+        &self,
+        run: Uuid,
+        stream: &str,
+        bytes: usize,
+    ) -> Result<Arc<Semaphore>> {
+        let mut streams = self
             .load_memory
             .lock()
             .map_err(|_| anyhow::anyhow!("loading memory lock poisoned"))?;
-        runs.retain(|_, budget| budget.strong_count() > 0);
-        if let Some(budget) = runs.get(&run).and_then(Weak::upgrade) {
+        streams.retain(|_, budget| budget.strong_count() > 0);
+        let key = (run, stream.to_owned());
+        if let Some(budget) = streams.get(&key).and_then(Weak::upgrade) {
             return Ok(budget);
         }
         let budget = Arc::new(Semaphore::new(bytes.div_ceil(LOAD_MEMORY_UNIT)));
-        runs.insert(run, Arc::downgrade(&budget));
+        streams.insert(key, Arc::downgrade(&budget));
         Ok(budget)
     }
 
@@ -262,7 +267,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn loading_memory_is_shared_within_a_run_and_independent_between_runs() -> Result<()> {
+    async fn loading_memory_is_shared_only_within_the_same_run_and_stream() -> Result<()> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let config = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -278,17 +283,26 @@ mod tests {
             "metrics",
         )?;
         let first_id = Uuid::new_v4();
-        let first = runtime.loading_memory(first_id, 100 * LOAD_MEMORY_UNIT)?;
+        let first = runtime.loading_memory(first_id, "images", 100 * LOAD_MEMORY_UNIT)?;
         let same = runtime
             .clone()
-            .loading_memory(first_id, 100 * LOAD_MEMORY_UNIT)?;
+            .loading_memory(first_id, "images", 100 * LOAD_MEMORY_UNIT)?;
         assert!(Arc::ptr_eq(&first, &same));
-        let second = runtime.loading_memory(Uuid::new_v4(), 100 * LOAD_MEMORY_UNIT)?;
+        let second = runtime.loading_memory(first_id, "labels", 100 * LOAD_MEMORY_UNIT)?;
+        let third = runtime.loading_memory(first_id, "audio", 100 * LOAD_MEMORY_UNIT)?;
+        let other_run = runtime.loading_memory(Uuid::new_v4(), "images", 100 * LOAD_MEMORY_UNIT)?;
         let occupied = first.clone().acquire_many_owned(100).await?;
         assert_eq!(same.available_permits(), 0);
-        assert_eq!(second.available_permits(), 100);
+        let second_permit = second.clone().try_acquire_many_owned(100)?;
+        let third_permit = third.clone().try_acquire_many_owned(100)?;
+        let other_run_permit = other_run.clone().try_acquire_many_owned(100)?;
+        assert_eq!(second.available_permits(), 0);
+        assert_eq!(third.available_permits(), 0);
+        assert_eq!(other_run.available_permits(), 0);
         drop(occupied);
         assert_eq!(same.available_permits(), 100);
+        assert_eq!(second.available_permits(), 0);
+        drop((second_permit, third_permit, other_run_permit));
         Ok(())
     }
 }
