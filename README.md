@@ -129,7 +129,7 @@ Export the returned `run_id` as `TENSORLANE_RUN_ID`. Save the Python reader abov
 
 ## Checkpoints and metrics
 
-Save checkpoints with `lane.save_asset("model", path, kind="checkpoint")`, then call `lane.flush()` before modifying the source file. To load one in a new run, add it to `config.tensorlane.assets` and read its local path with `lane.asset("model")`. The [resume example](client/examples/train2.py) restores weights and continues from the number of samples actually trained on.
+Save checkpoints with `lane.save_asset("model", path, kind="checkpoint")`, then call `lane.flush()` before modifying the source file. You can also pass a state dictionary: `lane.save_asset("model", {"model": model.state_dict(), "optimizer": optimizer.state_dict()}, kind="checkpoint")`. TensorLane serializes dictionaries with `torch.save`, waits for their upload to commit, and cleans up the temporary file before returning the asset ID. File and directory inputs retain asynchronous uploads; call `lane.flush()` before modifying their source. To load one in a new run, add it to `config.tensorlane.assets` and read its local path with `lane.asset("model")`. The [resume example](client/examples/train2.py) restores weights and continues from the number of samples actually trained on.
 
 Use `lane.metric(step, name, value)` to record scalars and `lane.metric_artifact(...)` for files. Throughput and timing metrics are enabled by default. The full run configuration is available as `lane.config`; application settings are in `lane.config["app"]`. Runtime defaults are one rank, five workers, and two prefetched batches per rank and stream. Explicit `init` arguments override `config.tensorlane` settings. Always select a stream by name with `lane.batches("training")`.
 
