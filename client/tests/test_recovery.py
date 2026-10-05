@@ -1,10 +1,65 @@
 from pathlib import Path
 import time
+import threading
 import tensorlane
-from pipeline_fixture import PipelineCase
+from pipeline_fixture import PipelineCase, wait_for
 
 
 class RecoveryTests(PipelineCase):
+    def test_parallel_batch_requests_preserve_order_and_credit_limit(self):
+        self.service.streams.update(training=5, validation=0, evaluation=0)
+        gate = threading.Event()
+        started = set()
+        completed = set()
+        data = self.service.data
+
+        def delayed_data(handler, run, stream, index):
+            if stream == "training":
+                with self.service.lock:
+                    started.add(index)
+                if index == 0:
+                    gate.wait(20)
+            data(handler, run, stream, index)
+            if stream == "training":
+                with self.service.lock:
+                    completed.add(index)
+
+        self.service.data = delayed_data
+        try:
+            self.start(
+                factor=3, workers=1, transform_fn=None, performance_metrics=False
+            )
+            wait_for(lambda: {1, 2}.issubset(completed))
+            self.assertEqual(started, {0, 1, 2})
+            self.assertNotIn(0, completed)
+            gate.set()
+            with self.daemon.batches("training") as reader:
+                batches = list(reader)
+            self.assertEqual([batch.batch_id for batch in batches], list(range(5)))
+            self.assertEqual(
+                [batch.samples[0].metadata["position"] for batch in batches],
+                list(range(5)),
+            )
+        finally:
+            gate.set()
+
+    def test_eof_discards_errors_from_speculative_requests(self):
+        self.service.streams.update(training=0, validation=0, evaluation=0)
+        data = self.service.data
+
+        def empty_data(handler, run, stream, index):
+            if index > 0:
+                self.service.reply(handler, 422, {"message": "past EOF"})
+            else:
+                data(handler, run, stream, index)
+
+        self.service.data = empty_data
+        self.start(factor=3, workers=1, transform_fn=None, performance_metrics=False)
+        with self.daemon.batches("training") as reader:
+            self.assertEqual(list(reader), [])
+        self.daemon.close()
+        self.assertFalse(self.service.end_requests[-1].failed)
+
     def test_truncated_asset_range_is_retried_and_verified(self):
         body = bytes(range(251)) * 20000
         self.service.assets = {"model": (None, body)}
