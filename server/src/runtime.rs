@@ -16,6 +16,8 @@ use crate::{
     shared_cache::{Lock, write_atomic},
 };
 
+pub(super) const LOAD_MEMORY_UNIT: usize = 1024;
+
 #[derive(Clone)]
 pub struct Runtime {
     pub repo: RunRepo,
@@ -85,7 +87,7 @@ impl Runtime {
         if let Some(budget) = runs.get(&run).and_then(Weak::upgrade) {
             return Ok(budget);
         }
-        let budget = Arc::new(Semaphore::new(bytes));
+        let budget = Arc::new(Semaphore::new(bytes.div_ceil(LOAD_MEMORY_UNIT)));
         runs.insert(run, Arc::downgrade(&budget));
         Ok(budget)
     }
@@ -276,10 +278,12 @@ mod tests {
             "metrics",
         )?;
         let first_id = Uuid::new_v4();
-        let first = runtime.loading_memory(first_id, 100)?;
-        let same = runtime.clone().loading_memory(first_id, 100)?;
+        let first = runtime.loading_memory(first_id, 100 * LOAD_MEMORY_UNIT)?;
+        let same = runtime
+            .clone()
+            .loading_memory(first_id, 100 * LOAD_MEMORY_UNIT)?;
         assert!(Arc::ptr_eq(&first, &same));
-        let second = runtime.loading_memory(Uuid::new_v4(), 100)?;
+        let second = runtime.loading_memory(Uuid::new_v4(), 100 * LOAD_MEMORY_UNIT)?;
         let occupied = first.clone().acquire_many_owned(100).await?;
         assert_eq!(same.available_permits(), 0);
         assert_eq!(second.available_permits(), 100);

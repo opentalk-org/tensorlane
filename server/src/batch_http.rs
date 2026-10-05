@@ -2,7 +2,7 @@ use crate::{
     MAX_BATCH_BYTES,
     db::stream_samples,
     loader::Loader,
-    runtime::{Batch, Runtime},
+    runtime::{Batch, LOAD_MEMORY_UNIT, Runtime},
     sampling::{BatchPlan, plan::QuerySampler},
     shared_cache::{Lock, write_atomic},
 };
@@ -144,12 +144,16 @@ async fn load_batch(
         .checked_mul(2)
         .and_then(|size| size.checked_add(overhead))
         .context("batch loading memory size overflow")?;
-    ensure!(
-        required <= limit,
-        "batch loading memory exceeds config.tensorlane.max_load_memory_bytes ({required} > {limit})"
-    );
-    let Ok(permit) = memory.try_acquire_many_owned(u32::try_from(required)?) else {
-        return Ok(None);
+    let count = u32::try_from(required.min(limit).div_ceil(LOAD_MEMORY_UNIT))?;
+    // Oversized batches queue for the entire budget so smaller batches cannot
+    // continually overtake them. They run alone once existing loads finish.
+    let permit = if required > limit {
+        memory.acquire_many_owned(count).await?
+    } else {
+        let Ok(permit) = memory.try_acquire_many_owned(count) else {
+            return Ok(None);
+        };
+        permit
     };
     let mut encoded_bytes = response.encoded_len();
     let samples = try_join_all(prepared.into_iter().map(|(sample, sizes)| async move {
@@ -253,7 +257,7 @@ mod tests {
                     &loader,
                     "training".into(),
                     plan(8),
-                    Arc::new(Semaphore::new(256 * 1024 * 1024)),
+                    Arc::new(Semaphore::new(256 * 1024 * 1024 / LOAD_MEMORY_UNIT)),
                     256 * 1024 * 1024,
                 ),
             )
@@ -276,8 +280,11 @@ mod tests {
     #[tokio::test]
     async fn loading_waits_for_memory_without_fetching_and_releases_it_after_use() -> Result<()> {
         let limit = 256 * 1024 * 1024;
-        let memory = Arc::new(Semaphore::new(limit));
-        let occupied = memory.clone().acquire_many_owned(limit as u32).await?;
+        let memory = Arc::new(Semaphore::new(limit / LOAD_MEMORY_UNIT));
+        let occupied = memory
+            .clone()
+            .acquire_many_owned((limit / LOAD_MEMORY_UNIT) as u32)
+            .await?;
         let loader = DelayedLoader {
             barrier: tokio::sync::Barrier::new(1),
             active: AtomicUsize::new(0),
@@ -295,19 +302,82 @@ mod tests {
             load_batch(&loader, "training".into(), plan(1), memory.clone(), limit)
                 .await?
                 .unwrap();
-        assert!(memory.available_permits() < limit);
+        assert!(memory.available_permits() < limit / LOAD_MEMORY_UNIT);
         let _encoded = response.encode_to_vec();
-        assert!(memory.available_permits() < limit);
+        assert!(memory.available_permits() < limit / LOAD_MEMORY_UNIT);
         drop(permit);
-        assert_eq!(memory.available_permits(), limit);
+        assert_eq!(memory.available_permits(), limit / LOAD_MEMORY_UNIT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_batch_runs_alone_without_starving_or_blocking_other_runs() -> Result<()> {
+        let limit = 128 * 1024;
+        let memory = Arc::new(Semaphore::new(limit / LOAD_MEMORY_UNIT));
+        let loader = Arc::new(DelayedLoader {
+            barrier: tokio::sync::Barrier::new(1),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            completed: Mutex::new(Vec::new()),
+        });
+        let occupied = memory.clone().acquire_owned().await?;
+        let loading = {
+            let memory = memory.clone();
+            let loader = loader.clone();
+            tokio::spawn(async move {
+                load_batch(loader.as_ref(), "training".into(), plan(2), memory, limit).await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!loading.is_finished());
+        assert_eq!(loader.peak.load(Ordering::SeqCst), 0);
         assert!(
-            load_batch(&loader, "training".into(), plan(1), memory.clone(), 1)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("batch loading memory exceeds")
+            load_batch(
+                loader.as_ref(),
+                "training".into(),
+                plan(1),
+                memory.clone(),
+                limit
+            )
+            .await?
+            .is_none()
         );
-        assert_eq!(memory.available_permits(), limit);
+        let other_run = Arc::new(Semaphore::new(limit / LOAD_MEMORY_UNIT));
+        assert!(
+            load_batch(
+                loader.as_ref(),
+                "training".into(),
+                plan(1),
+                other_run,
+                limit
+            )
+            .await?
+            .is_some()
+        );
+        drop(occupied);
+        let (response, permit) = tokio::time::timeout(Duration::from_secs(1), loading)
+            .await???
+            .unwrap();
+        assert_eq!(response.batch.len(), 2);
+        assert_eq!(memory.available_permits(), 0);
+        assert!(
+            load_batch(
+                loader.as_ref(),
+                "training".into(),
+                plan(1),
+                memory.clone(),
+                limit
+            )
+            .await?
+            .is_none()
+        );
+        drop(permit);
+        assert_eq!(memory.available_permits(), limit / LOAD_MEMORY_UNIT);
+        assert!(
+            load_batch(loader.as_ref(), "training".into(), plan(1), memory, limit)
+                .await?
+                .is_some()
+        );
         Ok(())
     }
 
@@ -327,7 +397,7 @@ mod tests {
             &LargeLoader,
             "training".into(),
             plan(2),
-            Arc::new(Semaphore::new(256 * 1024 * 1024)),
+            Arc::new(Semaphore::new(256 * 1024 * 1024 / LOAD_MEMORY_UNIT)),
             256 * 1024 * 1024,
         )
         .await
