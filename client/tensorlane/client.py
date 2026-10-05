@@ -215,7 +215,7 @@ class TensorLane:
     def save_asset(
         self,
         name: str,
-        path: str | Path,
+        path: str | Path | dict,
         *,
         step: int = 0,
         kind: str = "file",
@@ -225,14 +225,26 @@ class TensorLane:
         if metadata is not None and not isinstance(metadata, dict):
             raise TypeError("asset metadata must be an object")
         self._performance_collector()
-        return self._upload_client().save_asset(
-            name,
-            Path(path).absolute(),
-            step,
-            kind,
-            asset_type,
-            json.dumps(metadata or {}, allow_nan=False),
-            _content_type(path),
+        uploads = self._upload_client()
+        options = {
+            "step": step,
+            "kind": kind,
+            "asset_type": asset_type,
+            "metadata_json": json.dumps(metadata or {}, allow_nan=False),
+        }
+        if isinstance(path, dict):
+            import torch
+
+            with tempfile.NamedTemporaryFile(
+                dir=self._root, suffix=".pt"
+            ) as checkpoint:
+                torch.save(path, checkpoint)
+                checkpoint.flush()
+                asset_id = uploads.save_asset(name, Path(checkpoint.name), **options)
+                uploads.flush()
+                return asset_id
+        return uploads.save_asset(
+            name, Path(path).absolute(), content_type=_content_type(path), **options
         )
 
     def flush(self, *, timeout: float | None = None) -> None:

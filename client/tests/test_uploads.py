@@ -1,14 +1,71 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
+import io
 from pathlib import Path
 from unittest.mock import patch
 import time
+import torch
 from fixture_transforms import transform, timed_transform
 from pipeline_fixture import PipelineCase, wait_for
 
 
 class PipelineTests(PipelineCase):
+    def test_state_dict_save_snapshots_model_and_optimizer_and_cleans_source(self):
+        self.start(workers=1, performance_metrics=False)
+        model = torch.nn.Linear(2, 1)
+        optimizer = torch.optim.Adam(model.parameters())
+        model(torch.ones(1, 2)).sum().backward()
+        optimizer.step()
+        expected = model.weight.detach().clone()
+        self.service.upload_gate.clear()
+        with ThreadPoolExecutor() as executor:
+            saved = executor.submit(
+                self.daemon.save_asset,
+                "model",
+                {"model": model.state_dict(), "optimizer": optimizer.state_dict()},
+                kind="checkpoint",
+                step=3,
+                metadata={"note": "state dictionary"},
+            )
+            try:
+                self.assertTrue(self.service.upload_started.wait(5))
+                self.assertFalse(saved.done())
+                self.assertTrue(list(self.daemon._root.glob("*.pt")))
+                with torch.no_grad():
+                    model.weight.add_(10)
+            finally:
+                self.service.upload_gate.set()
+            asset_id = saved.result(timeout=15)
+        self.assertFalse(list(self.daemon._root.glob("*.pt")))
+        metadata, _, body = self.service.saved[0]
+        self.assertEqual(metadata.asset_id, asset_id)
+        self.assertEqual(metadata.kind, "checkpoint")
+        self.assertEqual(metadata.step, 3)
+        self.assertEqual(metadata.content_type, "application/octet-stream")
+        self.assertEqual(metadata.metadata_json, '{"note": "state dictionary"}')
+        state = torch.load(io.BytesIO(body), weights_only=True)
+        restored = torch.nn.Linear(2, 1)
+        restored.load_state_dict(state["model"])
+        restored_optimizer = torch.optim.Adam(restored.parameters())
+        restored_optimizer.load_state_dict(state["optimizer"])
+        self.assertTrue(torch.equal(restored.weight, expected))
+        self.assertTrue(restored_optimizer.state)
+
+    def test_state_dict_save_cleans_source_when_serialization_or_enqueue_fails(self):
+        self.start(workers=1, performance_metrics=False)
+        with patch("torch.save", side_effect=ValueError("serialization failed")):
+            with self.assertRaisesRegex(ValueError, "serialization failed"):
+                self.daemon.save_asset("model", {"weight": torch.ones(2)})
+        self.assertFalse(list(self.daemon._root.glob("*.pt")))
+        with self.assertRaisesRegex(RuntimeError, "asset kind"):
+            self.daemon.save_asset("model", {"weight": torch.ones(2)}, kind="invalid")
+        self.assertFalse(list(self.daemon._root.glob("*.pt")))
+        self.service.fail_save = True
+        with self.assertRaisesRegex(RuntimeError, "fixture save failure"):
+            self.daemon.save_asset("model", {"weight": torch.ones(2)})
+        self.assertFalse(list(self.daemon._root.glob("*.pt")))
+
     def test_metrics_and_artifacts_still_work(self):
         self.start()
         self.daemon.metric(3, "loss", 0.25)
