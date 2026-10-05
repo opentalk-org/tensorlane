@@ -46,6 +46,13 @@ pub(super) async fn supervise(
             !initialized.streams.is_empty(),
             "server returned no streams"
         );
+        ensure!(
+            !initialized
+                .streams
+                .iter()
+                .any(|name| matches!(name.as_str(), "." | "..")),
+            "stream name must not be . or .."
+        );
         let (assets, asset_metadata) =
             crate::assets::prefetch(&http, &initialized, &options.root).await?;
         {
@@ -166,6 +173,7 @@ pub(super) async fn supervise(
         connected.store(true, Ordering::Release);
         loop {
             tokio::select! {
+                biased;
                 result = &mut stop => return result.unwrap_or(Ok(())),
                 result = &mut heartbeat => {
                     result.context("heartbeat task panicked")??;

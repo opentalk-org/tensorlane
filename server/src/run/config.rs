@@ -101,6 +101,10 @@ impl Config {
         let mut compiled = BTreeMap::new();
         for (key, query) in queries {
             ensure!(!key.trim().is_empty(), "query key must not be empty");
+            ensure!(
+                !matches!(key.as_str(), "." | ".."),
+                "query key must not be . or .."
+            );
             ensure!(!compiled.contains_key(&key), "duplicate query key: {}", key);
             ensure!(
                 !query.sql.trim().is_empty(),
@@ -118,6 +122,10 @@ impl Config {
         }
         for (name, asset) in &settings.assets {
             ensure!(!name.is_empty(), "asset name must not be empty");
+            ensure!(
+                !matches!(name.as_str(), "." | ".."),
+                "asset name must not be . or .."
+            );
             ensure!(
                 asset.object.is_some() != asset.asset_id.is_some(),
                 "asset {name} requires exactly one of object or asset_id"
@@ -182,6 +190,26 @@ mod tests {
             json!({"queries": [{"key": "x", "sql": "SELECT 1", "batch_size": 32}]}),
         ] {
             assert!(parse(value.clone()).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_segments_in_stream_and_asset_names() {
+        for name in [".", ".."] {
+            for document in [
+                json!({"queries": {name: {"sql": "SELECT 1"}}}),
+                json!({"queries": [{"key": name, "sql": "SELECT 1"}]}),
+                json!({"queries": {"training": {"sql": "SELECT 1"}},
+                    "tensorlane": {"assets": {name: {"object": "model"}}}}),
+            ] {
+                assert!(
+                    parse(document)
+                        .err()
+                        .unwrap()
+                        .to_string()
+                        .contains("must not be . or ..")
+                );
+            }
         }
     }
 

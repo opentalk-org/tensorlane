@@ -51,7 +51,7 @@ Run configuration has three separate sections:
 
 Parameters use ClickHouse syntax such as `{batch_size:UInt64}` and come only from that query's `params` object. Put inputs such as `dataset_id` and `seed` there too. SQL determines batch membership and count; `batches`, `samples`, and `batch_size` are ordinary SQL parameters with no built-in TensorLane meaning. See the executable [example run configuration](queries/examples/sample-configs.json).
 
-Query keys must be unique and nonempty. Every stream ends when its query result ends unless `repeat` is explicitly `true`; repeating replays the saved query result. Keys such as `training` and `validation` have no special behavior.
+Query keys must be unique and nonempty. Query keys and input asset names cannot be `.` or `..`, which HTTP URLs treat as path navigation. Every stream ends when its query result ends unless `repeat` is explicitly `true`; repeating replays the saved query result. Keys such as `training` and `validation` have no special behavior.
 
 New run configurations use named query objects. Stored lists with `key` fields remain readable without rewriting historical runs.
 
