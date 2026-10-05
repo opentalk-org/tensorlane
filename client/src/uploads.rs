@@ -88,7 +88,7 @@ async fn receive(
     };
     let mut automatic = false;
     let processing = async {
-        let mut metrics: Option<Metrics> = None;
+        let mut metrics = Metrics::new(http.clone(), run_id.clone());
         while let Some(job) = queue.recv().await {
             match job {
                 Upload::Automatic => automatic = true,
@@ -119,16 +119,11 @@ async fn receive(
                     .await?
                 }
                 Upload::Flush => {
-                    if let Some(metrics) = metrics.take() {
-                        metrics.finish().await?;
-                    }
+                    metrics.flush().await?;
                     replies.send(&Ok(())).await?;
                 }
                 Upload::Metric { step, name, value } => {
-                    let stream = metrics.get_or_insert_with(|| {
-                        Metrics::new(http.clone(), run_id.clone(), automatic)
-                    });
-                    stream
+                    metrics
                         .metric(ScalarMetric {
                             step,
                             name,
@@ -143,17 +138,11 @@ async fn receive(
                     name,
                     content_type,
                 } => {
-                    let stream = metrics.get_or_insert_with(|| {
-                        Metrics::new(http.clone(), run_id.clone(), automatic)
-                    });
-                    stream.artifact(step, path, name, content_type).await?;
+                    metrics.artifact(step, path, name, content_type).await?;
                 }
             }
         }
-        if let Some(metrics) = metrics {
-            metrics.finish().await?;
-        }
-        anyhow::Ok(())
+        metrics.flush().await
     };
     let result = tokio::try_join!(reading, processing).map(|_| ());
     if let Err(error) = &result {
@@ -183,7 +172,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(client: crate::transport::HttpClient, run_id: String, _automatic: bool) -> Self {
+    fn new(client: crate::transport::HttpClient, run_id: String) -> Self {
         Self {
             client,
             run_id,
@@ -248,10 +237,6 @@ impl Metrics {
             file,
         )
         .await
-    }
-
-    async fn finish(mut self) -> anyhow::Result<()> {
-        self.flush().await
     }
 }
 

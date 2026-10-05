@@ -11,18 +11,23 @@ from . import _native
 from .client import TensorLane, _root, _check_alive
 
 
-def _validate_callbacks(spec, streams=None):
-    if spec is None:
-        return
+def _validate_callbacks(spec):
     if isinstance(spec, Mapping):
-        if streams is not None and any(name not in streams for name in spec):
-            raise ValueError("callback mapping contains an unknown stream")
-        if any(
-            not isinstance(name, str) or not callable(fn) for name, fn in spec.items()
-        ):
-            raise TypeError("callback mapping must contain callables")
-    elif not callable(spec):
+        for name, fn in spec.items():
+            if not isinstance(name, str) or not callable(fn):
+                raise TypeError("callback mapping must contain callables")
+        return dict(spec)
+    if spec is not None and not callable(spec):
         raise TypeError("callback must be callable or a mapping")
+    return spec
+
+
+def _stream_callbacks(spec, streams):
+    if isinstance(spec, dict):
+        if spec.keys() - set(streams):
+            raise ValueError("callback mapping contains an unknown stream")
+        return spec
+    return dict.fromkeys(streams, spec)
 
 
 def init(
@@ -62,6 +67,10 @@ def init(
     if timeout is not None and timeout <= 0:
         raise ValueError("timeout must be positive")
     deadline = None if timeout is None else time.monotonic() + timeout
+    if start_daemon and ranks is not None and rank >= ranks:
+        raise ValueError("invalid rank")
+    transform = _validate_callbacks(transform)
+    collate_fn = _validate_callbacks(collate_fn)
     root = _root(run_id, ipc_dir)
     if not start_daemon:
         metadata_path = root / "init.json"
@@ -73,8 +82,8 @@ def init(
             time.sleep(0.02)
         metadata = json.loads(metadata_path.read_text())
         _check_alive(root)
-        _validate_callbacks(transform, metadata["streams"])
-        _validate_callbacks(collate_fn, metadata["streams"])
+        _stream_callbacks(transform, metadata["streams"])
+        _stream_callbacks(collate_fn, metadata["streams"])
         if rank >= int((root / "ranks").read_text()):
             raise ValueError("invalid rank")
         return TensorLane(
@@ -90,11 +99,6 @@ def init(
             prefetch_factor=metadata["prefetch_factor"],
             performance_metrics=performance_metrics,
         )
-
-    if ranks is not None and rank >= ranks:
-        raise ValueError("invalid rank")
-    _validate_callbacks(transform)
-    _validate_callbacks(collate_fn)
 
     native = _native.Daemon(
         run_id,
@@ -130,8 +134,8 @@ def init(
 
     context = multiprocessing.get_context("spawn")
     try:
-        _validate_callbacks(transform, daemon.streams)
-        _validate_callbacks(collate_fn, daemon.streams)
+        transform = _stream_callbacks(transform, daemon.streams)
+        collate_fn = _stream_callbacks(collate_fn, daemon.streams)
         daemon._queue = context.Queue()
         daemon._stopped = context.Event()
         collator_ready = context.Event()
