@@ -21,6 +21,7 @@ class Batch:
     samples: tuple[Any, ...]
     data: Any
     _timings: tuple[float, ...] = field(default=(), repr=False, compare=False)
+    _memory_units: int = field(default=0, repr=False, compare=False)
 
     def __len__(self) -> int:
         return len(self.samples)

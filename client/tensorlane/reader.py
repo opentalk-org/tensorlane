@@ -5,7 +5,7 @@ from pathlib import Path
 from collections.abc import Callable, Iterator
 from multiprocessing.connection import Listener
 import socket
-import torch.multiprocessing as multiprocessing
+import multiprocessing
 from . import _native
 from .data import Batch
 from ._performance import Performance
@@ -34,6 +34,7 @@ class BatchReader(Iterator[Batch]):
         self._connection = None
         self._listener = None
         self._semaphore = None
+        self._memory_semaphore = None
         deadline = time.monotonic() + timeout
         try:
             self._check()
@@ -43,6 +44,9 @@ class BatchReader(Iterator[Batch]):
             multiprocessing.current_process().authkey = key
             directory = root / "streams" / str(stream_index)
             self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
+            self._memory_semaphore = _native.Semaphore(
+                (directory / "memory").read_text()
+            )
             try:
                 self._listener = Listener(
                     str(directory / f"rank-{rank}.sock"),
@@ -97,6 +101,7 @@ class BatchReader(Iterator[Batch]):
             if kind != "batch":
                 raise RuntimeError(f"unexpected rank message: {kind}")
             batch = value
+            self._memory_semaphore.post(batch._memory_units)
             self._semaphore.post()
             self._returned = time.monotonic()
             if self._performance is not None:
@@ -133,6 +138,7 @@ class BatchReader(Iterator[Batch]):
                 pass
             self._listener = None
         self._semaphore = None
+        self._memory_semaphore = None
         self._closed = True
 
     def __enter__(self) -> BatchReader:

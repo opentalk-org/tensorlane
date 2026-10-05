@@ -4,7 +4,10 @@ use std::{
     ffi::CString,
     io,
     mem::ManuallyDrop,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub struct PosixSemaphore {
@@ -86,11 +89,13 @@ pub struct BatchBudget {
     pub semaphore: PosixSemaphore,
     pub capacity: usize,
     cancelled: AtomicBool,
+    pub memory: Arc<MemoryBudget>,
 }
 
 impl BatchBudget {
-    pub fn new(capacity: usize) -> Result<Self> {
+    pub fn new(capacity: usize, memory_bytes: usize) -> Result<Self> {
         Ok(Self {
+            memory: Arc::new(MemoryBudget::new(memory_bytes)?),
             semaphore: PosixSemaphore::create(capacity)?,
             capacity,
             cancelled: AtomicBool::new(false),
@@ -106,8 +111,95 @@ impl BatchBudget {
     }
 
     pub fn cancel(&self) {
+        self.memory.cancel();
         if !self.cancelled.swap(true, Ordering::AcqRel) {
             let _ = self.semaphore.post();
+        }
+    }
+}
+
+pub const MEMORY_UNIT: usize = 1024 * 1024;
+
+pub struct MemoryBudget {
+    pub semaphore: PosixSemaphore,
+    capacity: usize,
+    next: tokio::sync::watch::Sender<u64>,
+    cancelled: AtomicBool,
+}
+
+pub struct MemoryLease {
+    memory: Arc<MemoryBudget>,
+    pub units: usize,
+}
+
+impl MemoryBudget {
+    fn new(bytes: usize) -> Result<Self> {
+        let capacity = bytes.div_ceil(MEMORY_UNIT).max(1);
+        Ok(Self {
+            semaphore: PosixSemaphore::create(capacity)?,
+            capacity,
+            next: tokio::sync::watch::channel(0).0,
+            cancelled: AtomicBool::new(false),
+        })
+    }
+
+    pub async fn acquire(self: &Arc<Self>, sequence: u64, bytes: usize) -> Result<MemoryLease> {
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "memory budget cancelled"
+        );
+        let mut next = self.next.subscribe();
+        while *next.borrow_and_update() != sequence {
+            anyhow::ensure!(
+                !self.cancelled.load(Ordering::Acquire),
+                "memory budget cancelled"
+            );
+            next.changed().await?;
+        }
+        let units = bytes.div_ceil(MEMORY_UNIT).min(self.capacity);
+        let memory = self.clone();
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..units {
+                memory.semaphore.wait()?;
+                anyhow::ensure!(
+                    !memory.cancelled.load(Ordering::Acquire),
+                    "memory budget cancelled"
+                );
+            }
+            anyhow::Ok(())
+        })
+        .await??;
+        anyhow::ensure!(
+            !self.cancelled.load(Ordering::Acquire),
+            "memory budget cancelled"
+        );
+        self.next.send_replace(sequence + 1);
+        Ok(MemoryLease {
+            memory: self.clone(),
+            units,
+        })
+    }
+
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.next.send_replace(u64::MAX);
+            for _ in 0..self.capacity {
+                let _ = self.semaphore.post();
+            }
+        }
+    }
+}
+
+impl MemoryLease {
+    pub fn transfer(mut self) {
+        self.units = 0;
+    }
+}
+
+impl Drop for MemoryLease {
+    fn drop(&mut self) {
+        for _ in 0..self.units {
+            let _ = self.memory.semaphore.post();
         }
     }
 }
@@ -123,7 +215,7 @@ mod tests {
 
     #[test]
     fn independently_opened_handle_releases_waiter() -> Result<()> {
-        let budget = Arc::new(BatchBudget::new(1)?);
+        let budget = Arc::new(BatchBudget::new(1, 1024 * 1024)?);
         assert!(budget.acquire()?);
         let rank = PosixSemaphore::open(budget.semaphore.name()?)?;
         let (done, received) = mpsc::channel();
@@ -138,7 +230,7 @@ mod tests {
 
     #[test]
     fn cancellation_wakes_waiter_and_unlinks_on_drop() -> Result<()> {
-        let budget = Arc::new(BatchBudget::new(1)?);
+        let budget = Arc::new(BatchBudget::new(1, 1024 * 1024)?);
         let name = budget.semaphore.name()?.to_owned();
         assert!(budget.acquire()?);
         let (done, received) = mpsc::channel();

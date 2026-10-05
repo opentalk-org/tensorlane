@@ -7,7 +7,7 @@ use crate::{
 use anyhow::anyhow;
 use pyo3::{
     prelude::*,
-    types::{PyBytes, PyDict},
+    types::{PyBytes, PyDict, PyList},
 };
 use std::{collections::HashMap, path::PathBuf, sync::Mutex};
 
@@ -170,27 +170,34 @@ impl Listener {
         };
         let object = PyDict::new(py);
         match message {
-            Work::Sample {
+            Work::Batch {
                 stream,
                 batch,
                 query_batch_idx,
                 timings,
-                index,
-                sample,
+                samples,
+                memory_units,
             } => {
-                object.set_item("kind", "sample")?;
+                object.set_item("kind", "batch")?;
                 object.set_item("stream", stream)?;
                 object.set_item("batch", batch)?;
                 object.set_item("query_batch_idx", query_batch_idx)?;
                 object.set_item("timings", timings)?;
-                object.set_item("index", index)?;
-                object.set_item("sample_id", sample.sample_id)?;
-                object.set_item("metadata_json", sample.metadata_json)?;
-                let values = PyDict::new(py);
-                for (name, value) in sample.blobs {
-                    values.set_item(name, PyBytes::new(py, &value))?;
+                object.set_item("memory_units", memory_units)?;
+                let items = PyList::empty(py);
+                for (index, sample) in samples {
+                    let item = PyDict::new(py);
+                    item.set_item("index", index)?;
+                    item.set_item("sample_id", sample.sample_id)?;
+                    item.set_item("metadata_json", sample.metadata_json)?;
+                    let values = PyDict::new(py);
+                    for (name, value) in sample.blobs {
+                        values.set_item(name, PyBytes::new(py, &value))?;
+                    }
+                    item.set_item("blobs", values)?;
+                    items.append(item)?;
                 }
-                object.set_item("blobs", values)?;
+                object.set_item("samples", items)?;
             }
             Work::End { stream } => {
                 object.set_item("kind", "end")?;
@@ -215,7 +222,13 @@ impl Semaphore {
         })
     }
 
-    fn post(&self, py: Python<'_>) -> anyhow::Result<()> {
-        py.allow_threads(|| self.inner.post())
+    #[pyo3(signature=(count=1))]
+    fn post(&self, py: Python<'_>, count: usize) -> anyhow::Result<()> {
+        py.allow_threads(|| {
+            for _ in 0..count {
+                self.inner.post()?;
+            }
+            Ok(())
+        })
     }
 }

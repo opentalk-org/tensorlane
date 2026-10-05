@@ -111,7 +111,35 @@ pub struct Sample {
     #[prost(string, tag = "7")]
     pub metadata_json: String,
     #[prost(map = "string, bytes", tag = "8")]
+    #[serde(with = "blob_bytes")]
     pub blobs: HashMap<String, Vec<u8>>,
+}
+
+mod blob_bytes {
+    use super::*;
+    use serde::ser::SerializeMap;
+
+    pub fn serialize<S: serde::Serializer>(
+        blobs: &HashMap<String, Vec<u8>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(blobs.len()))?;
+        for (name, bytes) in blobs {
+            map.serialize_entry(name, serde_bytes::Bytes::new(bytes))?;
+        }
+        map.end()
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<String, Vec<u8>>, D::Error> {
+        HashMap::<String, serde_bytes::ByteBuf>::deserialize(deserializer).map(|blobs| {
+            blobs
+                .into_iter()
+                .map(|(name, bytes)| (name, bytes.into_vec()))
+                .collect()
+        })
+    }
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

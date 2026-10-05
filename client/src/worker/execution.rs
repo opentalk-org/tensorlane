@@ -66,10 +66,12 @@ pub(super) async fn supervise(
                         .ranks
                         .checked_mul(settings.factor)
                         .context("prefetch capacity overflow")?,
+                    (settings.memory_bytes / initialized.streams.len()).max(1),
                 )?);
                 let directory = options.root.join("streams").join(index.to_string());
                 std::fs::create_dir_all(&directory)?;
                 std::fs::write(directory.join("semaphore"), budget.semaphore.name()?)?;
+                std::fs::write(directory.join("memory"), budget.memory.semaphore.name()?)?;
                 budgets.insert(name.clone(), budget);
             }
         }
@@ -126,21 +128,52 @@ pub(super) async fn supervise(
         let mut senders = work;
         let mut next_worker = 0;
         while let Some(message) = receive_work.recv().await {
-            match &message {
-                Work::End { .. } => {
+            match message {
+                Work::End { ref stream } => {
                     for sender in &mut senders {
                         sender
-                            .send(&message)
+                            .send(&Work::End {
+                                stream: stream.clone(),
+                            })
                             .await
                             .context("transform worker disconnected")?;
                     }
                 }
-                Work::Sample { .. } => {
-                    senders[next_worker]
-                        .send(&message)
-                        .await
-                        .context("transform worker disconnected")?;
-                    next_worker = (next_worker + 1) % senders.len();
+                Work::Batch {
+                    stream,
+                    batch,
+                    query_batch_idx,
+                    timings,
+                    samples,
+                    memory_units,
+                } => {
+                    let mut parts = vec![Vec::new(); senders.len()];
+                    for sample in samples {
+                        parts[next_worker].push(sample);
+                        next_worker = (next_worker + 1) % senders.len();
+                    }
+                    futures_util::future::try_join_all(senders.iter_mut().zip(parts).map(
+                        |(sender, samples)| {
+                            let stream = stream.clone();
+                            async move {
+                                if !samples.is_empty() {
+                                    sender
+                                        .send(&Work::Batch {
+                                            stream,
+                                            batch,
+                                            query_batch_idx,
+                                            timings,
+                                            samples,
+                                            memory_units,
+                                        })
+                                        .await
+                                        .context("transform worker disconnected")?;
+                                }
+                                anyhow::Ok(())
+                            }
+                        },
+                    ))
+                    .await?;
                 }
             }
         }

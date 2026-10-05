@@ -39,6 +39,7 @@ pub struct Settings {
     pub ranks: usize,
     pub factor: usize,
     pub num_workers: usize,
+    pub memory_bytes: usize,
 }
 impl Settings {
     fn resolve(options: &Options, config: &str) -> anyhow::Result<Self> {
@@ -71,6 +72,7 @@ impl Settings {
             ranks: count("ranks", options.ranks, 1)?,
             factor: count("prefetch_factor", options.factor, 2)?,
             num_workers: count("num_workers", options.num_workers, 5)?,
+            memory_bytes: count("max_prefetch_memory_bytes", None, 128 * 1024 * 1024)?,
         };
         ensure!(options.rank < settings.ranks, "invalid rank");
         Ok(settings)

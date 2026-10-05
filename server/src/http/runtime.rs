@@ -194,9 +194,7 @@ async fn batch(
         .await
         .map_err(runtime_error)?
     {
-        crate::runtime::Batch::Pending => {
-            Ok((StatusCode::ACCEPTED, [("retry-after", "1")]).into_response())
-        }
+        crate::runtime::Batch::Pending => Ok(StatusCode::ACCEPTED.into_response()),
         crate::runtime::Batch::End => Ok(StatusCode::NO_CONTENT.into_response()),
         crate::runtime::Batch::Ready(path) => {
             use futures::StreamExt;
@@ -207,10 +205,9 @@ async fn batch(
             .encode_to_vec();
             let file = tokio::fs::File::open(path).await?;
             let length = file.metadata().await?.len() + tail.len() as u64;
-            let stream =
-                tokio_util::io::ReaderStream::new(file).chain(futures::stream::once(async move {
-                    Ok(bytes::Bytes::from(tail))
-                }));
+            let stream = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024).chain(
+                futures::stream::once(async move { Ok(bytes::Bytes::from(tail)) }),
+            );
             Ok(Response::builder()
                 .header("content-type", "application/x-protobuf")
                 .header("content-length", length)

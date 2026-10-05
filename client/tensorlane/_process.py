@@ -8,7 +8,7 @@ import threading
 import traceback
 import time
 
-import torch.multiprocessing as multiprocessing
+import multiprocessing
 
 from . import _native
 from .data import Batch, RawSample
@@ -24,12 +24,8 @@ def _connect(path: Path, key: bytes, stopped):
 
 
 def share(value):
-    import torch
-
-    if isinstance(value, torch.Tensor):
-        if value.device.type != "cpu":
-            raise TypeError("workers must return CPU tensors")
-        return value.detach().share_memory_()
+    if value is None or isinstance(value, (str, bytes, bool, int, float)):
+        return value
     if isinstance(value, dict):
         return {key: share(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -40,8 +36,12 @@ def share(value):
         return RawSample(
             value.sample_id, value.stream, share(value.metadata), share(value.blobs)
         )
-    if value is None or isinstance(value, (str, bytes, bool, int, float)):
-        return value
+    import torch
+
+    if isinstance(value, torch.Tensor):
+        if value.device.type != "cpu":
+            raise TypeError("workers must return CPU tensors")
+        return value.detach().share_memory_()
     raise TypeError(f"unsupported worker output: {type(value).__name__}")
 
 
@@ -51,6 +51,7 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
     try:
         import torch
 
+        torch.set_num_threads(1)
         output.cancel_join_thread()
         errors = queue.SimpleQueue()
         output._on_queue_feeder_error = lambda error, _message: errors.put(error)
@@ -72,36 +73,41 @@ def transform_worker(root: Path, transform, streams, output, stopped) -> None:
                 stream = message["stream"]
                 if stream not in streams or stream in ended:
                     raise RuntimeError("unexpected or already ended stream")
-                if message["kind"] == "sample":
-                    try:
-                        started = time.monotonic()
-                        metadata = json.loads(message["metadata_json"])
-                        if not isinstance(metadata, dict):
-                            raise TypeError("sample metadata must be an object")
-                        sample = RawSample(
-                            message["sample_id"], stream, metadata, message["blobs"]
-                        )
-                        transform_fn = transform.get(stream)
-                        transformed = share(
-                            transform_fn(sample) if transform_fn else sample
-                        )
-                        output.put(
-                            (
-                                "sample",
-                                stream,
-                                (
-                                    message["batch"],
-                                    message["query_batch_idx"],
-                                    message["index"],
-                                    transformed,
-                                    (*message["timings"], time.monotonic() - started),
-                                ),
+                if message["kind"] == "batch":
+                    parts = []
+                    for item in message["samples"]:
+                        try:
+                            started = time.monotonic()
+                            metadata = json.loads(item["metadata_json"])
+                            if not isinstance(metadata, dict):
+                                raise TypeError("sample metadata must be an object")
+                            sample = RawSample(
+                                item["sample_id"], stream, metadata, item["blobs"]
                             )
+                            transform_fn = transform.get(stream)
+                            transformed = share(
+                                transform_fn(sample) if transform_fn else sample
+                            )
+                            parts.append(
+                                (item["index"], transformed, time.monotonic() - started)
+                            )
+                        except Exception as error:
+                            raise RuntimeError(
+                                f"stream {stream} batch {message['batch']} sample {item['index']}: {error}"
+                            ) from error
+                    output.put(
+                        (
+                            "samples",
+                            stream,
+                            (
+                                message["batch"],
+                                message["query_batch_idx"],
+                                parts,
+                                message["timings"],
+                                message["memory_units"],
+                            ),
                         )
-                    except Exception as error:
-                        raise RuntimeError(
-                            f"stream {stream} batch {message['batch']} sample {message['index']}: {error}"
-                        ) from error
+                    )
                 elif message["kind"] == "end":
                     output.put(("end", stream, None))
                     ended.add(stream)
@@ -184,22 +190,31 @@ def collate_worker(
                 for output in outputs[stream]:
                     output.put(("end", None))
             continue
-        if kind != "sample" or ended[stream] == num_workers:
+        if kind != "samples" or ended[stream] == num_workers:
             raise RuntimeError(f"unexpected transformation message: {kind}")
-        (batch_id, batch_size), query_idx, index, sample, timings = value
+        (batch_id, batch_size), query_idx, incoming_parts, timings, memory_units = value
         if batch_id < next_batch[stream] or batch_id in completed[stream]:
             raise RuntimeError("message for an already completed batch")
-        if batch_size <= 0 or index < 0 or index >= batch_size:
+        if batch_size <= 0 or not incoming_parts:
             raise RuntimeError("invalid sample position")
-        size, expected_query_idx, parts = pending[stream].setdefault(
-            batch_id, (batch_size, query_idx, {})
+        size, expected_query_idx, expected_units, parts = pending[stream].setdefault(
+            batch_id, (batch_size, query_idx, memory_units, {})
         )
-        if size != batch_size or expected_query_idx != query_idx or index in parts:
+        if (
+            size != batch_size
+            or expected_query_idx != query_idx
+            or expected_units != memory_units
+        ):
             raise RuntimeError("inconsistent batch or duplicate sample position")
-        parts[index] = (sample, timings)
+        for index, sample, seconds in incoming_parts:
+            if index < 0 or index >= batch_size:
+                raise RuntimeError("invalid sample position")
+            if index in parts:
+                raise RuntimeError("inconsistent batch or duplicate sample position")
+            parts[index] = (sample, seconds)
         if len(parts) == size:
             samples = tuple(parts[index][0] for index in range(size))
-            timings = (*timings[:3], sum(part[1][3] for part in parts.values()))
+            timings = (*timings, sum(part[1] for part in parts.values()))
             started = time.monotonic()
             collator = collate_fn.get(stream)
             data = share(collator(samples)) if collator else samples
@@ -210,6 +225,7 @@ def collate_worker(
                 samples,
                 data,
                 (*timings, time.monotonic() - started),
+                memory_units,
             )
             del pending[stream][batch_id]
         while next_batch[stream] in completed[stream]:

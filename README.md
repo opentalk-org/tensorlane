@@ -26,7 +26,7 @@ Omit both range fields to fetch the whole object. The Python sample will contain
 
 Run configuration has three separate sections:
 
-- `tensorlane`: runtime settings (`ranks`, `num_workers`, `prefetch_factor`) and asset settings (`assets`, `asset_type`).
+- `tensorlane`: runtime settings (`ranks`, `num_workers`, `prefetch_factor`, `max_prefetch_memory_bytes`) and asset settings (`assets`, `asset_type`).
 - `queries`: an object mapping stream names to `sql`, `params`, and an optional `repeat` flag.
 - `app`: custom application configuration. TensorLane stores it without interpreting its contents.
 
@@ -134,6 +134,8 @@ Save checkpoints with `lane.save_asset("model", path, kind="checkpoint")`, then 
 Use `lane.metric(step, name, value)` to record scalars and `lane.metric_artifact(...)` for files. Throughput and timing metrics are enabled by default. The full run configuration is available as `lane.config`; application settings are in `lane.config["app"]`. Runtime defaults are one rank, five workers, and two prefetched batches per rank and stream. Explicit `init` arguments override `config.tensorlane` settings. Always select a stream by name with `lane.batches("training")`.
 
 Set `config.tensorlane.max_load_memory_bytes` to control server batch-loading memory for each run (default: 268435456, or 256 MiB). The budget is divided evenly among configured streams, each with an independent loading pool; other runs also have independent pools. For two streams, the default provides 128 MiB each. Before reading blob payloads, the server reserves an estimated working set covering payloads, protobuf encoding, descriptors, and stream buffers. Reservations remain held until the encoded batch is cached. Whole-object sizes are inspected with S3 HEAD; byte ranges use their declared lengths. Busy pools return pending responses. A batch whose estimated working set exceeds its stream's share may run alone once that stream has no other active loads; it holds the entire stream pool through cache publication without blocking other streams. The memory setting is therefore a concurrency target, with a single-batch exception per stream to avoid stalled oversized batches. Reservations round up to 1 KiB. The 64 MiB encoded-batch wire limit still applies. Query plans are prepared independently per stream. This replaces fixed sample, blob, S3-read, and batch-preparation concurrency caps. The budget applies per run per server process and excludes query preparation, input asset downloads, uploads, SDK internals, and allocator overhead; it is not a process RSS limit. Client transform and collation worker pools remain shared.
+
+Client prefetch also has a byte budget: `config.tensorlane.max_prefetch_memory_bytes` defaults to 134217728 (128 MiB), divided among streams and shared by all ranks using the daemon. A batch reserves its wire size before its body is read and holds the reservation through transformation and collation until a rank receives it. Reservations follow batch order, and a batch larger than its stream budget runs alone. This bounds queued input payloads; worker runtimes, transformed outputs, and batches retained by training code add memory beyond that budget. Tensors keep their existing shared-memory transport.
 
 ## Development
 

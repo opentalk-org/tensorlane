@@ -6,7 +6,7 @@ import time
 import threading
 from pathlib import Path
 from collections.abc import Mapping
-import torch.multiprocessing as multiprocessing
+import multiprocessing
 from . import _native
 from .client import TensorLane, _root, _check_alive
 
@@ -132,7 +132,8 @@ def init(
     num_workers = daemon.num_workers
     from ._process import collate_worker, transform_worker
 
-    context = multiprocessing.get_context("spawn")
+    context = multiprocessing.get_context("forkserver")
+    context.set_forkserver_preload(["torch.multiprocessing"])
     try:
         transform = _stream_callbacks(transform, daemon.streams)
         collate_fn = _stream_callbacks(collate_fn, daemon.streams)

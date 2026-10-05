@@ -1,3 +1,4 @@
+use crate::semaphore::{MemoryBudget, MemoryLease};
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::StreamExt;
 use reqwest::{
@@ -5,7 +6,7 @@ use reqwest::{
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tensorlane_protocol::{EndRequest, InitResponse, SESSION_HEADER};
 use tokio::time::Instant;
 
@@ -88,8 +89,47 @@ impl HttpClient {
         headers: &[(&str, String)],
         limit: usize,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
+        let (status, headers, bytes, _) = self
+            .request_inner(method, parts, body, headers, limit, None)
+            .await?;
+        Ok((status, headers, bytes))
+    }
+
+    pub async fn batch(
+        &self,
+        parts: &[&str],
+        memory: Arc<MemoryBudget>,
+        sequence: u64,
+    ) -> Result<(StatusCode, Vec<u8>, MemoryLease)> {
+        let (status, _, bytes, lease) = self
+            .request_inner(
+                Method::GET,
+                parts,
+                None,
+                &[],
+                crate::MAX_BATCH_BYTES,
+                Some((memory, sequence)),
+            )
+            .await?;
+        Ok((
+            status,
+            bytes,
+            lease.context("batch response has no memory reservation")?,
+        ))
+    }
+
+    async fn request_inner(
+        &self,
+        method: Method,
+        parts: &[&str],
+        body: Option<Vec<u8>>,
+        headers: &[(&str, String)],
+        limit: usize,
+        memory: Option<(Arc<MemoryBudget>, u64)>,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>, Option<MemoryLease>)> {
+        let mut lease = None;
         let url = self.url(parts)?;
-        let started = Instant::now();
+        let mut started = Instant::now();
         let mut attempt = 0;
         loop {
             let remaining = if self.retry_timeout.is_zero() {
@@ -102,8 +142,10 @@ impl HttpClient {
             let mut request = self
                 .client
                 .request(method.clone(), url.clone())
-                .header(SESSION_HEADER, &self.session)
-                .timeout(remaining.min(Duration::from_secs(120)));
+                .header(SESSION_HEADER, &self.session);
+            if memory.is_none() {
+                request = request.timeout(remaining.min(Duration::from_secs(120)));
+            }
             if let Some(bytes) = &body {
                 request = request.body(bytes.clone());
             }
@@ -114,27 +156,49 @@ impl HttpClient {
                 let response = request.send().await?;
                 let status = response.status();
                 let headers = response.headers().clone();
-                let mut stream = response.bytes_stream();
-                let mut bytes = Vec::new();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
+                let capacity = response.content_length().unwrap_or(0).min(limit as u64) as usize;
+                if status.is_success()
+                    && status != StatusCode::ACCEPTED
+                    && lease.is_none()
+                    && let Some((memory, sequence)) = &memory
+                {
+                    let bytes = if status == StatusCode::NO_CONTENT {
+                        0
+                    } else {
+                        response.content_length().unwrap_or(limit as u64)
+                    };
                     ensure!(
-                        bytes
-                            .len()
-                            .checked_add(chunk.len())
-                            .is_some_and(|size| size <= limit),
+                        bytes <= limit as u64,
                         "HTTP response exceeds its size limit"
                     );
-                    bytes.extend_from_slice(&chunk);
+                    let waiting = Instant::now();
+                    lease = Some(memory.acquire(*sequence, bytes as usize).await?);
+                    started += waiting.elapsed();
                 }
-                Ok((status, headers, bytes))
+                let receive = async {
+                    let mut stream = response.bytes_stream();
+                    let mut bytes = Vec::with_capacity(capacity);
+                    while let Some(chunk) = stream.next().await {
+                        let chunk = chunk?;
+                        ensure!(
+                            bytes
+                                .len()
+                                .checked_add(chunk.len())
+                                .is_some_and(|size| size <= limit),
+                            "HTTP response exceeds its size limit"
+                        );
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok((status, headers, bytes))
+                };
+                tokio::time::timeout(remaining.min(Duration::from_secs(120)), receive).await?
             }
             .await;
             let (error, retry_after) = match result {
                 Ok((status, headers, bytes))
                     if status != StatusCode::ACCEPTED && status.is_success() =>
                 {
-                    return Ok((status, headers, bytes));
+                    return Ok((status, headers, bytes, lease));
                 }
                 Ok((status, headers, bytes)) => {
                     let message = serde_json::from_slice::<serde_json::Value>(&bytes)
@@ -152,7 +216,10 @@ impl HttpClient {
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u64>().ok())
-                        .map(|v| Duration::from_secs(v.min(30)));
+                        .map(|v| Duration::from_secs(v.min(30)))
+                        .or_else(|| {
+                            (status == StatusCode::ACCEPTED).then_some(Duration::from_millis(25))
+                        });
                     (format!("TensorLane HTTP {status}: {message}"), delay)
                 }
                 Err(error) => (format!("{error:#}"), None),
@@ -163,7 +230,7 @@ impl HttpClient {
             );
             let delay = retry_after
                 .unwrap_or_else(|| Duration::from_millis((100u64 << attempt.min(7)).min(10_000)));
-            let jitter = Duration::from_millis((uuid::Uuid::new_v4().as_u128() % 100) as u64);
+            let jitter = Duration::from_millis((uuid::Uuid::new_v4().as_u128() % 20) as u64);
             let wait = delay + jitter;
             let wait = if self.retry_timeout.is_zero() {
                 wait
