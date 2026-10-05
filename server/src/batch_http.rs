@@ -7,10 +7,14 @@ use crate::{
     shared_cache::{Lock, write_atomic},
 };
 use anyhow::{Context, Result, ensure};
-use futures::{StreamExt, TryStreamExt};
+use futures::future::try_join_all;
 use prost::Message;
+use std::sync::Arc;
 use tensorlane_protocol::DataResponse;
-use tokio::fs;
+use tokio::{
+    fs,
+    sync::{OwnedSemaphorePermit, Semaphore},
+};
 use uuid::Uuid;
 
 impl Runtime {
@@ -75,16 +79,16 @@ impl Runtime {
         let Some(lock) = Lock::try_acquire(&cached.with_extension("lock")).await? else {
             return Ok(Batch::Pending);
         };
-        let Ok(slot) = self.batches.clone().try_acquire_owned() else {
-            return Ok(Batch::Pending);
-        };
+        let memory = self.loading_memory(id, config.max_load_memory_bytes)?;
         let engine = self.clone();
         let result_path = cached.clone();
         let name = name.to_owned();
         self.tasks.spawn(async move {
-            let (_lock, _slot) = (lock, slot);
+            let _lock = lock;
             let result = async {
-                let response = load_batch(engine.loader.as_ref(), name.clone(), plan).await?;
+                let Some((response, _memory)) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, config.max_load_memory_bytes).await? else {
+                    return Ok(());
+                };
                 write_atomic(&cached, &response.encode_to_vec()).await?;
                 anyhow::Ok(())
             }.await;
@@ -101,18 +105,70 @@ impl Runtime {
     }
 }
 
-async fn load_batch(loader: &dyn Loader, stream: String, plan: BatchPlan) -> Result<DataResponse> {
+async fn load_batch(
+    loader: &dyn Loader,
+    stream: String,
+    plan: BatchPlan,
+    memory: Arc<Semaphore>,
+    limit: usize,
+) -> Result<Option<(DataResponse, OwnedSemaphorePermit)>> {
     let started = std::time::Instant::now();
     let mut response = DataResponse {
         stream,
         query_batch_idx: plan.query_batch_idx,
         ..Default::default()
     };
+    let prepared = try_join_all(plan.samples.into_iter().map(|sample| async move {
+        let sizes = try_join_all(sample.blobs.values().map(|blob| loader.size(blob))).await?;
+        anyhow::Ok((sample, sizes))
+    }))
+    .await?;
+    let mut payload_bytes = 0usize;
+    let mut encoded_bound = response.encoded_len() + 64;
+    let mut overhead = 0usize;
+    for (sample, sizes) in &prepared {
+        encoded_bound += sample.sample_id.len() + sample.metadata_json.len() + 32;
+        overhead += 256;
+        for ((name, blob), size) in sample.blobs.iter().zip(sizes) {
+            payload_bytes += size;
+            encoded_bound += name.len() + size + 32;
+            // Descriptor/future storage and an allowance for each active S3 stream.
+            overhead += blob.object.len() + name.len() + 64 * 1024;
+        }
+    }
+    ensure!(
+        payload_bytes <= MAX_BATCH_BYTES,
+        "encoded batch exceeds 64 MiB"
+    );
+    let required = encoded_bound
+        .checked_mul(2)
+        .and_then(|size| size.checked_add(overhead))
+        .context("batch loading memory size overflow")?;
+    ensure!(
+        required <= limit,
+        "batch loading memory exceeds config.tensorlane.max_load_memory_bytes ({required} > {limit})"
+    );
+    let Ok(permit) = memory.try_acquire_many_owned(u32::try_from(required)?) else {
+        return Ok(None);
+    };
     let mut encoded_bytes = response.encoded_len();
-    let mut samples = futures::stream::iter(plan.samples)
-        .map(|sample| loader.load_sample(sample))
-        .buffered(4);
-    while let Some(sample) = samples.try_next().await? {
+    let samples = try_join_all(prepared.into_iter().map(|(sample, sizes)| async move {
+        let blobs = try_join_all(sample.blobs.into_iter().zip(sizes).map(
+            |((name, blob), size)| async move {
+                let bytes = loader.load(&blob, size).await?;
+                ensure!(bytes.len() == size, "blob returned an unexpected size");
+                anyhow::Ok((name, bytes))
+            },
+        ))
+        .await?;
+        anyhow::Ok(tensorlane_protocol::Sample {
+            sample_id: sample.sample_id,
+            metadata_json: sample.metadata_json,
+            blobs: blobs.into_iter().collect(),
+        })
+    }))
+    .await?;
+    for sample in samples {
         encoded_bytes += prost::encoding::message::encoded_len(1, &sample);
         ensure!(
             encoded_bytes <= MAX_BATCH_BYTES - 64,
@@ -121,7 +177,7 @@ async fn load_batch(loader: &dyn Loader, stream: String, plan: BatchPlan) -> Res
         response.batch.push(sample);
     }
     response.load_seconds = started.elapsed().as_secs_f64();
-    Ok(response)
+    Ok(Some((response, permit)))
 }
 
 #[cfg(test)]
@@ -129,7 +185,6 @@ mod tests {
     use super::*;
     use crate::sampling::{BlobRef, Sample};
     use async_trait::async_trait;
-    use bytes::Bytes;
     use std::{
         collections::BTreeMap,
         sync::{
@@ -148,7 +203,10 @@ mod tests {
 
     #[async_trait]
     impl Loader for DelayedLoader {
-        async fn load(&self, reference: &BlobRef) -> Result<Bytes> {
+        async fn size(&self, _: &BlobRef) -> Result<usize> {
+            Ok(1)
+        }
+        async fn load(&self, reference: &BlobRef, _: usize) -> Result<Vec<u8>> {
             let index: u8 = reference.object.parse()?;
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(active, Ordering::SeqCst);
@@ -156,7 +214,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis((8 - index as u64) * 5)).await;
             self.completed.lock().unwrap().push(index);
             self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(Bytes::from(vec![index]))
+            Ok(vec![index])
         }
     }
 
@@ -191,34 +249,89 @@ mod tests {
         for _ in 0..2 {
             let batch = tokio::time::timeout(
                 Duration::from_secs(2),
-                load_batch(&loader, "training".into(), plan(8)),
+                load_batch(
+                    &loader,
+                    "training".into(),
+                    plan(8),
+                    Arc::new(Semaphore::new(256 * 1024 * 1024)),
+                    256 * 1024 * 1024,
+                ),
             )
-            .await??;
+            .await??
+            .unwrap();
+            let (batch, _permit) = batch;
             assert_eq!(batch.query_batch_idx, 42);
             for (index, sample) in batch.batch.iter().enumerate() {
                 assert_eq!(sample.sample_id, index.to_string());
                 assert_eq!(sample.blobs["payload"], vec![index as u8]);
             }
         }
-        assert_eq!(loader.peak.load(Ordering::SeqCst), 4);
+        assert_eq!(loader.peak.load(Ordering::SeqCst), 8);
         assert_ne!(loader.completed.lock().unwrap()[0], 0);
         Ok(())
     }
 
     struct LargeLoader;
 
+    #[tokio::test]
+    async fn loading_waits_for_memory_without_fetching_and_releases_it_after_use() -> Result<()> {
+        let limit = 256 * 1024 * 1024;
+        let memory = Arc::new(Semaphore::new(limit));
+        let occupied = memory.clone().acquire_many_owned(limit as u32).await?;
+        let loader = DelayedLoader {
+            barrier: tokio::sync::Barrier::new(1),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            completed: Mutex::new(Vec::new()),
+        };
+        assert!(
+            load_batch(&loader, "training".into(), plan(1), memory.clone(), limit)
+                .await?
+                .is_none()
+        );
+        assert_eq!(loader.peak.load(Ordering::SeqCst), 0);
+        drop(occupied);
+        let (response, permit) =
+            load_batch(&loader, "training".into(), plan(1), memory.clone(), limit)
+                .await?
+                .unwrap();
+        assert!(memory.available_permits() < limit);
+        let _encoded = response.encode_to_vec();
+        assert!(memory.available_permits() < limit);
+        drop(permit);
+        assert_eq!(memory.available_permits(), limit);
+        assert!(
+            load_batch(&loader, "training".into(), plan(1), memory.clone(), 1)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("batch loading memory exceeds")
+        );
+        assert_eq!(memory.available_permits(), limit);
+        Ok(())
+    }
+
     #[async_trait]
     impl Loader for LargeLoader {
-        async fn load(&self, _: &BlobRef) -> Result<Bytes> {
-            Ok(Bytes::from(vec![0; MAX_BATCH_BYTES / 2]))
+        async fn size(&self, _: &BlobRef) -> Result<usize> {
+            Ok(MAX_BATCH_BYTES / 2)
+        }
+        async fn load(&self, _: &BlobRef, size: usize) -> Result<Vec<u8>> {
+            Ok(vec![0; size])
         }
     }
 
     #[tokio::test]
     async fn concurrent_sample_reads_enforce_encoded_batch_limit() {
-        let error = load_batch(&LargeLoader, "training".into(), plan(2))
-            .await
-            .unwrap_err();
+        let error = load_batch(
+            &LargeLoader,
+            "training".into(),
+            plan(2),
+            Arc::new(Semaphore::new(256 * 1024 * 1024)),
+            256 * 1024 * 1024,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("encoded batch exceeds 64 MiB"));
     }
 }
