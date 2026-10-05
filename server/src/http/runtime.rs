@@ -197,17 +197,22 @@ async fn batch(
         crate::runtime::Batch::Pending => Ok(StatusCode::ACCEPTED.into_response()),
         crate::runtime::Batch::End => Ok(StatusCode::NO_CONTENT.into_response()),
         crate::runtime::Batch::Ready(path) => {
-            use futures::StreamExt;
             let tail = tensorlane_protocol::DataResponse {
                 batch_id: sequence,
                 ..Default::default()
             }
             .encode_to_vec();
-            let file = tokio::fs::File::open(path).await?;
-            let length = file.metadata().await?.len() + tail.len() as u64;
-            let stream = tokio_util::io::ReaderStream::with_capacity(file, 256 * 1024).chain(
-                futures::stream::once(async move { Ok(bytes::Bytes::from(tail)) }),
-            );
+            let data = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(path)?;
+                let data = unsafe { memmap2::Mmap::map(&file)? };
+                Ok::<_, std::io::Error>(bytes::Bytes::from_owner(data))
+            })
+            .await??;
+            let length = data.len() + tail.len();
+            let stream = futures::stream::iter([
+                Ok::<_, std::io::Error>(data),
+                Ok(bytes::Bytes::from(tail)),
+            ]);
             Ok(Response::builder()
                 .header("content-type", "application/x-protobuf")
                 .header("content-length", length)

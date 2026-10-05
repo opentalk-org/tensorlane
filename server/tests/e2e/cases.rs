@@ -1,9 +1,10 @@
 use super::setup::{TestEnv, config};
 use anyhow::{Result, ensure};
 use bytes::Bytes;
+use prost::Message;
 use reqwest::{Method, StatusCode};
 use serde_json::json;
-use tensorlane_protocol::AssetDownload;
+use tensorlane_protocol::{AssetDownload, DataResponse};
 use uuid::Uuid;
 
 pub async fn check(env: &TestEnv) -> Result<()> {
@@ -47,6 +48,36 @@ pub async fn check(env: &TestEnv) -> Result<()> {
             .query_batch_idx,
         0
     );
+    let large_dataset = env.seed(1).await?;
+    let object = format!("datasets/{large_dataset}");
+    env.put_object(&object, Bytes::from(vec![31; 16 * 1024 * 1024]))
+        .await?;
+    let large_run = env.create_run(config(large_dataset, 1)).await?;
+    env.init(&large_run).await?;
+    let expected = env.batch(&large_run, "training", 0).await?.unwrap();
+    let response = env
+        .request(
+            Method::GET,
+            &format!("/runs/{large_run}/streams/training/batches/0"),
+        )
+        .send()
+        .await?
+        .error_for_status()?;
+    let length = response.content_length().unwrap();
+    tokio::fs::remove_file(
+        env.cache
+            .join("runs")
+            .join(&large_run)
+            .join("data/0/0.batch"),
+    )
+    .await?;
+    let replacement = Bytes::from(vec![47; 16 * 1024 * 1024]);
+    env.put_object(&object, replacement.clone()).await?;
+    let refreshed = env.batch(&large_run, "training", 0).await?.unwrap();
+    assert_eq!(refreshed.batch[0].blobs["payload"], replacement);
+    let original = response.bytes().await?;
+    assert_eq!(original.len() as u64, length);
+    assert_eq!(DataResponse::decode(original)?, expected);
     assert_eq!(
         env.http
             .post(format!("{}/runs/{id}/init", env.url))
