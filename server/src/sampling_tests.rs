@@ -33,7 +33,7 @@ async fn groups_sparse_batches_and_preserves_repeated_samples() {
         .await
         .unwrap();
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
-    let first = sampler.next_batch().await.unwrap().unwrap();
+    let first = sampler.batch_at(0).await.unwrap().unwrap();
     assert_eq!(
         first
             .samples
@@ -43,10 +43,10 @@ async fn groups_sparse_batches_and_preserves_repeated_samples() {
         vec!["a", "b"]
     );
     assert_eq!(
-        sampler.next_batch().await.unwrap().unwrap().query_batch_idx,
+        sampler.batch_at(1).await.unwrap().unwrap().query_batch_idx,
         4
     );
-    assert!(sampler.next_batch().await.unwrap().is_none());
+    assert!(sampler.batch_at(2).await.unwrap().is_none());
     drop(sampler);
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
@@ -76,7 +76,7 @@ async fn repeats_identical_plans_without_creating_files_and_empty_repetition_end
         .unwrap();
     let original = std::fs::read(dir.path().join("plan")).unwrap();
     for index in 0..1000 {
-        let batch = repeated.next_batch().await.unwrap().unwrap();
+        let batch = repeated.batch_at(index).await.unwrap().unwrap();
         assert_eq!(batch.query_batch_idx, if index % 2 == 0 { 7 } else { 9 });
         assert_eq!(
             batch.samples[0].sample_id,
@@ -86,7 +86,7 @@ async fn repeats_identical_plans_without_creating_files_and_empty_repetition_end
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     assert_eq!(std::fs::read(dir.path().join("plan")).unwrap(), original);
     let (_dir, mut empty) = sampler(vec![], true).await.unwrap();
-    assert!(empty.next_batch().await.unwrap().is_none());
+    assert!(empty.batch_at(0).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -150,7 +150,7 @@ async fn truncated_plan_fails_and_large_batches_are_rejected() {
         .unwrap();
     file.set_len(5).unwrap();
     assert!(
-        plan.next_batch()
+        plan.batch_at(0)
             .await
             .err()
             .unwrap()

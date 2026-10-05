@@ -73,7 +73,6 @@ impl Connection {
 enum Command {
     Send(Upload),
     Flush(oneshot::Sender<Reply>),
-    Close(oneshot::Sender<Reply>),
 }
 
 #[pyclass]
@@ -114,7 +113,7 @@ impl UploadClient {
                                 connection.sender.send(&message).await?;
                                 connection.dirty = true;
                             }
-                            Command::Flush(reply) | Command::Close(reply) => {
+                            Command::Flush(reply) => {
                                 let result = connection
                                     .flush()
                                     .await
@@ -263,7 +262,7 @@ impl UploadClient {
         if let Some(sender) = sender {
             py.allow_threads(|| {
                 sender
-                    .blocking_send(Command::Close(reply))
+                    .blocking_send(Command::Flush(reply))
                     .map_err(|_| self.error())
             })?;
             drop(sender);

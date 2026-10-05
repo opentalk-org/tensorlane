@@ -16,7 +16,7 @@ use uuid::Uuid;
 impl Runtime {
     pub async fn batch(&self, id: Uuid, session: Uuid, name: &str, sequence: u64) -> Result<Batch> {
         ensure!(!self.shutdown.is_cancelled(), "server is shutting down");
-        let (_, config) = self.active(id, session).await?;
+        let config = self.active(id, session).await?;
         let (index, (_, query)) = config
             .queries
             .iter()

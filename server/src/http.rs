@@ -13,7 +13,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
@@ -80,25 +79,13 @@ impl IntoResponse for AppError {
     }
 }
 
-#[derive(Serialize)]
-struct RunResponse {
-    run_id: Uuid,
-    project_id: Uuid,
-    name: String,
-    config: Map<String, Value>,
-    status: Option<RunStatus>,
-    #[serde(with = "time::serde::rfc3339::option")]
-    status_timestamp: Option<OffsetDateTime>,
-}
-
 pub async fn serve(
     port: u16,
-    run_repo: RunRepo,
     auth: crate::auth::Auth,
     shutdown: CancellationToken,
     runtime: crate::runtime::Runtime,
 ) -> anyhow::Result<()> {
-    let app = router(run_repo, auth.clone())
+    let app = router(runtime.repo.clone(), auth.clone())
         .merge(runtime::router(runtime, auth))
         .layer(tower::limit::ConcurrencyLimitLayer::new(64));
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
@@ -162,12 +149,12 @@ async fn create_run(
 async fn get_run(
     State(run_repo): State<RunRepo>,
     run_id: Result<Path<Uuid>, PathRejection>,
-) -> Result<Json<RunResponse>, AppError> {
+) -> Result<Json<Run>, AppError> {
     let Path(run_id) = run_id.map_err(|err| AppError::new(err.status(), err))?;
     let run = run_repo.get(run_id).await?;
 
     match run {
-        Some(run) => Ok(Json(run.into())),
+        Some(run) => Ok(Json(run)),
         None => Err(AppError::new(
             StatusCode::NOT_FOUND,
             anyhow::anyhow!("Run not found"),
@@ -175,22 +162,9 @@ async fn get_run(
     }
 }
 
-async fn list_runs(State(run_repo): State<RunRepo>) -> Result<Json<Vec<RunResponse>>, AppError> {
+async fn list_runs(State(run_repo): State<RunRepo>) -> Result<Json<Vec<Run>>, AppError> {
     let runs = run_repo.list().await?;
-    Ok(Json(runs.into_iter().map(Into::into).collect()))
-}
-
-impl From<Run> for RunResponse {
-    fn from(run: Run) -> Self {
-        Self {
-            run_id: run.id,
-            project_id: run.project_id,
-            name: run.name,
-            config: run.config,
-            status: run.status,
-            status_timestamp: run.status_timestamp,
-        }
-    }
+    Ok(Json(runs))
 }
 
 #[derive(Deserialize)]
@@ -201,10 +175,10 @@ async fn get_asset(
     State(repo): State<RunRepo>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<crate::asset_repo::AssetInfo>, AppError> {
-    let asset =
-        repo.assets().get(id).await?.ok_or_else(|| {
-            AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Asset not found"))
-        })?;
+    let asset = repo
+        .get_asset(id)
+        .await?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Asset not found")))?;
     Ok(Json(asset.info()?))
 }
 async fn run_assets(
@@ -219,8 +193,7 @@ async fn run_assets(
         ));
     }
     let assets = repo
-        .assets()
-        .for_run(id, filter.name.as_deref())
+        .run_assets(id, filter.name.as_deref())
         .await?
         .into_iter()
         .map(|asset| asset.info())

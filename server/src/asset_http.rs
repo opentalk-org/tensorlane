@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use axum::{
     body::Body,
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     response::Response,
 };
 use futures::TryStreamExt;
@@ -17,28 +17,14 @@ use crate::{
 };
 use tensorlane_protocol::TRANSFER_CHUNK_BYTES;
 
-pub async fn download(
-    engine: Runtime,
-    source: AssetSource,
-    headers: HeaderMap,
-) -> Result<Response> {
+pub async fn download(engine: Runtime, source: AssetSource, range: (u64, u64)) -> Result<Response> {
     let permit = engine
         .asset_slots
         .clone()
         .try_acquire_owned()
         .context("asset download capacity reached")?;
     let size = source.download.size;
-    if let Some(expected) = headers.get(header::IF_MATCH) {
-        ensure!(
-            expected.to_str()? == source.download.etag,
-            "input asset changed during download"
-        );
-    }
-    let range = headers
-        .get(header::RANGE)
-        .context("asset download requires a byte Range header")?
-        .to_str()?;
-    let (start, end) = parse_range(range, size)?;
+    let (start, end) = range;
     let identity = hex::encode(Sha256::digest(
         format!("{}\0{}", source.object, source.download.etag).as_bytes(),
     ));

@@ -24,7 +24,7 @@ async fn live_plan_memory() -> anyhow::Result<()> {
         let mut sampler = QuerySampler::create(&name, rows, &path, false).await?;
         let disk_bytes = std::fs::metadata(&path)?.len();
         let (mut count, mut batches) = (0, 0);
-        while let Some(batch) = sampler.next_batch().await? {
+        while let Some(batch) = sampler.batch_at(batches).await? {
             count += batch.samples.len();
             batches += 1;
         }
@@ -68,8 +68,10 @@ async fn disk_plan_memory() -> anyhow::Result<()> {
     }
     let mut samples = 0;
     for plan in &mut plans {
-        while let Some(batch) = plan.next_batch().await? {
+        let mut sequence = 0;
+        while let Some(batch) = plan.batch_at(sequence).await? {
             samples += batch.samples.len();
+            sequence += 1;
         }
     }
     println!(

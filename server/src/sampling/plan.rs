@@ -27,7 +27,6 @@ impl Drop for PlanFile {
 
 pub struct QuerySampler {
     reader: BufReader<File>,
-    pending: Option<SampleRow>,
     repeat: bool,
     batches: u64,
     _file: PlanFile,
@@ -103,7 +102,6 @@ impl QuerySampler {
         );
         Ok(Self {
             reader,
-            pending: None,
             repeat,
             batches,
             _file: file,
@@ -119,7 +117,6 @@ impl QuerySampler {
         ensure!(length % 8 == 0, "invalid query plan index");
         Ok(Self {
             reader: BufReader::with_capacity(IO_BUFFER_BYTES, File::open(path).await?),
-            pending: None,
             repeat,
             batches: length / 8,
             _file: PlanFile {
@@ -139,8 +136,7 @@ impl QuerySampler {
             .await?;
         let offset = index.read_u64_le().await?;
         self.reader.seek(std::io::SeekFrom::Start(offset)).await?;
-        self.pending = None;
-        self.next_batch().await
+        self.read_batch().await
     }
 
     async fn read_row(&mut self) -> Result<Option<SampleRow>> {
@@ -163,17 +159,8 @@ impl QuerySampler {
         ))
     }
 
-    pub(super) async fn next_batch(&mut self) -> Result<Option<BatchPlan>> {
-        let mut first = match self.pending.take() {
-            Some(row) => Some(row),
-            None => self.read_row().await?,
-        };
-        if first.is_none() && self.repeat && self.batches > 0 {
-            self.reader.rewind().await?;
-            first = self.read_row().await?;
-            ensure!(first.is_some(), "repeating plan is unexpectedly empty");
-        }
-        let Some(first) = first else {
+    async fn read_batch(&mut self) -> Result<Option<BatchPlan>> {
+        let Some(first) = self.read_row().await? else {
             return Ok(None);
         };
         let mut size = first.encoded_len() + 4;
@@ -183,7 +170,6 @@ impl QuerySampler {
         };
         while let Some(row) = self.read_row().await? {
             if row.batch_idx != batch.query_batch_idx {
-                self.pending = Some(row);
                 break;
             }
             size += row.encoded_len() + 4;

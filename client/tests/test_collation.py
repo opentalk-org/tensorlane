@@ -61,7 +61,7 @@ class CollationTests(unittest.TestCase):
         )
         outputs = self.run_collator(messages, {"training": sum})
         for batch_id, index, samples, data in [(0, 7, (1,), 1), (1, 40, (2, 3), 5)]:
-            kind, (_, batch) = outputs[0].get_nowait()
+            kind, batch = outputs[0].get_nowait()
             self.assertEqual(kind, "batch")
             self.assertEqual(
                 (batch.batch_id, batch.query_batch_idx, batch.samples, batch.data),
@@ -69,7 +69,7 @@ class CollationTests(unittest.TestCase):
             )
         self.assertEqual(outputs[0].get_nowait(), ("end", None))
         self.assertEqual(outputs[1].get_nowait(), ("end", None))
-        self.assertEqual(outputs[2].get_nowait()[1][1].data, (4,))
+        self.assertEqual(outputs[2].get_nowait()[1].data, (4,))
 
     def test_duplicate_positions_and_inconsistent_sizes_fail(self):
         for second in [((0, 2), 1, 0, 2), ((0, 3), 1, 1, 2), ((0, 2), 2, 1, 2)]:
@@ -87,7 +87,10 @@ class CollationTests(unittest.TestCase):
     def test_incomplete_batch_on_end_fails(self):
         with self.assertRaisesRegex(RuntimeError, "incomplete"):
             self.run_collator(
-                [("sample", "training", ((0, 2), 1, 0, 1, (0, 0, 0, 0))), ("end", "training", None)]
+                [
+                    ("sample", "training", ((0, 2), 1, 0, 1, (0, 0, 0, 0))),
+                    ("end", "training", None),
+                ]
             )
 
     def test_nested_tensors_are_detached_and_shared(self):

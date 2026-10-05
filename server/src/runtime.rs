@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::{
     loader::{Loader, S3Loader},
     run_config::Config,
-    run_repo::{Run, RunRepo, RunStatus},
+    run_repo::{RunRepo, RunStatus},
     shared_cache::{Lock, write_atomic},
 };
 
@@ -21,7 +21,8 @@ pub struct Runtime {
     pub cache: Arc<PathBuf>,
     pub shutdown: CancellationToken,
     pub tasks: TaskTracker,
-    pub uploads: crate::uploads::UploadStore,
+    pub(super) checkpoint_prefix: &'static str,
+    pub(super) metrics_prefix: &'static str,
     pub asset_slots: Arc<Semaphore>,
     pub upload_slots: Arc<Semaphore>,
     pub(super) loader: Arc<dyn Loader>,
@@ -37,29 +38,34 @@ pub enum Batch {
 
 impl Runtime {
     pub fn new(
-        repo: RunRepo,
         database: clickhouse::Client,
         s3: aws_sdk_s3::Client,
         bucket: &'static str,
         cache: PathBuf,
         shutdown: CancellationToken,
-        uploads: crate::uploads::UploadStore,
-    ) -> Self {
-        Self {
+        checkpoint_prefix: &'static str,
+        metrics_prefix: &'static str,
+    ) -> Result<Self> {
+        let checkpoint_prefix = checkpoint_prefix.trim_matches('/');
+        let metrics_prefix = metrics_prefix.trim_matches('/');
+        ensure!(!checkpoint_prefix.is_empty(), "checkpoint prefix is empty");
+        ensure!(!metrics_prefix.is_empty(), "metrics prefix is empty");
+        Ok(Self {
             loader: Arc::new(S3Loader::new(s3.clone(), bucket)),
-            repo,
+            repo: RunRepo::new(database.clone()),
             database,
             s3,
             bucket,
             cache: Arc::new(cache),
             shutdown,
             tasks: TaskTracker::new(),
-            uploads,
+            checkpoint_prefix,
+            metrics_prefix,
             asset_slots: Arc::new(Semaphore::new(8)),
             upload_slots: Arc::new(Semaphore::new(2)),
             plans: Arc::new(Semaphore::new(2)),
             batches: Arc::new(Semaphore::new(2)),
-        }
+        })
     }
 
     pub fn run_dir(&self, run: Uuid) -> PathBuf {
@@ -99,7 +105,7 @@ impl Runtime {
         })
     }
 
-    pub async fn active(&self, id: Uuid, session: Uuid) -> Result<(Run, Config)> {
+    pub async fn active(&self, id: Uuid, session: Uuid) -> Result<Config> {
         let record = self.repo.get(id).await?.context("run not found")?;
         ensure!(
             record.status == Some(RunStatus::Running),
@@ -114,8 +120,7 @@ impl Runtime {
             owner.session_id == session,
             "run belongs to another client session"
         );
-        let config = Config::parse(&record.config)?;
-        Ok((record, config))
+        Config::parse(&record.config)
     }
 
     pub async fn heartbeat(&self, id: Uuid, session: Uuid) -> Result<()> {
@@ -155,7 +160,7 @@ impl Runtime {
     }
 
     pub async fn asset(&self, id: Uuid, session: Uuid, name: &str) -> Result<AssetSource> {
-        let (_, config) = self.active(id, session).await?;
+        let config = self.active(id, session).await?;
         use sha2::{Digest, Sha256};
         let dir = self.run_dir(id).join("inputs");
         fs::create_dir_all(&dir).await?;
@@ -170,8 +175,7 @@ impl Runtime {
         let record = match input.asset_id {
             Some(id) => Some(
                 self.repo
-                    .assets()
-                    .get(id)
+                    .get_asset(id)
                     .await?
                     .context("input asset not found")?,
             ),

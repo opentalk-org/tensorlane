@@ -83,12 +83,12 @@ class TensorLane:
     def rank(self) -> int:
         return self._rank
 
-    def _supervise_processes(self, root: Path) -> None:
+    def _supervise_processes(self) -> None:
         while not self._stopped.wait(0.05):
             try:
                 self._native.check()
             except RuntimeError:
-                (root / "init.json").unlink(missing_ok=True)
+                (self._root / "init.json").unlink(missing_ok=True)
                 self._stopped.set()
                 return
             for process in self._processes:

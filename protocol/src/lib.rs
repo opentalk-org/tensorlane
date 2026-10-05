@@ -104,7 +104,7 @@ pub struct MetricBatch {
     pub arrays: Vec<ArrayMetric>,
 }
 
-#[derive(Clone, PartialEq, prost::Message)]
+#[derive(Clone, PartialEq, prost::Message, Serialize, Deserialize)]
 pub struct Sample {
     #[prost(string, tag = "6")]
     pub sample_id: String,

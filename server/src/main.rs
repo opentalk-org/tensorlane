@@ -185,25 +185,17 @@ async fn main() -> anyhow::Result<()> {
 
     fs::create_dir_all(&args.cache_dir).await?;
     let bucket = args.bucket.leak();
-    let run_repo = run_repo::RunRepo::new(database.clone());
     let shutdown = CancellationToken::new();
     tokio::spawn(watch_shutdown_signals(shutdown.clone()));
-    let uploads = uploads::UploadStore::new(
-        s3_client.clone(),
-        database.clone(),
-        bucket,
-        args.checkpoint_prefix.leak(),
-        args.metrics_prefix.leak(),
-    )?;
     let runtime = runtime::Runtime::new(
-        run_repo.clone(),
         database,
         s3_client,
         bucket,
         args.cache_dir,
         shutdown.clone(),
-        uploads,
-    );
+        args.checkpoint_prefix.leak(),
+        args.metrics_prefix.leak(),
+    )?;
     let cache_root = runtime.cache.clone();
     let cache_shutdown = shutdown.clone();
     runtime.tasks.spawn(async move {
@@ -217,13 +209,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-    let serving = http::serve(
-        args.http_port,
-        run_repo,
-        auth,
-        shutdown.clone(),
-        runtime.clone(),
-    );
+    let serving = http::serve(args.http_port, auth, shutdown.clone(), runtime.clone());
     tokio::pin!(serving);
     tokio::select! {
         result = &mut serving => result?,
@@ -252,21 +238,17 @@ async fn receive_shutdown_signals(shutdown: CancellationToken) -> anyhow::Result
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
         }
-        handle_shutdown_signal(&shutdown, received);
+        match received {
+            1 => {
+                info!("shutdown requested");
+                shutdown.cancel();
+            }
+            2 => info!("shutdown still in progress; one more signal will force exit"),
+            _ => {
+                info!("received 3 signals, forcing shutdown");
+                std::process::exit(130);
+            }
+        }
     }
     Ok(())
-}
-
-fn handle_shutdown_signal(shutdown: &CancellationToken, received: usize) {
-    match received {
-        1 => {
-            info!("shutdown requested");
-            shutdown.cancel();
-        }
-        2 => info!("shutdown still in progress; one more signal will force exit"),
-        _ => {
-            info!("received 3 signals, forcing shutdown");
-            std::process::exit(130);
-        }
-    }
 }

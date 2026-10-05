@@ -170,7 +170,7 @@ pub async fn commit(engine: &Runtime, id: Uuid, session: Uuid) -> Result<UploadS
                     crate::asset_commit::save(&engine, id, session, &metadata, &spec.sha256, spec.size, &path).await?;
                 }
                 UploadMetadata::Artifact { run_id, metadata } => {
-                    engine.uploads.save_artifact(id, run_id.parse()?, &metadata, &path).await?;
+                    engine.save_artifact(id, run_id.parse()?, &metadata, &path).await?;
                 }
             }
             write_atomic(&dir.join("committed"), b"committed").await?;
