@@ -58,7 +58,6 @@ impl S3Loader {
 #[async_trait]
 impl Loader for S3Loader {
     async fn load(&self, reference: &BlobRef) -> Result<Bytes> {
-        reference.validate()?;
         let _permit = self.slots.acquire().await?;
         let mut request = self
             .s3_client
