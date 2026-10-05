@@ -11,8 +11,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tensorlane_protocol::{
-    ArtifactMetric, MetricBatch, SaveAssetMetadata, ScalarMetric, TRANSFER_CHUNK_BYTES,
-    UploadMetadata, UploadSpec, UploadStatus,
+    ArtifactMetric, MetricBatch, SaveAssetMetadata, ScalarMetric, UploadMetadata, UploadSpec,
 };
 use tokio::{
     fs::File,
@@ -275,38 +274,7 @@ async fn transfer(
         size,
         sha256: hex::encode(hash.finalize()),
     };
-    let status: UploadStatus = client.json(Method::PUT, &["uploads", id], &spec).await?;
-    if status.committed {
-        return Ok(());
-    }
-    for index in 0..size.div_ceil(TRANSFER_CHUNK_BYTES as u64) {
-        let length =
-            (size - index * TRANSFER_CHUNK_BYTES as u64).min(TRANSFER_CHUNK_BYTES as u64) as usize;
-        let mut bytes = vec![0; length];
-        file.read_exact(&mut bytes)
-            .await
-            .context("upload source shrank while uploading")?;
-        client
-            .request(
-                Method::PUT,
-                &["uploads", id, "chunks", &index.to_string()],
-                Some(bytes),
-                &[],
-                1024 * 1024,
-            )
-            .await?;
-    }
-    ensure!(
-        file.read(&mut [0u8; 1]).await? == 0,
-        "upload source grew while uploading"
-    );
-    let status: UploadStatus = client
-        .json(
-            Method::POST,
-            &["uploads", id, "commit"],
-            &serde_json::json!({}),
-        )
-        .await?;
+    let status = client.upload(id, &spec, &file).await?;
     ensure!(status.committed, "upload was not committed");
     Ok(())
 }

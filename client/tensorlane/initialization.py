@@ -157,6 +157,7 @@ def init(
                 root,
                 ranks,
                 num_workers,
+                daemon.prefetch_factor,
                 daemon.streams,
                 collate_fn,
                 daemon._connections,

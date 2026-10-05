@@ -1,152 +1,231 @@
-use crate::shared_cache::write_atomic;
 use anyhow::{Context, Result, ensure};
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::{
     Client,
-    primitives::{ByteStream, Length},
+    primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart},
 };
-use serde::{Deserialize, Serialize};
-use std::path::Path;
-use tokio::fs;
+use axum::extract::Multipart;
+use bytes::Bytes;
+use sha2::{Digest, Sha256};
+use tensorlane_protocol::UploadSpec;
 
-#[derive(Deserialize, Serialize)]
-struct Multipart {
-    upload_id: String,
-    parts: Vec<String>,
-}
+const PART_BYTES: usize = 16 * 1024 * 1024;
 
 pub async fn upload(
     client: &Client,
     bucket: &str,
-    path: &Path,
     key: &str,
     content_type: &str,
+    spec: &UploadSpec,
+    fingerprint: &str,
+    multipart: &mut Multipart,
 ) -> Result<()> {
-    let size = fs::metadata(path).await?.len();
-    let receipt = path.with_extension("s3-complete");
-    if fs::try_exists(&receipt).await? {
-        return Ok(());
-    }
-    if size == 0 {
-        client
-            .put_object()
-            .bucket(bucket)
-            .key(key)
-            .content_type(content_type)
-            .body(ByteStream::from_static(b""))
-            .send()
-            .await?;
-        return write_atomic(&receipt, b"complete").await;
-    }
-    let progress = path.with_extension("multipart.json");
-    let mut state: Multipart = if fs::try_exists(&progress).await? {
-        serde_json::from_slice(&fs::read(&progress).await?)?
+    let exists = existing(client, bucket, key, spec, fingerprint).await?;
+    let upload_id = if !exists && spec.size > 0 {
+        Some(
+            client
+                .create_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .content_type(content_type)
+                .metadata("sha256", &spec.sha256)
+                .metadata("spec", fingerprint)
+                .send()
+                .await?
+                .upload_id()
+                .context("missing S3 upload ID")?
+                .to_owned(),
+        )
     } else {
-        let response = client
-            .create_multipart_upload()
-            .bucket(bucket)
-            .key(key)
-            .content_type(content_type)
-            .send()
-            .await?;
-        let state = Multipart {
-            upload_id: response.upload_id().context("missing S3 upload ID")?.into(),
-            parts: Vec::new(),
-        };
-        write_atomic(&progress, &serde_json::to_vec(&state)?).await?;
-        state
+        None
     };
-    let part_size = (16 * 1024 * 1024u64).max(size.div_ceil(10_000));
-    ensure!(
-        part_size <= 5 * 1024 * 1024 * 1024,
-        "upload exceeds multipart limits"
-    );
-    for index in state.parts.len() as u64..size.div_ceil(part_size) {
-        let offset = index * part_size;
-        let body = ByteStream::read_from()
-            .path(path)
-            .offset(offset)
-            .length(Length::Exact(part_size.min(size - offset)))
-            .build()
-            .await?;
-        let response = client
-            .upload_part()
+    let result = async {
+        let mut field = multipart
+            .next_field()
+            .await?
+            .context("upload is missing its file")?;
+        ensure!(field.name() == Some("file"), "upload is missing its file");
+        let mut digest = Sha256::new();
+        let mut size = 0u64;
+        let mut parts = Vec::new();
+        let mut buffer = if upload_id.is_some() {
+            Vec::with_capacity(PART_BYTES)
+        } else {
+            Vec::new()
+        };
+        while let Some(chunk) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), field.chunk()).await??
+        {
+            size = size
+                .checked_add(chunk.len() as u64)
+                .context("upload has unexpected size")?;
+            ensure!(size <= spec.size, "upload has unexpected size");
+            digest.update(&chunk);
+            if let Some(upload_id) = &upload_id {
+                let mut remaining = chunk.as_ref();
+                while !remaining.is_empty() {
+                    let count = remaining.len().min(PART_BYTES - buffer.len());
+                    buffer.extend_from_slice(&remaining[..count]);
+                    remaining = &remaining[count..];
+                    if buffer.len() == PART_BYTES {
+                        parts.push(
+                            part(
+                                client,
+                                bucket,
+                                key,
+                                upload_id,
+                                parts.len() + 1,
+                                Bytes::from(std::mem::take(&mut buffer)),
+                            )
+                            .await?,
+                        );
+                        buffer = Vec::with_capacity(PART_BYTES);
+                    }
+                }
+            }
+        }
+        drop(field);
+        ensure!(size == spec.size, "upload has unexpected size");
+        ensure!(
+            hex::encode(digest.finalize()) == spec.sha256,
+            "upload SHA256 does not match"
+        );
+        ensure!(
+            multipart.next_field().await?.is_none(),
+            "upload contains unexpected fields"
+        );
+        if exists {
+            return Ok(());
+        }
+        if let Some(upload_id) = &upload_id {
+            if !buffer.is_empty() {
+                parts.push(
+                    part(
+                        client,
+                        bucket,
+                        key,
+                        upload_id,
+                        parts.len() + 1,
+                        Bytes::from(buffer),
+                    )
+                    .await?,
+                );
+            }
+            let response = client
+                .complete_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(parts))
+                        .build(),
+                )
+                .send()
+                .await;
+            if let Err(error) = response {
+                if !existing(client, bucket, key, spec, fingerprint).await? {
+                    return Err(error.into());
+                }
+                let _ = client
+                    .abort_multipart_upload()
+                    .bucket(bucket)
+                    .key(key)
+                    .upload_id(upload_id)
+                    .send()
+                    .await;
+            }
+        } else {
+            let response = client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .content_type(content_type)
+                .metadata("sha256", &spec.sha256)
+                .metadata("spec", fingerprint)
+                .if_none_match("*")
+                .body(ByteStream::from_static(b""))
+                .send()
+                .await;
+            if let Err(error) = response
+                && !existing(client, bucket, key, spec, fingerprint).await?
+            {
+                return Err(error.into());
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if result.is_err()
+        && let Some(upload_id) = &upload_id
+    {
+        let _ = client
+            .abort_multipart_upload()
             .bucket(bucket)
             .key(key)
-            .upload_id(&state.upload_id)
-            .part_number(i32::try_from(index + 1)?)
-            .body(body)
+            .upload_id(upload_id)
             .send()
             .await;
-        match response {
-            Ok(part) => {
-                state
-                    .parts
-                    .push(part.e_tag().context("missing S3 part ETag")?.into());
-                write_atomic(&progress, &serde_json::to_vec(&state)?).await?;
-            }
-            Err(error)
-                if error
-                    .as_service_error()
-                    .is_some_and(|error| error.code() == Some("NoSuchUpload")) =>
-            {
-                return completed(client, bucket, key, size, &progress, &receipt).await;
-            }
-            Err(error) => return Err(error.into()),
-        }
     }
-    let parts = state
-        .parts
-        .iter()
-        .enumerate()
-        .map(|(index, etag)| {
-            CompletedPart::builder()
-                .part_number((index + 1) as i32)
-                .e_tag(etag)
-                .build()
-        })
-        .collect();
-    let response = client
-        .complete_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .upload_id(&state.upload_id)
-        .multipart_upload(
-            CompletedMultipartUpload::builder()
-                .set_parts(Some(parts))
-                .build(),
-        )
-        .send()
-        .await;
-    match response {
-        Ok(_) => write_atomic(&receipt, b"complete").await,
-        Err(error)
-            if error
-                .as_service_error()
-                .is_some_and(|error| error.code() == Some("NoSuchUpload")) =>
-        {
-            completed(client, bucket, key, size, &progress, &receipt).await
-        }
-        Err(error) => Err(error.into()),
-    }
+    result
 }
 
-async fn completed(
+async fn part(
     client: &Client,
     bucket: &str,
     key: &str,
-    size: u64,
-    progress: &Path,
-    receipt: &Path,
-) -> Result<()> {
-    let object = client.head_object().bucket(bucket).key(key).send().await;
-    if object
-        .as_ref()
-        .is_ok_and(|head| head.content_length() == Some(size as i64))
-    {
-        return write_atomic(receipt, b"complete").await;
+    upload_id: &str,
+    number: usize,
+    bytes: Bytes,
+) -> Result<CompletedPart> {
+    let number = i32::try_from(number)?;
+    let response = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(number)
+        .body(ByteStream::from(bytes))
+        .send()
+        .await?;
+    Ok(CompletedPart::builder()
+        .part_number(number)
+        .e_tag(response.e_tag().context("missing S3 part ETag")?)
+        .build())
+}
+
+async fn existing(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    spec: &UploadSpec,
+    fingerprint: &str,
+) -> Result<bool> {
+    match client.head_object().bucket(bucket).key(key).send().await {
+        Ok(head) => {
+            ensure!(
+                head.content_length() == Some(spec.size as i64)
+                    && head
+                        .metadata()
+                        .and_then(|m| m.get("sha256"))
+                        .map(String::as_str)
+                        == Some(spec.sha256.as_str())
+                    && head
+                        .metadata()
+                        .and_then(|m| m.get("spec"))
+                        .map(String::as_str)
+                        == Some(fingerprint),
+                "conflicting retry of upload ID"
+            );
+            Ok(true)
+        }
+        Err(error)
+            if error
+                .raw_response()
+                .is_some_and(|response| response.status().as_u16() == 404) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
     }
-    fs::remove_file(progress).await?;
-    anyhow::bail!("multipart upload expired; restarting from retained chunks")
 }

@@ -27,6 +27,7 @@ mod http;
 mod job;
 mod loader;
 mod metric_http;
+mod object_state;
 mod query_params;
 mod run_config;
 mod run_repo;
@@ -104,10 +105,10 @@ struct Args {
     #[arg(
         long,
         env = "CACHE_DIR",
-        help = "Directory for prefetched data, downloaded assets, and staged uploads."
+        help = "Directory for disposable query, batch, and input asset caches."
     )]
     cache_dir: PathBuf,
-    #[arg(long, env = "CACHE_BYTES", default_value_t = 8 * 1024 * 1024 * 1024u64)]
+    #[arg(long, env = "CACHE_BYTES", default_value_t = 15 * 1024 * 1024 * 1024u64)]
     cache_bytes: u64,
     #[arg(
         long,

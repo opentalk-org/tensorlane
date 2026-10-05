@@ -5,9 +5,17 @@ uploads, metrics, heartbeats, and completion. Upgrade the server and Python clie
 together. Existing gRPC clients cannot use this server. Keep their old server
 available until their training runs finish.
 
-A client supplies `x-tensorlane-session: <UUID>` on training requests. The Python
-client persists this UUID in its IPC directory. The first initialization stores
-ownership in ClickHouse. Another client session cannot take over the run.
+A client supplies `x-tensorlane-session: <UUID>` on training requests. Each Python
+daemon starts with a fresh UUID. The first initialization claims ownership atomically in R2 and records it in
+ClickHouse. HTTP retries from that daemon keep the same UUID, including across
+server replacement. Another training execution cannot take over the run.
+
+Resume by creating a new run with `POST /runs`, adding `resume_from: <old run UUID>`
+to the existing project, name, and configuration fields. Creation selects the
+source run's latest committed checkpoint and pins its asset ID under its original
+name in the new run's input assets. Incomplete uploads are ignored. Python calls
+remain `tensorlane.init(new_run_id)` and `lane.asset(name)`. The new run starts its
+own batch sequences at zero; this does not restore prior stream positions.
 
 | Request | Response |
 | --- | --- |
@@ -18,14 +26,20 @@ ownership in ClickHouse. Another client session cannot take over the run.
 | `GET /runs/{id}/inputs/{name}` | Size, ETag, optional SHA-256, and asset metadata |
 | `GET /runs/{id}/inputs/{name}/bytes` | 206 for an explicit byte range of at most 4 MiB |
 | `PUT /runs/{id}/metrics/{request_id}` | 204; repeated IDs are deduplicated |
-| `PUT /uploads/{id}` | Creates an upload with its size, SHA-256, and metadata |
-| `PUT /uploads/{id}/chunks/{index}` | 204; writes one chunk of at most 4 MiB |
-| `POST /uploads/{id}/commit` | 202 until S3 and ClickHouse writes finish, then 200 |
+| `PUT /uploads/{id}` | Streams multipart `spec` JSON followed by `file` directly into the final R2 object; 200 after publication |
 
-A batch sequence starts at zero. Retrying a sequence returns the same samples.
+A batch sequence starts at zero. Retrying a sequence uses the cached query result.
 For a repeating stream, the sequence keeps increasing while the saved query
 result repeats. The protobuf messages are defined in `protocol/batch.proto`.
 Run management routes remain JSON HTTP APIs.
+
+Initialization does not execute data queries. The Python client starts a stream's
+prefetch when its first `lane.batches(name)` reader connects. A batch request
+creates a missing query plan; partially removed plans are rebuilt automatically.
+Each rebuilt plan has a separate batch cache, so it cannot serve an older plan's
+payloads. Requerying uses the run's original SQL and parameters. Deterministic SQL,
+the same seed, and stable source data are required to reproduce the same samples
+after a plan is evicted.
 
 Each stream fetches up to `ranks * prefetch_factor` batches concurrently.
 The same prefetch credits cover outstanding requests and completed batches, so
@@ -40,24 +54,32 @@ retried individually. Clients pin the ETag, validate each range, and verify the
 final SHA-256 when the registered asset supplies one. Input object keys must be
 immutable during a run. Asset IDs point to immutable saved objects.
 
-Uploads preserve received chunks, their hashes, and multipart S3 progress on the
-shared volume. Commit requests are idempotent. Metrics use durable volume receipts
-and ClickHouse insert tokens. ClickHouse deduplication covers the gap between
-insertion and receipt publication; its deduplication window must cover the
-client's recovery period. Completed receipts remain until the run is archived.
+Uploads stream through a bounded 16 MiB buffer into standard S3 multipart parts
+on the final object key. The server validates length and SHA-256 before completing
+the object, then publishes its asset or artifact row in ClickHouse. There are no
+local upload files or intermediate payload objects. A failed request aborts its
+multipart upload; an HTTP retry sends the whole file and can reach any replica.
+Existing final objects are checked against the upload's content and metadata.
+
+Small immutable R2 records hold run ownership, upload fingerprints, checkpoint
+lineage, and metric retry receipts. They contain control metadata, never staged
+payload bytes. ClickHouse insert tokens deduplicate metric and artifact retries
+between insertion and receipt publication; the deduplication window must cover
+the client's recovery period.
 
 ## Recovery and limits
 
 Requests retry network failures, incomplete bodies, 202, 408, 429, and server
 errors. Backoff includes jitter. The default recovery deadline is 600 seconds per
 request; `TENSORLANE_RETRY_TIMEOUT_SECONDS=0` waits indefinitely. Each attempt has
-a 10-second connect timeout, a 30-second read idle timeout, and a 120-second total
-limit. A Python `init(timeout=...)` deadline also covers asset downloads and local
+a 10-second connect timeout and a 30-second read idle timeout. Ordinary requests
+have a 120-second attempt limit; streaming uploads can use the remaining recovery
+deadline. A Python `init(timeout=...)` deadline also covers asset downloads and local
 worker startup. A `flush(timeout=...)` deadline includes queue space and automatic metrics.
 A timeout leaves its upload running.
 
 A missed heartbeat or a lost connection does not fail a run. Server startup and
-shutdown leave run status and saved query results intact. Only explicit run
+shutdown leave run status intact. Cached query results can be regenerated. Only explicit run
 completion changes a running run to succeeded or failed. Abandoned clients leave
 running records; `run_sessions.updated_at` exposes their last heartbeat.
 
@@ -66,7 +88,7 @@ Server batch-loading admission uses `config.tensorlane.max_load_memory_bytes`
 pools. A batch exceeding its stream's share may run alone within that stream;
 its reservation lasts through cache publication. This is an estimated working-set
 target. Query preparation uses independent stream locks. Each server process
-allows two upload commits and eight asset range requests at once. Upload queues
+allows two streaming uploads and eight asset range requests at once. Upload queues
 have bounded capacity. Batches are limited to 64 MiB and query snapshots to
 512 MiB. Uploads are limited to 16 GiB.
 
@@ -74,25 +96,25 @@ CPU tensor storage is shared between Python transform workers, the collate worke
 and readers. IPC still serializes Python metadata and tensor storage handles.
 Collation may allocate a new batch tensor before its storage is shared.
 
-## Shared storage
+## Replicas and cache
 
-All server replicas need the same ClickHouse database and `CACHE_DIR` volume.
-The volume must support POSIX advisory file locks, atomic rename, and fsync
-across replicas. These locks serialize ownership changes, query preparation,
-checkpoint lineage, and upload commits. A dead process releases its locks.
-No sticky routing is required.
+Replicas share ClickHouse and R2. Each replica has an independent disposable
+`CACHE_DIR`; no shared filesystem or sticky routing is required. Local locks
+coordinate preparation and eviction only within that replica. Cache loss causes
+automatic query preparation and input downloads on the next request.
 
-`CACHE_BYTES` defaults to 8 GiB and limits reusable batch and asset range files.
-Cleanup runs every minute. Immutable query snapshots, upload staging, and receipts
-are retained separately and need capacity planning and archival after runs finish.
+`CACHE_BYTES` defaults to 15 GiB and limits query plans, reusable batches, and asset
+range files. Cleanup runs every minute and removes a query plan's index and ready
+marker with it, under the same local lock used by batch readers and preparation.
 Writes reserve at least 512 MiB of free space; insufficient space returns an error
-so the client can retry. Cache cleanup does not remove query snapshots or receipts.
-S3 providers should expire abandoned multipart uploads through a lifecycle rule.
+so the client can retry. R2 control records are outside the disposable cache.
+Configure the bucket to expire abandoned multipart uploads after hard process
+termination.
 
 The server accepts SIGTERM, stops admitting new preparations, and allows up to
 60 seconds for HTTP requests and background jobs to finish. Provision a shutdown
-grace period of at least 65 seconds. A hard stop also preserves completed files;
-the next process resumes from them.
+grace period of at least 65 seconds. Another replica can serve retried requests
+using the database and R2 records.
 
 The migration `20261004170000` adds run sessions and enables insert deduplication
 for local MergeTree tables. Review and apply it before starting this server.

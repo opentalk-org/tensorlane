@@ -33,6 +33,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
     assert_eq!(initialized.run_id, id);
     assert_eq!(env.init(&id).await?.streams, vec!["training", "validation"]);
     assert_eq!(env.status(&id).await?, "running");
+    assert!(!env.cache.join("runs").join(&id).join("plans").exists());
     for sequence in [2, 0, 2, 3, 1] {
         let batch = env.batch(&id, "training", sequence).await?.unwrap();
         assert_eq!(batch.batch_id, sequence);
@@ -64,17 +65,30 @@ pub async fn check(env: &TestEnv) -> Result<()> {
         .await?
         .error_for_status()?;
     let length = response.content_length().unwrap();
+    let plans = env.cache.join("runs").join(&large_run).join("plans");
+    let generation = tokio::fs::read(plans.join("0.ready")).await?;
     tokio::fs::remove_file(
         env.cache
             .join("runs")
             .join(&large_run)
-            .join("data/0/0.batch"),
+            .join("data/0")
+            .join(Uuid::from_slice(&generation)?.to_string())
+            .join("0.batch"),
     )
     .await?;
+    tokio::fs::remove_file(plans.join("0.index")).await?;
     let replacement = Bytes::from(vec![47; 16 * 1024 * 1024]);
     env.put_object(&object, replacement.clone()).await?;
     let refreshed = env.batch(&large_run, "training", 0).await?.unwrap();
     assert_eq!(refreshed.batch[0].blobs["payload"], replacement);
+    assert_ne!(tokio::fs::read(plans.join("0.ready")).await?, generation);
+    tokio::fs::remove_file(plans.join("0.plan")).await?;
+    let latest = Bytes::from(vec![59; 16 * 1024 * 1024]);
+    env.put_object(&object, latest.clone()).await?;
+    assert_eq!(
+        env.batch(&large_run, "training", 0).await?.unwrap().batch[0].blobs["payload"],
+        latest
+    );
     let original = response.bytes().await?;
     assert_eq!(original.len() as u64, length);
     assert_eq!(DataResponse::decode(original)?, expected);

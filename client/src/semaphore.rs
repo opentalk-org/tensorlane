@@ -96,7 +96,7 @@ impl BatchBudget {
     pub fn new(capacity: usize, memory_bytes: usize) -> Result<Self> {
         Ok(Self {
             memory: Arc::new(MemoryBudget::new(memory_bytes)?),
-            semaphore: PosixSemaphore::create(capacity)?,
+            semaphore: PosixSemaphore::create(0)?,
             capacity,
             cancelled: AtomicBool::new(false),
         })
@@ -216,7 +216,6 @@ mod tests {
     #[test]
     fn independently_opened_handle_releases_waiter() -> Result<()> {
         let budget = Arc::new(BatchBudget::new(1, 1024 * 1024)?);
-        assert!(budget.acquire()?);
         let rank = PosixSemaphore::open(budget.semaphore.name()?)?;
         let (done, received) = mpsc::channel();
         let waiting = budget.clone();
@@ -232,7 +231,6 @@ mod tests {
     fn cancellation_wakes_waiter_and_unlinks_on_drop() -> Result<()> {
         let budget = Arc::new(BatchBudget::new(1, 1024 * 1024)?);
         let name = budget.semaphore.name()?.to_owned();
-        assert!(budget.acquire()?);
         let (done, received) = mpsc::channel();
         let waiting = budget.clone();
         let thread = thread::spawn(move || done.send(waiting.acquire()).unwrap());

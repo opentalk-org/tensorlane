@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::{db, runtime::Runtime};
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -25,26 +23,14 @@ impl Runtime {
         format!("{}/{}", self.checkpoint_prefix, id)
     }
 
-    pub async fn save_asset(
-        &self,
-        record: &crate::asset_repo::AssetRecord,
-        local_path: &Path,
-        content_type: &str,
-    ) -> anyhow::Result<()> {
-        crate::s3_upload::upload(
-            &self.s3,
-            self.bucket,
-            local_path,
-            &record.path,
-            content_type,
-        )
-        .await?;
-        let mut insert = db::request(
-            self.database
-                .insert::<crate::asset_repo::AssetRecord>("assets"),
-        )
-        .await?
-        .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
+    pub async fn save_asset(&self, record: &crate::asset_repo::AssetRecord) -> anyhow::Result<()> {
+        let client = self
+            .database
+            .clone()
+            .with_setting("insert_deduplication_token", record.id.to_string());
+        let mut insert = db::request(client.insert::<crate::asset_repo::AssetRecord>("assets"))
+            .await?
+            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
         insert.write(record).await?;
         insert.end().await?;
         Ok(())
@@ -55,17 +41,8 @@ impl Runtime {
         id: Uuid,
         run_id: Uuid,
         metadata: &tensorlane_protocol::ArtifactMetric,
-        local_path: &Path,
     ) -> anyhow::Result<()> {
         let key = format!("{}/{}", self.metrics_prefix, id);
-        crate::s3_upload::upload(
-            &self.s3,
-            self.bucket,
-            local_path,
-            &key,
-            &metadata.content_type,
-        )
-        .await?;
         let row = ArtifactRecord {
             id,
             run_id,

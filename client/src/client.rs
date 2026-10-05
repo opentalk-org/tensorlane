@@ -128,6 +128,7 @@ impl Listener {
     fn new(py: Python<'_>, path: PathBuf) -> anyhow::Result<Self> {
         py.allow_threads(|| {
             let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
                 .enable_all()
                 .build()?;
             let receiver = runtime.block_on(async move {

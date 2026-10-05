@@ -30,43 +30,59 @@ impl Runtime {
         let dir = self.run_dir(id).join("plans");
         fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{index}.plan"));
-        crate::job::check(&path.with_extension("error")).await?;
-        if !fs::try_exists(path.with_extension("ready")).await? {
+        let ready = path.with_extension("ready");
+        let (plan, generation) = loop {
             let Some(lock) = Lock::try_acquire(&path.with_extension("lock")).await? else {
                 return Ok(Batch::Pending);
             };
-            if !fs::try_exists(path.with_extension("ready")).await? {
-                let engine = self.clone();
-                let ready = path.with_extension("ready");
-                let path = path.clone();
-                let query = query.clone();
-                let name = name.to_owned();
-                self.tasks.spawn(async move {
-                    let _lock = lock;
-                    let result = async {
-                        crate::cache_limits::space(&engine.cache, 512*1024*1024).await?;
-                        let _ = fs::remove_file(path.with_extension("part")).await;
-                        let rows = stream_samples(&engine.database, &query.sql, &query.params);
-                        let mut sampler = QuerySampler::create(&name, rows, &path, query.repeat).await?;
-                        sampler.persist();
-                        write_atomic(&path.with_extension("ready"), b"ready").await?;
-                        anyhow::Ok(())
-                    }.await;
-                    if let Err(error) = result {
-                        tracing::warn!(run = %id, stream = %name, error = %error, "query plan preparation failed");
-                        crate::job::failed(&path.with_extension("error"), &error).await;
-                    }
-                });
-                if !crate::job::wait_for_file(&ready).await? {
-                    return Ok(Batch::Pending);
-                }
+            crate::job::check(&path.with_extension("error")).await?;
+            let generation = match fs::read(&ready).await {
+                Ok(bytes) => Uuid::from_slice(&bytes).ok(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if let Some(generation) = generation
+                && fs::try_exists(&path).await?
+                && fs::try_exists(path.with_extension("index")).await?
+            {
+                let mut sampler = QuerySampler::open(&path, query.repeat).await?;
+                break (sampler.batch_at(sequence).await?, generation);
             }
-        }
-        let mut sampler = QuerySampler::open(&path, query.repeat).await?;
-        let Some(plan) = sampler.batch_at(sequence).await? else {
+            if generation.is_some() || fs::try_exists(&ready).await? {
+                fs::remove_file(&ready).await?;
+            }
+            let engine = self.clone();
+            let path = path.clone();
+            let query = query.clone();
+            let name = name.to_owned();
+            self.tasks.spawn(async move {
+                let _lock = lock;
+                let result = async {
+                    crate::cache_limits::space(&engine.cache, 512*1024*1024).await?;
+                    let _ = fs::remove_file(path.with_extension("part")).await;
+                    let rows = stream_samples(&engine.database, &query.sql, &query.params);
+                    let mut sampler = QuerySampler::create(&name, rows, &path, query.repeat).await?;
+                    sampler.persist();
+                    write_atomic(&path.with_extension("ready"), Uuid::new_v4().as_bytes()).await?;
+                    anyhow::Ok(())
+                }.await;
+                if let Err(error) = result {
+                    tracing::warn!(run = %id, stream = %name, error = %error, "query plan preparation failed");
+                    crate::job::failed(&path.with_extension("error"), &error).await;
+                }
+            });
+            if !crate::job::wait_for_file(&ready).await? {
+                return Ok(Batch::Pending);
+            }
+        };
+        let Some(plan) = plan else {
             return Ok(Batch::End);
         };
-        let data = self.run_dir(id).join("data").join(index.to_string());
+        let data = self
+            .run_dir(id)
+            .join("data")
+            .join(index.to_string())
+            .join(generation.to_string());
         fs::create_dir_all(&data).await?;
         let cached = data.join(format!("{}.batch", plan.query_batch_idx));
         crate::job::check(&cached.with_extension("error")).await?;
@@ -84,9 +100,7 @@ impl Runtime {
         let preparation = self.tasks.spawn(async move {
             let _lock = lock;
             let result = async {
-                let Some((response, _memory)) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, limit).await? else {
-                    return Ok(());
-                };
+                let (response, _memory) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, limit).await?;
                 write_atomic(&cached, &response.encode_to_vec()).await?;
                 anyhow::Ok(())
             }.await;
@@ -117,7 +131,7 @@ async fn load_batch(
     plan: BatchPlan,
     memory: Arc<Semaphore>,
     limit: usize,
-) -> Result<Option<(DataResponse, OwnedSemaphorePermit)>> {
+) -> Result<(DataResponse, OwnedSemaphorePermit)> {
     let started = std::time::Instant::now();
     let mut response = DataResponse {
         stream,
@@ -151,16 +165,9 @@ async fn load_batch(
         .and_then(|size| size.checked_add(overhead))
         .context("batch loading memory size overflow")?;
     let count = u32::try_from(required.min(limit).div_ceil(LOAD_MEMORY_UNIT))?;
-    // Oversized batches queue for the entire budget so smaller batches cannot
-    // continually overtake them. They run alone once existing loads finish.
-    let permit = if required > limit {
-        memory.acquire_many_owned(count).await?
-    } else {
-        let Ok(permit) = memory.try_acquire_many_owned(count) else {
-            return Ok(None);
-        };
-        permit
-    };
+    let waiting = std::time::Instant::now();
+    let permit = memory.acquire_many_owned(count).await?;
+    response.server_wait_seconds = waiting.elapsed().as_secs_f64();
     let mut encoded_bytes = response.encoded_len();
     let references = prepared
         .iter()
@@ -184,8 +191,8 @@ async fn load_batch(
         );
         response.batch.push(sample);
     }
-    response.load_seconds = started.elapsed().as_secs_f64();
-    Ok(Some((response, permit)))
+    response.load_seconds = started.elapsed().as_secs_f64() - response.server_wait_seconds;
+    Ok((response, permit))
 }
 
 #[cfg(test)]
@@ -265,8 +272,7 @@ mod tests {
                     256 * 1024 * 1024,
                 ),
             )
-            .await??
-            .unwrap();
+            .await??;
             let (batch, _permit) = batch;
             assert_eq!(batch.query_batch_idx, 42);
             for (index, sample) in batch.batch.iter().enumerate() {
@@ -295,22 +301,47 @@ mod tests {
             peak: AtomicUsize::new(0),
             completed: Mutex::new(Vec::new()),
         };
-        assert!(
-            load_batch(&loader, "training".into(), plan(1), memory.clone(), limit)
-                .await?
-                .is_none()
-        );
+        let loading = load_batch(&loader, "training".into(), plan(1), memory.clone(), limit);
+        tokio::pin!(loading);
+        assert!(futures::poll!(loading.as_mut()).is_pending());
         assert_eq!(loader.peak.load(Ordering::SeqCst), 0);
         drop(occupied);
-        let (response, permit) =
-            load_batch(&loader, "training".into(), plan(1), memory.clone(), limit)
-                .await?
-                .unwrap();
+        let (response, permit) = loading.await?;
         assert!(memory.available_permits() < limit / LOAD_MEMORY_UNIT);
         let _encoded = response.encode_to_vec();
         assert!(memory.available_permits() < limit / LOAD_MEMORY_UNIT);
         drop(permit);
         assert_eq!(memory.available_permits(), limit / LOAD_MEMORY_UNIT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiting_batch_releases_partial_reservation() -> Result<()> {
+        let limit = 16 * LOAD_MEMORY_UNIT;
+        let memory = Arc::new(Semaphore::new(16));
+        let occupied = memory.clone().acquire_many_owned(14).await?;
+        let loader = DelayedLoader {
+            barrier: tokio::sync::Barrier::new(1),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            completed: Mutex::new(Vec::new()),
+        };
+        {
+            let waiting = load_batch(&loader, "audio".into(), plan(4), memory.clone(), limit);
+            tokio::pin!(waiting);
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            assert_eq!(loader.peak.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(memory.available_permits(), 2);
+        drop(occupied);
+        let (response, permit) = tokio::time::timeout(
+            Duration::from_secs(1),
+            load_batch(&loader, "audio".into(), plan(8), memory.clone(), limit),
+        )
+        .await??;
+        assert_eq!(response.batch.len(), 8);
+        drop(permit);
+        assert_eq!(memory.available_permits(), 16);
         Ok(())
     }
 
@@ -335,53 +366,34 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!loading.is_finished());
         assert_eq!(loader.peak.load(Ordering::SeqCst), 0);
-        assert!(
-            load_batch(
-                loader.as_ref(),
-                "training".into(),
-                plan(1),
-                memory.clone(),
-                limit
-            )
-            .await?
-            .is_none()
+        let smaller = load_batch(
+            loader.as_ref(),
+            "training".into(),
+            plan(1),
+            memory.clone(),
+            limit,
         );
+        tokio::pin!(smaller);
+        assert!(futures::poll!(smaller.as_mut()).is_pending());
         let other_run = Arc::new(Semaphore::new(limit / LOAD_MEMORY_UNIT));
-        assert!(
-            load_batch(
-                loader.as_ref(),
-                "training".into(),
-                plan(1),
-                other_run,
-                limit
-            )
-            .await?
-            .is_some()
-        );
+        let (other, _) = load_batch(
+            loader.as_ref(),
+            "training".into(),
+            plan(1),
+            other_run,
+            limit,
+        )
+        .await?;
+        assert_eq!(other.batch.len(), 1);
         drop(occupied);
-        let (response, permit) = tokio::time::timeout(Duration::from_secs(1), loading)
-            .await???
-            .unwrap();
+        let (response, permit) = tokio::time::timeout(Duration::from_secs(1), loading).await???;
         assert_eq!(response.batch.len(), 2);
         assert_eq!(memory.available_permits(), 0);
-        assert!(
-            load_batch(
-                loader.as_ref(),
-                "training".into(),
-                plan(1),
-                memory.clone(),
-                limit
-            )
-            .await?
-            .is_none()
-        );
+        assert!(futures::poll!(smaller.as_mut()).is_pending());
         drop(permit);
+        let (response, _) = tokio::time::timeout(Duration::from_secs(1), smaller).await??;
+        assert_eq!(response.batch.len(), 1);
         assert_eq!(memory.available_permits(), limit / LOAD_MEMORY_UNIT);
-        assert!(
-            load_batch(loader.as_ref(), "training".into(), plan(1), memory, limit)
-                .await?
-                .is_some()
-        );
         Ok(())
     }
 

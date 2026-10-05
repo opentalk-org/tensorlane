@@ -100,8 +100,6 @@ class PipelineTests(PipelineCase):
                 "inputs",
                 "model",
                 "uploads",
-                "chunks",
-                "commit",
                 "metrics",
                 "heartbeat",
                 "end",
@@ -189,22 +187,38 @@ class PipelineTests(PipelineCase):
             self.assertEqual(sample.blobs["context"], b"arbitrary bytes")
             self.assertEqual(sample.metadata["position"], 2000)
 
+    def test_init_and_asset_loading_do_not_fetch_streams(self):
+        self.service.assets = {"model": (None, b"weights")}
+        self.start(factor=1, workers=1, performance_metrics=False)
+        self.assertEqual(self.daemon.asset("model").read_bytes(), b"weights")
+        time.sleep(0.1)
+        self.assertTrue(
+            all(not requests for requests in self.service.requests.values())
+        )
+        with self.daemon.batches("evaluation") as reader:
+            self.assertEqual(len(list(reader)), self.service.streams["evaluation"])
+        self.assertEqual(self.service.requests["training"], [])
+        self.assertEqual(self.service.requests["validation"], [])
+        with self.daemon.batches("validation") as reader:
+            self.assertEqual(len(list(reader)), self.service.streams["validation"])
+        self.assertEqual(self.service.requests["training"], [])
+
     def test_other_streams_drain_while_training_is_full(self):
         self.start(factor=1, workers=3)
-        wait_for(lambda: len(self.service.requests["training"]) == 1)
-        for name in ("validation", "evaluation"):
-            with self.daemon.batches(name) as reader:
-                self.assertEqual(len(list(reader)), self.service.streams[name])
-        self.assertEqual(len(self.service.requests["training"]), 1)
-        with self.daemon.batches("training") as reader:
-            self.assertEqual(len(list(reader)), 5)
+        with self.daemon.batches("training") as training:
+            wait_for(lambda: len(self.service.requests["training"]) == 1)
+            for name in ("validation", "evaluation"):
+                with self.daemon.batches(name) as reader:
+                    self.assertEqual(len(list(reader)), self.service.streams[name])
+            self.assertEqual(len(self.service.requests["training"]), 1)
+            self.assertEqual(len(list(training)), 5)
 
     def test_credit_budget_covers_unconsumed_batches(self):
         self.start(factor=1)
-        wait_for(lambda: len(self.service.requests["training"]) == 1)
-        time.sleep(0.1)
-        self.assertEqual(len(self.service.requests["training"]), 1)
         with self.daemon.batches("training") as reader:
+            wait_for(lambda: len(self.service.requests["training"]) == 1)
+            time.sleep(0.1)
+            self.assertEqual(len(self.service.requests["training"]), 1)
             next(reader)
             wait_for(lambda: len(self.service.requests["training"]) == 2)
             time.sleep(0.1)
@@ -214,10 +228,14 @@ class PipelineTests(PipelineCase):
         self.service.config["tensorlane"]["max_prefetch_memory_bytes"] = 3 * 1024 * 1024
         self.service.blob_size = 2 * 1024 * 1024
         self.start(factor=4, workers=3)
-        wait_for(lambda: bool(self.service.requests["training"]))
-        for name in ("validation", "evaluation", "training"):
-            with self.daemon.batches(name) as reader:
-                batches = list(reader)
+        received = {}
+        with self.daemon.batches("training") as training:
+            wait_for(lambda: bool(self.service.requests["training"]))
+            for name in ("validation", "evaluation"):
+                with self.daemon.batches(name) as reader:
+                    received[name] = list(reader)
+            received["training"] = list(training)
+        for name, batches in received.items():
             self.assertEqual(
                 [batch.batch_id for batch in batches],
                 list(range(self.service.streams[name])),

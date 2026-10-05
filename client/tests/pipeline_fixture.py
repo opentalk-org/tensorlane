@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from email.parser import BytesParser
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
@@ -94,6 +95,7 @@ class Fixture:
         self.transient_batches = 0
         self.truncate_asset_once = False
         self.drop_metric_reply = False
+        self.drop_upload_reply = False
         self.metric_receipts = set()
         self.fail_init = False
         self.fail_asset = False
@@ -148,11 +150,7 @@ class Fixture:
             if handler.headers.get("Content-Type") == "application/json"
             else None
         )
-        action = (
-            parts[-1]
-            if parts[-1] in {"init", "heartbeat", "end", "commit"}
-            else parts[-2]
-        )
+        action = parts[-1] if parts[-1] in {"init", "heartbeat", "end"} else parts[-2]
         if self.authorization:
             self.authorization.methods.add(action)
         match parts:
@@ -247,17 +245,22 @@ class Fixture:
                     return
                 self.reply(handler, 204)
             case ["uploads", upload]:
-                self.uploads.setdefault(
-                    upload, {"spec": data, "chunks": {}, "committed": False}
+                message = BytesParser().parsebytes(
+                    f"Content-Type: {handler.headers['Content-Type']}\r\n\r\n".encode()
+                    + content
                 )
-                self.reply(
-                    handler, 200, {"committed": self.uploads[upload]["committed"]}
-                )
-            case ["uploads", upload, "chunks", index]:
-                self.uploads[upload]["chunks"][int(index)] = content
-                self.reply(handler, 204)
-            case ["uploads", upload, "commit"]:
-                self.commit(handler, upload)
+                fields = message.get_payload()
+                spec = json.loads(fields[0].get_payload(decode=True))
+                body = fields[1].get_payload(decode=True)
+                if (
+                    len(body) != spec["size"]
+                    or hashlib.sha256(body).hexdigest() != spec["sha256"]
+                ):
+                    self.reply(
+                        handler, 400, {"message": "upload has unexpected content"}
+                    )
+                    return
+                self.save(handler, upload, spec, body)
             case _:
                 self.reply(handler, 404, {"message": "unknown fixture endpoint"})
 
@@ -295,18 +298,22 @@ class Fixture:
             samples.append(sample)
         self.reply(handler, 200, batch_bytes(stream, index, samples))
 
-    def commit(self, handler, upload):
+    def save(self, handler, upload, spec, body):
         self.upload_started.set()
         self.upload_gate.wait(20)
-        state = self.uploads[upload]
-        spec = state["spec"]
         metadata = spec["metadata"]["metadata"]
         if self.fail_save or self.fail_metrics:
             self.reply(handler, 422, {"message": "fixture save failure"})
             return
-        if not state["committed"]:
-            body = b"".join(state["chunks"][index] for index in sorted(state["chunks"]))
-            with self.lock:
+        with self.lock:
+            state = self.uploads.get(upload)
+            if state is not None:
+                if state != (spec, body):
+                    self.reply(
+                        handler, 409, {"message": "conflicting retry of upload ID"}
+                    )
+                    return
+            else:
                 if spec["metadata"]["kind"] == "asset":
                     parent = self.heads.get(
                         metadata["name"],
@@ -316,7 +323,12 @@ class Fixture:
                     self.heads[metadata["name"]] = metadata["asset_id"]
                 else:
                     self.artifacts.append((SimpleNamespace(**metadata), body))
-                state["committed"] = True
+                self.uploads[upload] = (spec, body)
+            drop_reply = self.drop_upload_reply
+            self.drop_upload_reply = False
+        if drop_reply:
+            handler.close_connection = True
+            return
         self.reply(handler, 200, {"committed": True})
 
     def close(self):
