@@ -166,12 +166,12 @@ class TensorLane:
         if self._native is None:
             return
         (self._root / "init.json").unlink(missing_ok=True)
+        self._native.stop()
         if self._stopped is not None:
             self._stopped.set()
         if self._monitor is not None:
             self._monitor.join()
             self._monitor = None
-        self._native.stop()
         try:
             deadline = time.monotonic() + 5
             for process in self._processes:

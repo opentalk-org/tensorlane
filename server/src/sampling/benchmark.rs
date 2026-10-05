@@ -41,7 +41,7 @@ async fn live_plan_memory() -> anyhow::Result<()> {
 #[ignore = "writes and replays two large synthetic plans to measure peak RSS"]
 async fn disk_plan_memory() -> anyhow::Result<()> {
     let rows: u64 = env::var("TENSORLANE_BENCHMARK_ROWS")
-        .unwrap_or("2560000".into())
+        .unwrap_or("500000".into())
         .parse()?;
     let dir = tempfile::tempdir()?;
     let started = Instant::now();

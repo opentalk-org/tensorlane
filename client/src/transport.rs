@@ -68,6 +68,10 @@ pub async fn connect(addr: &str, key: Option<&str>, session: String) -> Result<H
 
 impl HttpClient {
     fn url(&self, parts: &[&str]) -> Result<Url> {
+        ensure!(
+            !parts.iter().any(|part| matches!(*part, "." | "..")),
+            "HTTP path segment must not be . or .."
+        );
         let mut url = self.base.clone();
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("invalid HTTP base address"))?

@@ -226,13 +226,13 @@ impl Worker {
     }
     pub fn stop(&mut self, error: Option<String>) {
         let _ = std::fs::remove_file(self._resources.root.join("init.json"));
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(error.map_or(Ok(()), |message| Err(anyhow!(message))));
+        }
         if let Ok(budgets) = self._resources.budgets.lock() {
             for budget in budgets.values() {
                 budget.cancel();
             }
-        }
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(error.map_or(Ok(()), |message| Err(anyhow!(message))));
         }
     }
     pub fn check(&self) -> anyhow::Result<()> {
