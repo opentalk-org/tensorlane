@@ -97,7 +97,7 @@ impl Runtime {
         Ok(budget)
     }
 
-    pub async fn initialize(&self, id: Uuid, session: Uuid) -> Result<InitResponse> {
+    pub async fn initialize(&self, id: Uuid) -> Result<InitResponse> {
         ensure!(!self.shutdown.is_cancelled(), "server is shutting down");
         let record = self.repo.get(id).await?.context("run not found")?;
         ensure!(
@@ -105,34 +105,8 @@ impl Runtime {
             "run is terminal"
         );
         let config = Config::parse(&record.config)?;
-        let existing = self.repo.session(id).await?;
-        if let Some(existing) = &existing {
-            ensure!(
-                existing.session_id == session,
-                "run belongs to another client session"
-            );
-        } else {
-            ensure!(
-                record.status == Some(RunStatus::Queued),
-                "run is already started"
-            );
-        }
-        let started_at = time::OffsetDateTime::now_utc().max(
-            record
-                .status_timestamp
-                .context("run has no status timestamp")?
-                + time::Duration::nanoseconds(1),
-        );
-        let owner = self
-            .create_state(
-                &format!("runs/{id}/session"),
-                &(session, i64::try_from(started_at.unix_timestamp_nanos())?),
-            )
-            .await?;
-        ensure!(owner.0 == session, "run belongs to another client session");
-        self.repo.renew_session(id, session).await?;
         if record.status != Some(RunStatus::Running) {
-            self.repo.start(id, owner.1).await?;
+            self.repo.append_status(id, RunStatus::Running).await?;
         }
         Ok(InitResponse {
             run_id: id.to_string(),
@@ -142,40 +116,17 @@ impl Runtime {
         })
     }
 
-    pub async fn active(&self, id: Uuid, session: Uuid) -> Result<Config> {
+    pub async fn active(&self, id: Uuid) -> Result<Config> {
         let record = self.repo.get(id).await?.context("run not found")?;
         ensure!(
             record.status == Some(RunStatus::Running),
             "run is not running"
         );
-        let owner = self
-            .repo
-            .session(id)
-            .await?
-            .context("run is not initialized")?;
-        ensure!(
-            owner.session_id == session,
-            "run belongs to another client session"
-        );
         Config::parse(&record.config)
     }
 
-    pub async fn heartbeat(&self, id: Uuid, session: Uuid) -> Result<()> {
-        self.active(id, session).await?;
-        self.repo.renew_session(id, session).await
-    }
-
-    pub async fn end(&self, id: Uuid, session: Uuid, failed: bool) -> Result<()> {
+    pub async fn end(&self, id: Uuid, failed: bool) -> Result<()> {
         let record = self.repo.get(id).await?.context("run not found")?;
-        let owner = self
-            .repo
-            .session(id)
-            .await?
-            .context("run is not initialized")?;
-        ensure!(
-            owner.session_id == session,
-            "run belongs to another client session"
-        );
         if matches!(
             record.status,
             Some(RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled)
@@ -192,15 +143,11 @@ impl Runtime {
                 },
             )
             .await?;
-        let (_, started_at): (Uuid, i64) = self
-            .read_state(&format!("runs/{id}/session"))
-            .await?
-            .context("run is not initialized")?;
-        self.repo.append_status(id, status, started_at).await
+        self.repo.append_status(id, status).await
     }
 
-    pub async fn asset(&self, id: Uuid, session: Uuid, name: &str) -> Result<AssetSource> {
-        let config = self.active(id, session).await?;
+    pub async fn asset(&self, id: Uuid, name: &str) -> Result<AssetSource> {
+        let config = self.active(id).await?;
         use sha2::{Digest, Sha256};
         let dir = self.run_dir(id).join("inputs");
         fs::create_dir_all(&dir).await?;

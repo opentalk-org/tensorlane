@@ -1,14 +1,14 @@
 # HTTP training protocol
 
 TensorLane uses finite HTTP requests for initialization, batches, downloads,
-uploads, metrics, heartbeats, and completion. Upgrade the server and Python client
+uploads, metrics, and completion. Upgrade the server and Python client
 together. Existing gRPC clients cannot use this server. Keep their old server
 available until their training runs finish.
 
-A client supplies `x-tensorlane-session: <UUID>` on training requests. Each Python
-daemon starts with a fresh UUID. The first initialization claims ownership atomically in R2 and records it in
-ClickHouse. HTTP retries from that daemon keep the same UUID, including across
-server replacement. Another training execution cannot take over the run.
+Training requests identify the run by its URL and use the configured API key.
+Multiple clients may initialize and access the same running run, including after
+server or client replacement. No client session header or ownership claim is
+required. Clients coordinate their batch sequences and run completion.
 
 Resume by creating a new run with `POST /runs`, adding `resume_from: <old run UUID>`
 to the existing project, name, and configuration fields. Creation selects the
@@ -20,7 +20,7 @@ own batch sequences at zero; this does not restore prior stream positions.
 | Request | Response |
 | --- | --- |
 | `POST /runs/{id}/init` | Run configuration, stream names, input names |
-| `POST /runs/{id}/heartbeat` | 204; records the last heartbeat |
+| `POST /runs/{id}/heartbeat` | Legacy compatibility endpoint: 204 while the run is running; no state is recorded |
 | `POST /runs/{id}/end` with `{"failed": false}` | 204; records completion |
 | `GET /runs/{id}/streams/{name}/batches/{sequence}` | Protobuf batch, 202 while preparing, or 204 at EOF |
 | `GET /runs/{id}/inputs/{name}` | Size, ETag, optional SHA-256, and asset metadata |
@@ -61,7 +61,7 @@ local upload files or intermediate payload objects. A failed request aborts its
 multipart upload; an HTTP retry sends the whole file and can reach any replica.
 Existing final objects are checked against the upload's content and metadata.
 
-Small immutable R2 records hold run ownership, upload fingerprints, checkpoint
+Small immutable R2 records hold completion decisions, upload fingerprints, checkpoint
 lineage, and metric retry receipts. They contain control metadata, never staged
 payload bytes. ClickHouse insert tokens deduplicate metric and artifact retries
 between insertion and receipt publication; the deduplication window must cover
@@ -78,10 +78,10 @@ deadline. A Python `init(timeout=...)` deadline also covers asset downloads and 
 worker startup. A `flush(timeout=...)` deadline includes queue space and automatic metrics.
 A timeout leaves its upload running.
 
-A missed heartbeat or a lost connection does not fail a run. Server startup and
-shutdown leave run status intact. Cached query results can be regenerated. Only explicit run
+A lost connection does not fail a run. Server startup and shutdown leave run
+status intact. Cached query results can be regenerated. Only explicit run
 completion changes a running run to succeeded or failed. Abandoned clients leave
-running records; `run_sessions.updated_at` exposes their last heartbeat.
+running records. Clients do not send heartbeats or store server session IDs.
 
 Server batch-loading admission uses `config.tensorlane.max_load_memory_bytes`
 (default 256 MiB per run per server process), divided into independent stream
@@ -125,9 +125,10 @@ The server accepts SIGTERM, stops admitting new preparations, and allows up to
 grace period of at least 65 seconds. Another replica can serve retried requests
 using the database and R2 records.
 
-The migration `20261004170000` adds run sessions and enables insert deduplication
-for local MergeTree tables. Review and apply it before starting this server.
-This change does not apply migrations automatically.
+The migration `20261004170000` enables insert deduplication for local MergeTree
+tables. The server no longer uses the historical `run_sessions` table; its removal
+has a separate forward migration. Existing migration files remain unchanged.
+This server does not apply migrations automatically.
 
 ## Query parameters
 

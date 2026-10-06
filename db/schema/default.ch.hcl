@@ -77,28 +77,6 @@ table "run_status" {
   }
 }
 
-table "run_sessions" {
-  schema = schema.default
-  engine = sql("ReplacingMergeTree(updated_at)")
-
-  column "run_id" {
-    type = UUID
-  }
-  column "session_id" {
-    type = UUID
-  }
-  column "updated_at" {
-    type = DateTime64(9)
-  }
-
-  primary_key {
-    columns = [column.run_id]
-  }
-  sort {
-    columns = [column.run_id]
-  }
-}
-
 table "metrics" {
   schema = schema.default
   engine = MergeTree

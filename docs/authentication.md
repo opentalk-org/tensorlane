@@ -7,7 +7,7 @@ access to every run, query, asset, and metric.
 
 Application endpoints use `Authorization: Bearer <key>` when a key is configured.
 Missing, invalid, or duplicate authorization headers return HTTP 401. This also
-covers downloads, uploads, metrics, heartbeats, run completion, unknown routes,
+covers downloads, uploads, metrics, legacy heartbeats, run completion, unknown routes,
 and unsupported methods. Keys are compared using constant-time comparison of
 their SHA-256 digests.
 

@@ -96,14 +96,11 @@ pub async fn check(env: &TestEnv) -> Result<()> {
         env.http
             .post(format!("{}/runs/{id}/init", env.url))
             .bearer_auth(super::setup::KEY)
-            .header(
-                tensorlane_protocol::SESSION_HEADER,
-                Uuid::new_v4().to_string()
-            )
+            .header("x-tensorlane-session", Uuid::new_v4().to_string())
             .send()
             .await?
             .status(),
-        StatusCode::CONFLICT
+        StatusCode::OK
     );
     let mut input = config(dataset, 1);
     input["tensorlane"]["assets"] = json!({"model":{"object":"inputs/model"}});

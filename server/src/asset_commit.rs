@@ -6,13 +6,12 @@ use uuid::Uuid;
 pub async fn save(
     engine: &Runtime,
     id: Uuid,
-    session: Uuid,
     metadata: &SaveAssetMetadata,
     hash: &str,
     size: u64,
 ) -> Result<()> {
     let run = metadata.run_id.parse()?;
-    let config = engine.active(run, session).await?;
+    let config = engine.active(run).await?;
     if let Some(existing) = engine.repo.get_asset(id).await? {
         ensure!(
             existing.run_id == run

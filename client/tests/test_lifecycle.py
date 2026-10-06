@@ -27,30 +27,13 @@ class PipelineTests(PipelineCase):
                 self.run_id, ranks=1, rank=0, start_daemon=True, ipc_dir=self.temp.name
             )
 
-    def test_crashed_clients_session_file_cannot_rejoin_the_old_run(self):
-        previous = str(uuid.uuid4())
+    def test_stale_session_file_does_not_prevent_reusing_a_run(self):
         root = _root(self.run_id, self.temp.name)
         root.mkdir()
-        (root / "session").write_text(previous)
-        handle = self.service.handle
-
-        def initialized_run(handler):
-            if (
-                handler.path.endswith("/init")
-                and handler.headers.get("x-tensorlane-session") != previous
-            ):
-                self.service.reply(
-                    handler,
-                    409,
-                    {"message": "run belongs to another client session"},
-                )
-                return
-            handle(handler)
-
-        self.service.handle = initialized_run
-        with self.assertRaisesRegex(RuntimeError, "another client session"):
-            self.start(workers=1, performance_metrics=False)
-        self.assertEqual(self.service.requests["training"], [])
+        (root / "session").write_text(str(uuid.uuid4()))
+        self.start(workers=1, performance_metrics=False)
+        with self.daemon.batches("training") as batches:
+            self.assertEqual(len(list(batches)), self.service.streams["training"])
         self.assertFalse((root / "session").exists())
 
     def test_callback_and_stream_errors_reach_readers(self):
