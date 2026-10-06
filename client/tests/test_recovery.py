@@ -105,6 +105,25 @@ class RecoveryTests(PipelineCase):
         self.assertEqual(self.service.saved[0][2], body)
         self.assertFalse(self.service.drop_upload_reply)
 
+    def test_upload_can_wait_over_thirty_seconds_without_restarting(self):
+        attempts = []
+        save = self.service.save
+
+        def slow_save(handler, upload, spec, body):
+            attempts.append(time.monotonic())
+            if len(attempts) == 1:
+                # Upload/commit work can continue before any response headers exist.
+                time.sleep(32)
+            save(handler, upload, spec, body)
+
+        self.service.save = slow_save
+        self.start(workers=1, performance_metrics=False)
+        body = b"checkpoint bytes"
+        self.daemon.save_asset("model", self.file(content=body))
+        self.daemon.flush(timeout=45)
+        self.assertEqual(len(attempts), 1, "a healthy upload was restarted")
+        self.assertEqual(self.service.saved[0][2], body)
+
     def test_lost_metric_reply_reuses_the_request_id(self):
         self.start(transform_fn=None, workers=1, performance_metrics=False)
         self.service.drop_metric_reply = True
