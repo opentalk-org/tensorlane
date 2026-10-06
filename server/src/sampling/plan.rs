@@ -79,7 +79,6 @@ impl QuerySampler {
             );
             row.sample()?;
             bytes += size as u64 + 4;
-            ensure!(bytes <= 512 * 1024 * 1024, "query plan exceeds 512 MiB");
             encoded.clear();
             row.encode(&mut encoded)?;
             writer.write_u32_le(size as u32).await?;

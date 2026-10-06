@@ -87,8 +87,37 @@ pools. A batch exceeding its stream's share may run alone within that stream;
 its reservation lasts through cache publication. This is an estimated working-set
 target. Query preparation uses independent stream locks. Each server process
 allows two streaming uploads and eight asset range requests at once. Upload queues
-have bounded capacity. Batches are limited to 64 MiB and query snapshots to
-512 MiB. Uploads are limited to 16 GiB.
+have bounded capacity. Batches are limited to 64 MiB. Query plans stream to disk
+without a fixed size or batch-count cap; the cache filesystem must have enough
+space for the plan. Uploads are limited to 16 GiB.
+
+Other fixed limits that can affect training:
+
+| Limit | Effect |
+| --- | --- |
+| 64 MiB per encoded batch | Enforced for descriptors, blob payloads, HTTP responses and client IPC frames. Changing it requires updating both server and client. |
+| 65,536 samples per batch | Rejects a batch even if its descriptors and payload fit the byte limit. It does not limit the total number of batches. |
+| 16 GiB per uploaded file | An application limit checked before streaming to S3, independent of the available memory or storage. |
+| 300 seconds per ClickHouse query | The server sends `max_execution_time=300`, so a longer query can fail even while producing results. |
+| 120 seconds per database read/write wait | Includes waiting for the first query row or the next row; this is separate from total query execution time. |
+| 30 seconds until S3 response headers | The SDK read timeout covers the request until headers arrive, including time spent sending an upload part. S3 operations also have a 120-second attempt timeout and a 600-second total timeout including retries. |
+| 30 seconds for incoming upload chunks | A pause in the HTTP request body aborts that attempt. Time spent awaiting an S3 part write is outside this chunk timer. |
+| 1,000 metrics per request | The built-in client flushes scalar metrics every 500 records; the count does not limit total training steps or total metrics. |
+| 4 MiB for upload specifications and ordinary runtime request bodies | Upload file bodies are exempt. Asset downloads also use 4 MiB range requests, without a total download-size limit. |
+| 2 MiB for run creation bodies | The management router inherits Axum's default JSON body limit. A large run configuration can be rejected before it reaches ClickHouse. |
+| 1 MiB for asset metadata responses; 8 MiB for JSON control responses | Client response limits. Large metadata can be accepted in an upload specification and then rejected on download. |
+| 64 concurrent application HTTP requests, two uploads and eight asset ranges per server | Controls concurrent work rather than the total number of requests. Waiting for an upload slot consumes the client's recovery deadline. |
+
+The default 600-second client recovery deadline can be changed with
+`TENSORLANE_RETRY_TIMEOUT_SECONDS`; zero disables it. That setting does not change
+server, S3 or reverse-proxy timeouts. `lane.batches(timeout=120)` bounds only the
+local collator connection and handshake; iteration has no per-step timeout.
+`init()` and `flush()` have no Python deadline unless the caller supplies one.
+
+`CACHE_BYTES` is a configurable cache target rather than a plan-size limit, but a
+plan larger than that target can be evicted and repeatedly rebuilt. The server's
+batch-loading and client's prefetch memory targets are also configurable and
+allow a single oversized batch to proceed alone. None limits the total step count.
 
 CPU tensor storage is shared between Python transform workers, the collate worker,
 and readers. IPC still serializes Python metadata and tensor storage handles.

@@ -58,7 +58,7 @@ impl Runtime {
             self.tasks.spawn(async move {
                 let _lock = lock;
                 let result = async {
-                    crate::cache_limits::space(&engine.cache, 512*1024*1024).await?;
+                    crate::cache_limits::space(&engine.cache, 0).await?;
                     let _ = fs::remove_file(path.with_extension("part")).await;
                     let rows = stream_samples(&engine.database, &query.sql, &query.params);
                     let mut sampler = QuerySampler::create(&name, rows, &path, query.repeat).await?;
