@@ -86,9 +86,7 @@ pub async fn serve(
     shutdown: CancellationToken,
     runtime: crate::runtime::Runtime,
 ) -> anyhow::Result<()> {
-    let app = router(runtime.repo.clone(), auth.clone())
-        .merge(runtime::router(runtime, auth))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(64));
+    let app = app(runtime, auth);
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, "HTTP server listening");
@@ -96,6 +94,14 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
     Ok(())
+}
+
+fn app(runtime: crate::runtime::Runtime, auth: crate::auth::Auth) -> Router {
+    let probes = crate::health::router(runtime.clone());
+    router(runtime.repo.clone(), auth.clone())
+        .merge(runtime::router(runtime, auth))
+        .layer(tower::limit::ConcurrencyLimitLayer::new(64))
+        .merge(probes)
 }
 
 fn router(run_repo: RunRepo, auth: crate::auth::Auth) -> Router {
@@ -243,6 +249,57 @@ mod tests {
     use tower::ServiceExt;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+    #[tokio::test]
+    async fn probes_are_public_while_application_routes_remain_protected() -> anyhow::Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let s3 = aws_sdk_s3::Client::from_conf(
+            aws_sdk_s3::config::Builder::new()
+                .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+                .region(aws_sdk_s3::config::Region::new("test"))
+                .endpoint_url("http://127.0.0.1:9")
+                .credentials_provider(aws_sdk_s3::config::Credentials::new(
+                    "test", "test", None, None, "test",
+                ))
+                .build(),
+        );
+        let cache = tempfile::tempdir()?;
+        let shutdown = CancellationToken::new();
+        let runtime = crate::runtime::Runtime::new(
+            clickhouse::Client::default().with_url("http://127.0.0.1:9"),
+            s3,
+            "test",
+            cache.path().to_owned(),
+            shutdown.clone(),
+            "checkpoints",
+            "metrics",
+        )?;
+        let app = app(runtime, crate::auth::Auth::new(Some(KEY))?);
+        for (path, expected) in [
+            ("/healthz", StatusCode::OK),
+            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+            ("/runs", StatusCode::UNAUTHORIZED),
+            ("/unknown", StatusCode::UNAUTHORIZED),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        shutdown.cancel();
+        for (path, expected) in [
+            ("/healthz", StatusCode::OK),
+            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), expected, "{path}");
+        }
+        Ok(())
+    }
 
     #[tokio::test]
     async fn anonymous_http_is_allowed_without_a_configured_key() {

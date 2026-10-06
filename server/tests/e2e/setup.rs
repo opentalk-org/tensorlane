@@ -171,7 +171,8 @@ impl TestEnv {
     pub async fn ready_at(&self, url: &str) -> Result<()> {
         eventually("server", || async {
             Ok(self
-                .request_at(url, Method::GET, "/runs")
+                .http
+                .get(format!("{url}/readyz"))
                 .send()
                 .await
                 .ok()
