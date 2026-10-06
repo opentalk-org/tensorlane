@@ -64,7 +64,6 @@ pub async fn connect(addr: &str, key: Option<&str>) -> Result<HttpClient> {
         client: reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         base,
@@ -199,7 +198,12 @@ impl HttpClient {
                 request = request.header(*name, value);
             }
             let result: Result<_> = async {
-                let response = request.send().await?;
+                // Reqwest's read timeout also covers sending the request body.
+                let response = if matches!(&body, Some(RequestBody::Upload(..))) {
+                    request.send().await?
+                } else {
+                    tokio::time::timeout(Duration::from_secs(30), request.send()).await??
+                };
                 let status = response.status();
                 let headers = response.headers().clone();
                 let capacity = response.content_length().unwrap_or(0).min(limit as u64) as usize;
@@ -224,7 +228,9 @@ impl HttpClient {
                 let receive = async {
                     let mut stream = response.bytes_stream();
                     let mut bytes = Vec::with_capacity(capacity);
-                    while let Some(chunk) = stream.next().await {
+                    while let Some(chunk) =
+                        tokio::time::timeout(Duration::from_secs(30), stream.next()).await?
+                    {
                         let chunk = chunk?;
                         ensure!(
                             bytes

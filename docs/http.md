@@ -68,10 +68,12 @@ the client's recovery period.
 Requests retry network failures, incomplete bodies, 202, 408, 429, and server
 errors. Backoff includes jitter. The default recovery deadline is 600 seconds per
 request; `TENSORLANE_RETRY_TIMEOUT_SECONDS=0` waits indefinitely. Each attempt has
-a 10-second connect timeout and a 30-second read idle timeout. Ordinary requests
-have a 120-second attempt limit; streaming uploads can use the remaining recovery
-deadline. A Python `init(timeout=...)` deadline also covers asset downloads and local
-worker startup. A `flush(timeout=...)` deadline includes queue space and automatic metrics.
+a 10-second connect timeout and a 30-second response-body idle timeout. Ordinary
+requests also allow 30 seconds for response headers and have a 120-second attempt
+limit. Streaming uploads allow the remaining recovery deadline for sending the
+file and waiting for response headers. A Python `init(timeout=...)` deadline also
+covers asset downloads and local worker startup. A `flush(timeout=...)` deadline
+includes queue space and automatic metrics.
 A timeout leaves its upload running.
 
 A lost connection does not fail a run. Server startup and shutdown leave run
