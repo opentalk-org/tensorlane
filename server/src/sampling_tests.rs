@@ -119,6 +119,32 @@ async fn persisted_plan_can_be_reopened_and_replayed_by_sequence() {
 }
 
 #[tokio::test]
+#[ignore = "writes and replays a plan exceeding 512 MiB with 100000 batches"]
+async fn hundred_thousand_batches_can_exceed_512_mib() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("plan");
+    let metadata = serde_json::json!({"text": "x".repeat(6000)}).to_string();
+    let rows = stream::iter((0..100_000).map(|sequence| {
+        let mut sample = row(sequence, 0, &sequence.to_string());
+        sample.metadata_json = metadata.clone();
+        Ok(sample)
+    }));
+    let mut plan = QuerySampler::create("training", rows, &path, false).await?;
+    assert!(std::fs::metadata(&path)?.len() > 512 * 1024 * 1024);
+    plan.persist();
+    drop(plan);
+    let mut plan = QuerySampler::open(&path, false).await?;
+    for sequence in 0..100_000 {
+        let batch = plan.batch_at(sequence).await?.unwrap();
+        assert_eq!(batch.query_batch_idx, sequence);
+        assert_eq!(batch.samples.len(), 1);
+        assert_eq!(batch.samples[0].sample_id, sequence.to_string());
+    }
+    assert!(plan.batch_at(100_000).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn query_errors_and_cancellation_remove_partial_plans() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plan");
