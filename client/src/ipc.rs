@@ -9,7 +9,8 @@ use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
 fn codec() -> LengthDelimitedCodec {
     LengthDelimitedCodec::builder()
-        .max_frame_length(crate::MAX_BATCH_BYTES)
+        .length_field_length(8)
+        .max_frame_length(usize::MAX)
         .new_codec()
 }
 
@@ -28,12 +29,8 @@ impl<T: Serialize, Socket: AsyncWrite + Unpin> Sender<T, Socket> {
 
     pub async fn send(&mut self, value: &T) -> Result<()> {
         let bytes = postcard::to_allocvec(value)?;
-        ensure!(
-            bytes.len() <= crate::MAX_BATCH_BYTES,
-            "IPC message exceeds its size limit"
-        );
         self.socket
-            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .write_all(&u64::try_from(bytes.len())?.to_be_bytes())
             .await?;
         self.socket.write_all(&bytes).await?;
         self.socket.flush().await?;
@@ -159,7 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_frames_are_errors() -> Result<()> {
-        for bytes in [vec![0, 0], vec![0, 0, 0, 3, 1]] {
+        for bytes in [vec![0, 0], vec![0, 0, 0, 0, 0, 0, 0, 3, 1]] {
             let (mut sender, receiver) = UnixStream::pair()?;
             sender.write_all(&bytes).await?;
             drop(sender);
@@ -180,26 +177,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_header_is_rejected() -> Result<()> {
-        let (mut sender, receiver) = UnixStream::pair()?;
-        sender
-            .write_all(&((crate::MAX_BATCH_BYTES + 1) as u32).to_be_bytes())
-            .await?;
-        assert!(Receiver::<Vec<u8>>::new(receiver).recv().await.is_err());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn oversized_message_is_rejected_before_writing() -> Result<()> {
-        let (socket, receiver) = UnixStream::pair()?;
-        let mut sender = Sender::new(socket);
-        let bytes = bytes::Bytes::from(vec![0; crate::MAX_BATCH_BYTES + 1]);
-        assert!(sender.send(&bytes).await.is_err());
-        assert!(
-            timeout(Duration::from_millis(50), receiver.readable())
+    async fn messages_larger_than_sixty_four_mib_are_delivered() -> Result<()> {
+        let (sender, receiver) = UnixStream::pair()?;
+        let size = 65 * 1024 * 1024;
+        let producer = tokio::spawn(async move {
+            Sender::new(sender)
+                .send(&bytes::Bytes::from(vec![23; size]))
                 .await
-                .is_err()
-        );
+        });
+        let bytes = Receiver::<bytes::Bytes>::new(receiver)
+            .recv()
+            .await?
+            .unwrap();
+        producer.await??;
+        assert_eq!(bytes.len(), size);
+        assert!(bytes.iter().all(|byte| *byte == 23));
         Ok(())
     }
 

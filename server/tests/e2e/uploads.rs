@@ -100,6 +100,30 @@ async fn check_replicas(env: &mut TestEnv, replica: &str) -> Result<()> {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1]["id"], second.to_string());
     assert_eq!(rows[1]["ancestor_asset_id"], first.to_string());
+    let response = env
+        .request(Method::GET, &format!("/runs/{id}/inputs/{second}/bytes"))
+        .header("Range", format!("bytes=0-{}", body.len() - 1))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert_eq!(response.bytes().await?, body);
+    let large = Uuid::new_v4();
+    let large_spec = json!({"size":16u64 * 1024 * 1024 * 1024 + 1,"sha256":hex::encode(Sha256::digest(b"")),"metadata":{"kind":"asset","metadata":{"run_id":id,"asset_id":large,"name":"model","step":99,"kind":"checkpoint","asset_type":"test-model","metadata_json":"{}","content_type":"application/octet-stream"}}});
+    let response = env
+        .request_at(replica, Method::PUT, &format!("/uploads/{large}"))
+        .multipart(
+            Form::new()
+                .text("spec", large_spec.to_string())
+                .part("file", Part::bytes(Vec::new()).file_name("model")),
+        )
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    // The declaration is accepted; the intentionally empty body fails integrity validation.
+    assert_eq!(
+        response.json::<serde_json::Value>().await?["message"],
+        "upload has unexpected size"
+    );
     let incomplete = Uuid::new_v4();
     let spec = json!({"size":1,"sha256":hex::encode(Sha256::digest(b"u")),"metadata":{"kind":"asset","metadata":{"run_id":id,"asset_id":incomplete,"name":"model","step":99,"kind":"checkpoint","asset_type":"test-model","metadata_json":"{}","content_type":"application/octet-stream"}}});
     assert_eq!(
@@ -151,7 +175,7 @@ async fn check_replicas(env: &mut TestEnv, replica: &str) -> Result<()> {
             .status(),
         StatusCode::BAD_REQUEST
     );
-    for failed in [incomplete, bad_hash] {
+    for failed in [incomplete, bad_hash, large] {
         assert_eq!(
             env.database
                 .query("SELECT count() FROM assets WHERE id=?")
@@ -226,6 +250,27 @@ async fn check_replicas(env: &mut TestEnv, replica: &str) -> Result<()> {
     assert_eq!(
         hex::encode(Sha256::digest(&object)),
         hex::encode(Sha256::digest(&body))
+    );
+    let bulk_run = env.create_run(config(Uuid::new_v4(), 0)).await?;
+    env.init(&bulk_run).await?;
+    let scalars: Vec<_> = (0..1001)
+        .map(|step| json!({"step":step,"timestamp_unix_ms":1700000000123i64,"name":"bulk","value":0.5}))
+        .collect();
+    env.request(
+        Method::PUT,
+        &format!("/runs/{bulk_run}/metrics/{}", Uuid::new_v4()),
+    )
+    .json(&json!({"scalars": scalars, "arrays": []}))
+    .send()
+    .await?
+    .error_for_status()?;
+    assert_eq!(
+        env.database
+            .query("SELECT count() FROM metrics WHERE run_id=toUUID(?)")
+            .bind(&bulk_run)
+            .fetch_one::<u64>()
+            .await?,
+        1001
     );
     Ok(())
 }

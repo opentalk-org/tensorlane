@@ -9,6 +9,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
         return Ok(());
     };
     let mut settings = config(env.seed(4).await?, 4);
+    settings["app"]["padding"] = json!("x".repeat(9 * 1024 * 1024));
     settings["tensorlane"]["assets"] = json!({"model":{"object":"training/initial"}});
     env.put_object("training/initial", Bytes::from_static(b"initial weights"))
         .await?;

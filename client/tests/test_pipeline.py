@@ -26,6 +26,18 @@ def read_rank(run_id, rank, root, output, stream="training"):
 
 
 class PipelineTests(PipelineCase):
+    def test_batches_larger_than_sixty_four_mib_cross_http_and_worker_ipc(self):
+        self.service.streams = {"training": 1}
+        self.service.blob_size = 65 * 1024 * 1024
+        self.service.config["tensorlane"]["max_prefetch_memory_bytes"] = 8 * 1024 * 1024
+        self.start(factor=1, workers=1, transform_fn=None, performance_metrics=False)
+        with self.daemon.batches("training") as reader:
+            batch = next(reader)
+            self.assertEqual(len(batch.samples), 1)
+            for sample in batch.samples:
+                self.assertEqual(len(sample.blobs["payload"]), self.service.blob_size)
+            self.assertEqual(list(reader), [])
+
     def test_two_runs_share_batches_without_changing_process_authentication(self):
         key = multiprocessing.current_process().authkey
         self.service.blob_size = 1024 * 1024

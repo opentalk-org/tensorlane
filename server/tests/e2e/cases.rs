@@ -33,7 +33,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
     assert_eq!(initialized.run_id, id);
     assert_eq!(env.init(&id).await?.streams, vec!["training", "validation"]);
     assert_eq!(env.status(&id).await?, "running");
-    assert!(!env.cache.join("runs").join(&id).join("plans").exists());
+    assert!(!env.cache.join("runs").join(&id).join("plans-v2").exists());
     for sequence in [2, 0, 2, 3, 1] {
         let batch = env.batch(&id, "training", sequence).await?.unwrap();
         assert_eq!(batch.batch_id, sequence);
@@ -51,7 +51,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
     );
     let large_dataset = env.seed(1).await?;
     let object = format!("datasets/{large_dataset}");
-    env.put_object(&object, Bytes::from(vec![31; 16 * 1024 * 1024]))
+    env.put_object(&object, Bytes::from(vec![31; 65 * 1024 * 1024]))
         .await?;
     let large_run = env.create_run(config(large_dataset, 1)).await?;
     env.init(&large_run).await?;
@@ -65,7 +65,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
         .await?
         .error_for_status()?;
     let length = response.content_length().unwrap();
-    let plans = env.cache.join("runs").join(&large_run).join("plans");
+    let plans = env.cache.join("runs").join(&large_run).join("plans-v2");
     let generation = tokio::fs::read(plans.join("0.ready")).await?;
     tokio::fs::remove_file(
         env.cache

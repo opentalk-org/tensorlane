@@ -31,10 +31,6 @@ struct ArrayRecord {
 
 pub async fn save(engine: &Runtime, run: Uuid, request: Uuid, batch: MetricBatch) -> Result<()> {
     ensure!(!request.is_nil(), "metric request ID must not be nil");
-    ensure!(
-        batch.scalars.len() + batch.arrays.len() <= 1000,
-        "metric requests must not exceed 1000 metrics"
-    );
     for metric in &batch.scalars {
         ensure!(
             !metric.name.is_empty() && metric.value.is_finite(),
