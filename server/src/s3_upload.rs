@@ -20,6 +20,7 @@ pub async fn upload(
     fingerprint: &str,
     multipart: &mut Multipart,
 ) -> Result<()> {
+    let part_bytes = PART_BYTES.max(usize::try_from(spec.size.div_ceil(10_000))?);
     let exists = existing(client, bucket, key, spec, fingerprint).await?;
     let upload_id = if !exists && spec.size > 0 {
         Some(
@@ -49,7 +50,7 @@ pub async fn upload(
         let mut size = 0u64;
         let mut parts = Vec::new();
         let mut buffer = if upload_id.is_some() {
-            Vec::with_capacity(PART_BYTES)
+            Vec::with_capacity(part_bytes)
         } else {
             Vec::new()
         };
@@ -64,10 +65,10 @@ pub async fn upload(
             if let Some(upload_id) = &upload_id {
                 let mut remaining = chunk.as_ref();
                 while !remaining.is_empty() {
-                    let count = remaining.len().min(PART_BYTES - buffer.len());
+                    let count = remaining.len().min(part_bytes - buffer.len());
                     buffer.extend_from_slice(&remaining[..count]);
                     remaining = &remaining[count..];
-                    if buffer.len() == PART_BYTES {
+                    if buffer.len() == part_bytes {
                         parts.push(
                             part(
                                 client,
@@ -79,7 +80,7 @@ pub async fn upload(
                             )
                             .await?,
                         );
-                        buffer = Vec::with_capacity(PART_BYTES);
+                        buffer = Vec::with_capacity(part_bytes);
                     }
                 }
             }

@@ -19,7 +19,7 @@ Resume with `tensorlane.init()` using the same run ID. Initialization selects th
 | `POST /runs/{id}/end` with `{"failed": false}` | 204; records completion |
 | `GET /runs/{id}/streams/{name}/batches/{sequence}` | Protobuf batch, 202 while preparing, or 204 at EOF |
 | `GET /runs/{id}/inputs/{name}` | Size, ETag, optional SHA-256, and asset metadata |
-| `GET /runs/{id}/inputs/{name}/bytes` | 206 for an explicit byte range of at most 4 MiB |
+| `GET /runs/{id}/inputs/{name}/bytes` | 206 for an explicit byte range |
 | `PUT /runs/{id}/metrics/{request_id}` | 204; repeated IDs are deduplicated |
 | `PUT /uploads/{id}` | Streams multipart `spec` JSON followed by `file` directly into the final R2 object; 200 after publication |
 
@@ -35,7 +35,7 @@ creates a missing query plan; partially removed plans are rebuilt automatically.
 Each rebuilt plan has a separate batch cache, so it cannot serve an older plan's
 payloads. Requerying uses the run's original SQL and parameters. Deterministic SQL,
 the same seed, and stable source data are required to reproduce the same samples
-after a plan is evicted.
+after cache loss.
 
 Each stream fetches up to `ranks * prefetch_factor` batches concurrently.
 The same prefetch credits cover outstanding requests and completed batches, so
@@ -50,8 +50,9 @@ retried individually. Clients pin the ETag, validate each range, and verify the
 final SHA-256 when the registered asset supplies one. Input object keys must be
 immutable during a run. Asset IDs point to immutable saved objects.
 
-Uploads stream through a bounded 16 MiB buffer into standard S3 multipart parts
-on the final object key. The server validates length and SHA-256 before completing
+Uploads stream into standard S3 multipart parts on the final object key. Parts
+start at 16 MiB and grow for large files to fit the storage provider's 10,000-part
+maximum. The server buffers one part at a time. The server validates length and SHA-256 before completing
 the object, then publishes its asset or artifact row in ClickHouse. There are no
 local upload files or intermediate payload objects. A failed request aborts its
 multipart upload; an HTTP retry sends the whole file and can reach any replica.
@@ -87,26 +88,21 @@ pools. A batch exceeding its stream's share may run alone within that stream;
 its reservation lasts through cache publication. This is an estimated working-set
 target. Query preparation uses independent stream locks. Each server process
 allows two streaming uploads and eight asset range requests at once. Upload queues
-have bounded capacity. Batches are limited to 64 MiB. Query plans stream to disk
-without a fixed size or batch-count cap; the cache filesystem must have enough
-space for the plan. Uploads are limited to 16 GiB.
+have bounded capacity. There are no application byte or item-count caps on query
+plans, batches, samples, blobs, uploads, metadata, JSON request/response bodies,
+asset ranges, metrics, or IPC messages. Query plans stream to disk; the filesystem
+must have enough space. Client asset downloads still use 4 MiB chunks, which do
+not limit the total size. Storage-provider limits and available disk/RAM apply.
 
-Other fixed limits that can affect training:
+Remaining timeout and concurrency policies:
 
-| Limit | Effect |
+| Policy | Effect |
 | --- | --- |
-| 64 MiB per encoded batch | Enforced for descriptors, blob payloads, HTTP responses and client IPC frames. Changing it requires updating both server and client. |
-| 65,536 samples per batch | Rejects a batch even if its descriptors and payload fit the byte limit. It does not limit the total number of batches. |
-| 16 GiB per uploaded file | An application limit checked before streaming to S3, independent of the available memory or storage. |
-| 300 seconds per ClickHouse query | The server sends `max_execution_time=300`, so a longer query can fail even while producing results. |
-| 120 seconds per database read/write wait | Includes waiting for the first query row or the next row; this is separate from total query execution time. |
-| 30 seconds until S3 response headers | The SDK read timeout covers the request until headers arrive, including time spent sending an upload part. S3 operations also have a 120-second attempt timeout and a 600-second total timeout including retries. |
+| 300 seconds per ClickHouse query | The server sends `max_execution_time=300`. |
+| 120 seconds per database read/write wait | Includes waiting for the first query row or the next row. |
+| 30 seconds until S3 response headers | The SDK read timeout includes sending an upload part. S3 operations also have a 120-second attempt timeout and a 600-second total timeout including retries. |
 | 30 seconds for incoming upload chunks | A pause in the HTTP request body aborts that attempt. Time spent awaiting an S3 part write is outside this chunk timer. |
-| 1,000 metrics per request | The built-in client flushes scalar metrics every 500 records; the count does not limit total training steps or total metrics. |
-| 4 MiB for upload specifications and ordinary runtime request bodies | Upload file bodies are exempt. Asset downloads also use 4 MiB range requests, without a total download-size limit. |
-| 2 MiB for run creation bodies | The management router inherits Axum's default JSON body limit. A large run configuration can be rejected before it reaches ClickHouse. |
-| 1 MiB for asset metadata responses; 8 MiB for JSON control responses | Client response limits. Large metadata can be accepted in an upload specification and then rejected on download. |
-| 64 concurrent application HTTP requests, two uploads and eight asset ranges per server | Controls concurrent work rather than the total number of requests. Waiting for an upload slot consumes the client's recovery deadline. |
+| 64 concurrent application HTTP requests, two uploads and eight asset ranges per server | Controls concurrent work. Waiting for an upload slot consumes the client's recovery deadline. |
 
 The default 600-second client recovery deadline can be changed with
 `TENSORLANE_RETRY_TIMEOUT_SECONDS`; zero disables it. That setting does not change
@@ -114,10 +110,15 @@ server, S3 or reverse-proxy timeouts. `lane.batches(timeout=120)` bounds only th
 local collator connection and handshake; iteration has no per-step timeout.
 `init()` and `flush()` have no Python deadline unless the caller supplies one.
 
-`CACHE_BYTES` is a configurable cache target rather than a plan-size limit, but a
-plan larger than that target can be evicted and repeatedly rebuilt. The server's
-batch-loading and client's prefetch memory targets are also configurable and
+`CACHE_BYTES` controls reusable batch and asset-range cache files; query plans
+are excluded so large plans are not repeatedly evicted and rebuilt. Server
+batch-loading and client prefetch memory targets control concurrent work and
 allow a single oversized batch to proceed alone. None limits the total step count.
+
+Native IPC messages and on-disk query-plan records use 64-bit length prefixes.
+Update the Python client and restart its daemon when upgrading; old four-byte
+IPC peers are incompatible. The server uses a new `plans-v2` cache directory,
+so old disposable query plans are rebuilt rather than read with the new format.
 
 CPU tensor storage is shared between Python transform workers, the collate worker,
 and readers. IPC still serializes Python metadata and tensor storage handles.
@@ -128,7 +129,7 @@ Collation may allocate a new batch tensor before its storage is shared.
 `GET /healthz` returns HTTP 200 while the HTTP server is responsive. It does not
 check external dependencies. `GET /readyz` returns HTTP 200 only when ClickHouse
 answers `SELECT 1`, the configured S3 bucket accepts HEAD, and the cache directory
-is writable with at least 512 MiB of free filesystem space. These checks run
+is writable. These checks run
 concurrently with a two-second total deadline. Failures, timeouts, and shutdown
 return HTTP 503. Both endpoints are unauthenticated and bypass the application's
 request concurrency limit. Use `/healthz` for startup and liveness probes and
@@ -139,11 +140,11 @@ Replicas share ClickHouse and R2. Each replica has an independent disposable
 coordinate preparation and eviction only within that replica. Cache loss causes
 automatic query preparation and input downloads on the next request.
 
-`CACHE_BYTES` defaults to 15 GiB and limits query plans, reusable batches, and asset
-range files. Cleanup runs every minute and removes a query plan's index and ready
-marker with it, under the same local lock used by batch readers and preparation.
-Writes reserve at least 512 MiB of free space; insufficient space returns an error
-so the client can retry. R2 control records are outside the disposable cache.
+`CACHE_BYTES` defaults to 15 GiB and controls reusable batch and asset-range
+files. Cleanup runs every minute under local locks; query plans and their index
+and ready markers remain until cache loss. Writes check available filesystem
+space without reserving an extra fixed margin; insufficient space returns an
+error so the client can retry. R2 control records are outside the disposable cache.
 Configure the bucket to expire abandoned multipart uploads after hard process
 termination.
 

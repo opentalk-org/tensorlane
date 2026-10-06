@@ -15,7 +15,6 @@ use crate::{
     runtime::{AssetSource, Runtime},
     shared_cache::{Lock, TemporaryFile},
 };
-use tensorlane_protocol::TRANSFER_CHUNK_BYTES;
 
 pub async fn download(engine: Runtime, source: AssetSource, range: (u64, u64)) -> Result<Response> {
     let permit = engine
@@ -99,10 +98,6 @@ pub fn parse_range(range: &str, size: u64) -> Result<(u64, u64)> {
         start <= end && end < size,
         "asset range is outside the object"
     );
-    ensure!(
-        end - start < TRANSFER_CHUNK_BYTES as u64,
-        "asset ranges must not exceed 4 MiB"
-    );
     Ok((start, end))
 }
 
@@ -122,6 +117,9 @@ mod tests {
         ] {
             assert!(parse_range(range, 4).is_err());
         }
-        assert!(parse_range("bytes=0-4194304", 4194305).is_err());
+        assert_eq!(
+            parse_range("bytes=0-4194304", 4194305).unwrap(),
+            (0, 4194304)
+        );
     }
 }

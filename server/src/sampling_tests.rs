@@ -168,7 +168,7 @@ async fn query_errors_and_cancellation_remove_partial_plans() {
 }
 
 #[tokio::test]
-async fn truncated_plan_fails_and_large_batches_are_rejected() {
+async fn truncated_plan_fails_and_large_batches_are_allowed() {
     let (dir, mut plan) = sampler(vec![row(0, 0, "a")], false).await.unwrap();
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -184,13 +184,12 @@ async fn truncated_plan_fails_and_large_batches_are_rejected() {
             .contains("truncated")
     );
     let rows = stream::iter((0..65_537).map(|i| Ok(row(0, i, "a"))));
-    assert!(
-        QuerySampler::create("training", rows, &dir.path().join("large"), false)
-            .await
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("65536")
+    let mut large = QuerySampler::create("training", rows, &dir.path().join("large"), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        large.batch_at(0).await.unwrap().unwrap().samples.len(),
+        65_537
     );
     assert!(!dir.path().join("large.part").exists());
 }

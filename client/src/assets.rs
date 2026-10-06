@@ -49,13 +49,7 @@ async fn download(
     destination: PathBuf,
 ) -> anyhow::Result<(PathBuf, String)> {
     let (_, _, bytes) = http
-        .request(
-            Method::GET,
-            &["runs", run_id, "inputs", name],
-            None,
-            &[],
-            1024 * 1024,
-        )
+        .request(Method::GET, &["runs", run_id, "inputs", name], None, &[])
         .await?;
     let info: AssetDownload = serde_json::from_slice(&bytes)?;
     let entrypoint = info.metadata.entrypoint.clone();
@@ -85,7 +79,6 @@ async fn download(
                     ("range", format!("bytes={offset}-{end}")),
                     ("if-match", info.etag.clone()),
                 ],
-                TRANSFER_CHUNK_BYTES,
             )
             .await?;
         ensure!(

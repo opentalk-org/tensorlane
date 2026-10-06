@@ -1,4 +1,4 @@
-use crate::{MAX_BATCH_BYTES, sampling::BlobRef};
+use crate::sampling::BlobRef;
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
 use aws_sdk_s3::Client;
@@ -100,11 +100,7 @@ impl Loader for S3Loader {
                 u64::try_from(head.content_length().context("blob has no size")?)?
             }
         };
-        ensure!(
-            size <= MAX_BATCH_BYTES as u64,
-            "blob exceeds the 64 MiB batch limit"
-        );
-        Ok(size as usize)
+        Ok(usize::try_from(size)?)
     }
 
     async fn load(&self, reference: &BlobRef, size: usize) -> Result<Vec<u8>> {

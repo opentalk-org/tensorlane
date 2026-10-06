@@ -1,13 +1,13 @@
 use anyhow::{Result, ensure};
 use axum::extract::Multipart;
 use sha2::{Digest, Sha256};
-use tensorlane_protocol::{TRANSFER_CHUNK_BYTES, UploadMetadata, UploadSpec, UploadStatus};
+use tensorlane_protocol::{UploadMetadata, UploadSpec, UploadStatus};
 use uuid::Uuid;
 
 use crate::runtime::Runtime;
 
 pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Result<UploadStatus> {
-    let mut field = multipart
+    let field = multipart
         .next_field()
         .await?
         .ok_or_else(|| anyhow::anyhow!("upload must start with its spec"))?;
@@ -15,21 +15,9 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
         field.name() == Some("spec"),
         "upload must start with its spec"
     );
-    let mut bytes = Vec::new();
-    while let Some(chunk) = field.chunk().await? {
-        ensure!(
-            bytes.len() + chunk.len() <= TRANSFER_CHUNK_BYTES,
-            "upload spec exceeds 4 MiB"
-        );
-        bytes.extend_from_slice(&chunk);
-    }
-    drop(field);
+    let bytes = field.bytes().await?;
     let mut spec: UploadSpec = serde_json::from_slice(&bytes)?;
     ensure!(!id.is_nil(), "upload ID must not be nil");
-    ensure!(
-        spec.size <= 16 * 1024 * 1024 * 1024,
-        "upload exceeds 16 GiB"
-    );
     ensure!(
         spec.sha256.len() == 64 && spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
         "invalid upload SHA256"

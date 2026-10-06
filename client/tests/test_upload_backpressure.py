@@ -25,10 +25,10 @@ class UploadBackpressureTests(unittest.TestCase):
                 connection.settimeout(10)
                 with connection, connection.makefile("rb") as reader:
                     gate.wait()
-                    while header := reader.read(4):
-                        payload = reader.read(struct.unpack("!I", header)[0])
+                    while header := reader.read(8):
+                        payload = reader.read(struct.unpack("!Q", header)[0])
                         if payload == b"\x04":
-                            connection.sendall(b"\x00\x00\x00\x01\x00")
+                            connection.sendall(b"\x00\x00\x00\x00\x00\x00\x00\x01\x00")
                         else:
                             received.append(payload)
 

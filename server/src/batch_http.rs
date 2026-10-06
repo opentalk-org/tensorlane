@@ -1,5 +1,4 @@
 use crate::{
-    MAX_BATCH_BYTES,
     db::stream_samples,
     loader::{Loader, load_blobs},
     runtime::{Batch, LOAD_MEMORY_UNIT, Runtime},
@@ -27,7 +26,7 @@ impl Runtime {
             .enumerate()
             .find(|(_, (key, _))| key.as_str() == name)
             .context("unknown stream")?;
-        let dir = self.run_dir(id).join("plans");
+        let dir = self.run_dir(id).join("plans-v2");
         fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{index}.plan"));
         let ready = path.with_extension("ready");
@@ -143,23 +142,17 @@ async fn load_batch(
         anyhow::Ok((sample, sizes))
     }))
     .await?;
-    let mut payload_bytes = 0usize;
     let mut encoded_bound = response.encoded_len() + 64;
     let mut overhead = 0usize;
     for (sample, sizes) in &prepared {
         encoded_bound += sample.sample_id.len() + sample.metadata_json.len() + 32;
         overhead += 256;
         for ((name, blob), size) in sample.blobs.iter().zip(sizes) {
-            payload_bytes += size;
             encoded_bound += name.len() + size + 32;
             // Descriptor/future storage and an allowance for each active S3 stream.
             overhead += blob.object.len() + name.len() + 64 * 1024;
         }
     }
-    ensure!(
-        payload_bytes <= MAX_BATCH_BYTES,
-        "encoded batch exceeds 64 MiB"
-    );
     let required = encoded_bound
         .checked_mul(2)
         .and_then(|size| size.checked_add(overhead))
@@ -168,7 +161,6 @@ async fn load_batch(
     let waiting = std::time::Instant::now();
     let permit = memory.acquire_many_owned(count).await?;
     response.server_wait_seconds = waiting.elapsed().as_secs_f64();
-    let mut encoded_bytes = response.encoded_len();
     let references = prepared
         .iter()
         .flat_map(|(sample, sizes)| sample.blobs.values().cloned().zip(sizes.iter().copied()))
@@ -184,11 +176,6 @@ async fn load_batch(
                 .map(|name| (name, blobs.next().unwrap()))
                 .collect(),
         };
-        encoded_bytes += prost::encoding::message::encoded_len(1, &sample);
-        ensure!(
-            encoded_bytes <= MAX_BATCH_BYTES - 64,
-            "encoded batch exceeds 64 MiB"
-        );
         response.batch.push(sample);
     }
     response.load_seconds = started.elapsed().as_secs_f64() - response.server_wait_seconds;
@@ -400,7 +387,7 @@ mod tests {
     #[async_trait]
     impl Loader for LargeLoader {
         async fn size(&self, _: &BlobRef) -> Result<usize> {
-            Ok(MAX_BATCH_BYTES / 2)
+            Ok(32 * 1024 * 1024)
         }
         async fn load(&self, _: &BlobRef, size: usize) -> Result<Vec<u8>> {
             Ok(vec![0; size])
@@ -408,8 +395,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_sample_reads_enforce_encoded_batch_limit() {
-        let error = load_batch(
+    async fn concurrent_sample_reads_allow_large_batches() {
+        let (response, _memory) = load_batch(
             &LargeLoader,
             "training".into(),
             plan(2),
@@ -417,7 +404,8 @@ mod tests {
             256 * 1024 * 1024,
         )
         .await
-        .unwrap_err();
-        assert!(error.to_string().contains("encoded batch exceeds 64 MiB"));
+        .unwrap();
+        assert_eq!(response.batch.len(), 2);
+        assert!(response.encoded_len() > 64 * 1024 * 1024);
     }
 }

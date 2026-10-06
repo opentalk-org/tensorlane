@@ -91,17 +91,9 @@ impl HttpClient {
         parts: &[&str],
         body: Option<Vec<u8>>,
         headers: &[(&str, String)],
-        limit: usize,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>)> {
         let (status, headers, bytes, _) = self
-            .request_inner(
-                method,
-                parts,
-                body.map(RequestBody::Bytes),
-                headers,
-                limit,
-                None,
-            )
+            .request_inner(method, parts, body.map(RequestBody::Bytes), headers, None)
             .await?;
         Ok((status, headers, bytes))
     }
@@ -113,7 +105,6 @@ impl HttpClient {
                 &["uploads", id],
                 Some(RequestBody::Upload(spec, file)),
                 &[],
-                1024 * 1024,
                 None,
             )
             .await?;
@@ -127,14 +118,7 @@ impl HttpClient {
         sequence: u64,
     ) -> Result<(StatusCode, Vec<u8>, MemoryLease)> {
         let (status, _, bytes, lease) = self
-            .request_inner(
-                Method::GET,
-                parts,
-                None,
-                &[],
-                crate::MAX_BATCH_BYTES,
-                Some((memory, sequence)),
-            )
+            .request_inner(Method::GET, parts, None, &[], Some((memory, sequence)))
             .await?;
         Ok((
             status,
@@ -149,7 +133,6 @@ impl HttpClient {
         parts: &[&str],
         body: Option<RequestBody<'_>>,
         headers: &[(&str, String)],
-        limit: usize,
         memory: Option<(Arc<MemoryBudget>, u64)>,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>, Option<MemoryLease>)> {
         let mut lease = None;
@@ -206,7 +189,7 @@ impl HttpClient {
                 };
                 let status = response.status();
                 let headers = response.headers().clone();
-                let capacity = response.content_length().unwrap_or(0).min(limit as u64) as usize;
+                let capacity = usize::try_from(response.content_length().unwrap_or(0))?;
                 if status.is_success()
                     && status != StatusCode::ACCEPTED
                     && lease.is_none()
@@ -215,12 +198,8 @@ impl HttpClient {
                     let bytes = if status == StatusCode::NO_CONTENT {
                         0
                     } else {
-                        response.content_length().unwrap_or(limit as u64)
+                        response.content_length().unwrap_or(usize::MAX as u64)
                     };
-                    ensure!(
-                        bytes <= limit as u64,
-                        "HTTP response exceeds its size limit"
-                    );
                     let waiting = Instant::now();
                     lease = Some(memory.acquire(*sequence, bytes as usize).await?);
                     started += waiting.elapsed();
@@ -232,13 +211,6 @@ impl HttpClient {
                         tokio::time::timeout(Duration::from_secs(30), stream.next()).await?
                     {
                         let chunk = chunk?;
-                        ensure!(
-                            bytes
-                                .len()
-                                .checked_add(chunk.len())
-                                .is_some_and(|size| size <= limit),
-                            "HTTP response exceeds its size limit"
-                        );
                         bytes.extend_from_slice(&chunk);
                     }
                     Ok((status, headers, bytes))
@@ -306,7 +278,6 @@ impl HttpClient {
                 parts,
                 Some(serde_json::to_vec(body)?),
                 &[("content-type", "application/json".into())],
-                8 * 1024 * 1024,
             )
             .await?;
         Ok(serde_json::from_slice(&bytes)?)
@@ -326,7 +297,6 @@ impl HttpClient {
                 &["runs", run, "end"],
                 Some(serde_json::to_vec(&EndRequest { failed })?),
                 &[("content-type", "application/json".into())],
-                1024 * 1024,
             )
             .await?;
         Ok(())

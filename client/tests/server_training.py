@@ -44,6 +44,7 @@ def main():
                                 "optimizer": optimizer.state_dict(),
                             },
                             kind="checkpoint",
+                            metadata={"padding": "x" * (5 * 1024 * 1024)},
                         )
             assert steps == 4
             lane.flush()
@@ -57,6 +58,10 @@ def main():
             timeout=20,
         ) as lane:
             state = torch.load(lane.asset("model"), weights_only=True)
+            assert (
+                len(lane.asset_metadata["model"]["metadata"]["padding"])
+                == 5 * 1024 * 1024
+            )
             model.load_state_dict(state["model"])
             optimizer.load_state_dict(state["optimizer"])
             assert torch.equal(model.weight, saved_weight)

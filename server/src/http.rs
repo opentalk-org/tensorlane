@@ -117,6 +117,7 @@ fn router(run_repo: RunRepo, auth: crate::auth::Auth) -> Router {
             )
         })
         .layer(TraceLayer::new_for_http())
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::auth::http,

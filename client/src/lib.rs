@@ -1,7 +1,5 @@
 use pyo3::prelude::*;
 
-use tensorlane_protocol::MAX_BATCH_BYTES;
-
 mod assets;
 mod client;
 mod data;

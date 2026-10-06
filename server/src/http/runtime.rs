@@ -20,13 +20,8 @@ pub(super) fn router(runtime: crate::runtime::Runtime, auth: crate::auth::Auth) 
         .route("/runs/{run_id}/inputs/{name}", get(input_asset))
         .route("/runs/{run_id}/inputs/{name}/bytes", get(input_bytes))
         .route("/runs/{run_id}/metrics/{request_id}", put(save_metrics))
-        .route(
-            "/uploads/{upload_id}",
-            put(save_upload).layer(axum::extract::DefaultBodyLimit::disable()),
-        )
-        .layer(axum::extract::DefaultBodyLimit::max(
-            tensorlane_protocol::TRANSFER_CHUNK_BYTES,
-        ))
+        .route("/uploads/{upload_id}", put(save_upload))
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .layer(axum::middleware::from_fn_with_state(
             auth,
             crate::auth::http,
@@ -86,7 +81,6 @@ fn runtime_error(error: anyhow::Error) -> AppError {
         | "conflicting retry of asset ID"
         | "upload is already committed" => StatusCode::CONFLICT,
         "upload ID must not be nil"
-        | "upload exceeds 16 GiB"
         | "invalid upload SHA256"
         | "asset ID must match upload ID"
         | "asset name must not be empty"
@@ -94,13 +88,11 @@ fn runtime_error(error: anyhow::Error) -> AppError {
         | "artifact size does not match upload size"
         | "asset kind must be checkpoint or file"
         | "upload must start with its spec"
-        | "upload spec exceeds 4 MiB"
         | "upload is missing its file"
         | "upload has unexpected size"
         | "upload SHA256 does not match"
         | "upload contains unexpected fields"
         | "metric request ID must not be nil"
-        | "metric requests must not exceed 1000 metrics"
         | "invalid scalar metric"
         | "invalid array metric" => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

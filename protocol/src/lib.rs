@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 pub const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -10,7 +10,7 @@ pub async fn space(path: &Path, bytes: u64) -> Result<()> {
     let path = path.to_owned();
     let available = tokio::task::spawn_blocking(move || fs2::available_space(path)).await??;
     ensure!(
-        available >= bytes.saturating_add(512 * 1024 * 1024),
+        available >= bytes,
         "shared cache has insufficient free space"
     );
     Ok(())
@@ -46,24 +46,13 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 let reusable = name.ends_with(".batch")
-                    || name.ends_with(".plan")
                     || name
                         .split_once('-')
                         .is_some_and(|(a, b)| a.parse::<u64>().is_ok() && b.parse::<u64>().is_ok());
                 if reusable {
-                    let mut size = metadata.len();
-                    if name.ends_with(".plan") {
-                        for extension in ["index", "ready", "error"] {
-                            match std::fs::metadata(entry.path().with_extension(extension)) {
-                                Ok(metadata) => size += metadata.len(),
-                                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(error) => return Err(error),
-                            }
-                        }
-                    }
                     entries.push(Entry {
                         path: entry.path(),
-                        size,
+                        size: metadata.len(),
                         modified: metadata.modified()?,
                     });
                 }
@@ -78,8 +67,7 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
         if used <= limit {
             break;
         }
-        let plan = entry.path.extension().is_some_and(|ext| ext == "plan");
-        let lock_path = if plan || entry.path.extension().is_some_and(|ext| ext == "batch") {
+        let lock_path = if entry.path.extension().is_some_and(|ext| ext == "batch") {
             entry.path.with_extension("lock")
         } else {
             entry
@@ -91,18 +79,10 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
         let Some(_lock) = Lock::try_acquire(&lock_path).await? else {
             continue;
         };
-        let paths = std::iter::once(entry.path.clone()).chain(
-            ["index", "ready", "error"]
-                .into_iter()
-                .filter(|_| plan)
-                .map(|extension| entry.path.with_extension(extension)),
-        );
-        for path in paths {
-            match fs::remove_file(path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+        match fs::remove_file(entry.path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         used = used.saturating_sub(entry.size);
     }
@@ -113,7 +93,7 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn pruning_clears_query_plans_and_preserves_receipts_and_locked_entries() -> Result<()> {
+    async fn pruning_preserves_query_plans_receipts_and_locked_entries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let dir = temp.path().join("assets/a");
         fs::create_dir_all(&dir).await?;
@@ -143,7 +123,7 @@ mod tests {
         prune(temp.path(), 0).await?;
         assert!(!dir.join("0-3").exists());
         for extension in ["plan", "index", "ready", "error"] {
-            assert!(!plans.join(format!("0.{extension}")).exists());
+            assert!(plans.join(format!("0.{extension}")).exists());
         }
         assert!(run.join("receipt.json").exists());
         Ok(())

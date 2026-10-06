@@ -198,7 +198,6 @@ impl Metrics {
                 &["runs", &self.run_id, "metrics", &request],
                 Some(serde_json::to_vec(&self.batch)?),
                 &[("content-type", "application/json".into())],
-                1024 * 1024,
             )
             .await?;
         self.batch = MetricBatch::default();

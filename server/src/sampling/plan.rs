@@ -1,5 +1,5 @@
 use super::BatchPlan;
-use crate::{MAX_BATCH_BYTES, db::SampleRow};
+use crate::db::SampleRow;
 use anyhow::{Context, Result, ensure};
 use futures::{Stream, TryStreamExt};
 use prost::Message;
@@ -10,7 +10,6 @@ use tokio::{
 };
 
 const IO_BUFFER_BYTES: usize = 256 * 1024;
-const MAX_BATCH_SAMPLES: usize = 65_536;
 
 struct PlanFile {
     path: PathBuf,
@@ -49,7 +48,6 @@ impl QuerySampler {
         let mut writer = BufWriter::with_capacity(IO_BUFFER_BYTES, output);
         let mut previous = None;
         let (mut batches, mut samples, mut bytes) = (0u64, 0u64, 0u64);
-        let (mut batch_bytes, mut batch_samples) = (0usize, 0usize);
         let mut encoded = Vec::new();
         let mut offsets = Vec::new();
         futures::pin_mut!(rows);
@@ -63,25 +61,13 @@ impl QuerySampler {
             if previous.is_none_or(|(batch, _)| batch != row.batch_idx) {
                 offsets.extend_from_slice(&bytes.to_le_bytes());
                 batches += 1;
-                batch_bytes = 0;
-                batch_samples = 0;
             }
             previous = Some(key);
-            batch_bytes += size + 4;
-            batch_samples += 1;
-            ensure!(
-                batch_bytes <= MAX_BATCH_BYTES,
-                "batch descriptors exceed 64 MiB"
-            );
-            ensure!(
-                batch_samples <= MAX_BATCH_SAMPLES,
-                "batch exceeds 65536 samples"
-            );
             row.sample()?;
-            bytes += size as u64 + 4;
+            bytes += size as u64 + 8;
             encoded.clear();
             row.encode(&mut encoded)?;
-            writer.write_u32_le(size as u32).await?;
+            writer.write_u64_le(u64::try_from(size)?).await?;
             writer.write_all(&encoded).await?;
             samples += 1;
         }
@@ -142,12 +128,12 @@ impl QuerySampler {
         if self.reader.fill_buf().await?.is_empty() {
             return Ok(None);
         }
-        let size = self
-            .reader
-            .read_u32_le()
-            .await
-            .context("truncated plan record length")? as usize;
-        ensure!(size <= MAX_BATCH_BYTES, "plan descriptor exceeds 64 MiB");
+        let size = usize::try_from(
+            self.reader
+                .read_u64_le()
+                .await
+                .context("truncated plan record length")?,
+        )?;
         let mut bytes = vec![0; size];
         self.reader
             .read_exact(&mut bytes)
@@ -162,7 +148,6 @@ impl QuerySampler {
         let Some(first) = self.read_row().await? else {
             return Ok(None);
         };
-        let mut size = first.encoded_len() + 4;
         let mut batch = BatchPlan {
             query_batch_idx: first.batch_idx,
             samples: vec![first.sample()?],
@@ -171,12 +156,6 @@ impl QuerySampler {
             if row.batch_idx != batch.query_batch_idx {
                 break;
             }
-            size += row.encoded_len() + 4;
-            ensure!(size <= MAX_BATCH_BYTES, "batch descriptors exceed 64 MiB");
-            ensure!(
-                batch.samples.len() < MAX_BATCH_SAMPLES,
-                "batch exceeds 65536 samples"
-            );
             batch.samples.push(row.sample()?);
         }
         Ok(Some(batch))

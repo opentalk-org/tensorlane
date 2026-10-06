@@ -39,8 +39,6 @@ mod shared_cache;
 mod upload_http;
 mod uploads;
 
-use tensorlane_protocol::MAX_BATCH_BYTES;
-
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .usage(AnsiColor::Green.on_default().effects(Effects::BOLD))
