@@ -100,19 +100,33 @@ impl Runtime {
     pub async fn initialize(&self, id: Uuid) -> Result<InitResponse> {
         ensure!(!self.shutdown.is_cancelled(), "server is shutting down");
         let record = self.repo.get(id).await?.context("run not found")?;
-        ensure!(
-            matches!(record.status, Some(RunStatus::Queued | RunStatus::Running)),
-            "run is terminal"
-        );
         let config = Config::parse(&record.config)?;
+        let checkpoint = self
+            .repo
+            .run_assets(id, None)
+            .await?
+            .into_iter()
+            .rev()
+            .find(|asset| asset.kind == 1)
+            .map(|asset| tensorlane_protocol::Checkpoint {
+                name: asset.name,
+                asset_id: asset.id.to_string(),
+            });
+        let mut assets: Vec<_> = config.assets.keys().cloned().collect();
+        if let Some(checkpoint) = &checkpoint
+            && !assets.contains(&checkpoint.name)
+        {
+            assets.push(checkpoint.name.clone());
+        }
         if record.status != Some(RunStatus::Running) {
             self.repo.append_status(id, RunStatus::Running).await?;
         }
         Ok(InitResponse {
             run_id: id.to_string(),
             config: serde_json::to_string(&record.config)?,
-            assets: config.assets.keys().cloned().collect(),
+            assets,
             streams: config.queries.keys().cloned().collect(),
+            checkpoint,
         })
     }
 
@@ -133,16 +147,11 @@ impl Runtime {
         ) {
             return Ok(());
         }
-        let status = self
-            .create_state(
-                &format!("runs/{id}/end"),
-                &if failed {
-                    RunStatus::Failed
-                } else {
-                    RunStatus::Succeeded
-                },
-            )
-            .await?;
+        let status = if failed {
+            RunStatus::Failed
+        } else {
+            RunStatus::Succeeded
+        };
         self.repo.append_status(id, status).await
     }
 
@@ -158,7 +167,14 @@ impl Runtime {
         if fs::try_exists(&path).await? {
             return Ok(serde_json::from_slice(&fs::read(&path).await?)?);
         }
-        let input = config.assets.get(name).context("unknown input asset")?;
+        let input = match config.assets.get(name) {
+            Some(input) => input.clone(),
+            None => crate::run_config::AssetConfig {
+                asset_id: Some(name.parse().context("unknown input asset")?),
+                object: None,
+                entrypoint: None,
+            },
+        };
         let record = match input.asset_id {
             Some(id) => Some(
                 self.repo

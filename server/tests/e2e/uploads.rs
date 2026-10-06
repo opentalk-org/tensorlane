@@ -114,32 +114,21 @@ async fn check_replicas(env: &mut TestEnv, replica: &str) -> Result<()> {
             .status(),
         StatusCode::BAD_REQUEST
     );
-    let source: serde_json::Value = env
-        .request(Method::GET, &format!("/runs/{id}"))
+    env.request(Method::POST, &format!("/runs/{id}/end"))
+        .json(&json!({"failed": true}))
         .send()
         .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let resumed: serde_json::Value = env
-        .request(Method::POST, "/runs")
-        .json(&json!({"project_id":source["project_id"],"name":"resumed","config":source["config"],"resume_from":id}))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let resumed = resumed["run_id"].as_str().unwrap();
-    assert_ne!(resumed, id);
-    let initialized = env.init(resumed).await?;
-    let config: serde_json::Value = serde_json::from_str(&initialized.config)?;
-    assert_eq!(
-        config["tensorlane"]["assets"]["model"]["asset_id"],
-        second.to_string()
-    );
+        .error_for_status()?;
+    assert_eq!(env.status(&id).await?, "failed");
+    let initialized = env.init(&id).await?;
+    assert_eq!(initialized.run_id, id);
+    let pinned = initialized.checkpoint.unwrap();
+    assert_eq!(pinned.name, "model");
+    assert_eq!(pinned.asset_id, second.to_string());
+    assert_eq!(env.status(&id).await?, "running");
     checkpoint(env, replica, &id, 3, Bytes::from_static(b"newer"), false).await?;
     let metadata: tensorlane_protocol::AssetDownload = env
-        .request(Method::GET, &format!("/runs/{resumed}/inputs/model"))
+        .request(Method::GET, &format!("/runs/{id}/inputs/{second}"))
         .send()
         .await?
         .error_for_status()?

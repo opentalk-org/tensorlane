@@ -10,16 +10,11 @@ Multiple clients may initialize and access the same running run, including after
 server or client replacement. No client session header or ownership claim is
 required. Clients coordinate their batch sequences and run completion.
 
-Resume by creating a new run with `POST /runs`, adding `resume_from: <old run UUID>`
-to the existing project, name, and configuration fields. Creation selects the
-source run's latest committed checkpoint and pins its asset ID under its original
-name in the new run's input assets. Incomplete uploads are ignored. Python calls
-remain `tensorlane.init(new_run_id)` and `lane.asset(name)`. The new run starts its
-own batch sequences at zero; this does not restore prior stream positions.
+Resume with `tensorlane.init()` using the same run ID. Initialization selects the latest committed checkpoint, returns its name and immutable asset ID in `checkpoint`, and exposes it through `lane.asset(name)`. Failed or completed runs return to running on initialization. Incomplete uploads are ignored. The client saves per-stream next batch numbers in the checkpoint's existing `_tensorlane.next_batches` metadata and restores them before fetching data. Prefetched batches do not advance this cursor. Save after training on the returned batches; synchronize ranks before saving a distributed checkpoint. Load model and optimizer state from the checkpoint before reading batches. There is no separate resume request or manually supplied resume step.
 
 | Request | Response |
 | --- | --- |
-| `POST /runs/{id}/init` | Run configuration, stream names, input names |
+| `POST /runs/{id}/init` | Run configuration, stream names, input names, optional latest checkpoint |
 | `POST /runs/{id}/heartbeat` | Legacy compatibility endpoint: 204 while the run is running; no state is recorded |
 | `POST /runs/{id}/end` with `{"failed": false}` | 204; records completion |
 | `GET /runs/{id}/streams/{name}/batches/{sequence}` | Protobuf batch, 202 while preparing, or 204 at EOF |
@@ -28,7 +23,8 @@ own batch sequences at zero; this does not restore prior stream positions.
 | `PUT /runs/{id}/metrics/{request_id}` | 204; repeated IDs are deduplicated |
 | `PUT /uploads/{id}` | Streams multipart `spec` JSON followed by `file` directly into the final R2 object; 200 after publication |
 
-A batch sequence starts at zero. Retrying a sequence uses the cached query result.
+A new stream starts at zero; a resumed stream starts at its checkpoint cursor.
+Retrying a sequence uses the cached query result.
 For a repeating stream, the sequence keeps increasing while the saved query
 result repeats. The protobuf messages are defined in `protocol/batch.proto`.
 Run management routes remain JSON HTTP APIs.
@@ -61,7 +57,7 @@ local upload files or intermediate payload objects. A failed request aborts its
 multipart upload; an HTTP retry sends the whole file and can reach any replica.
 Existing final objects are checked against the upload's content and metadata.
 
-Small immutable R2 records hold completion decisions, upload fingerprints, checkpoint
+Small immutable R2 records hold upload fingerprints, checkpoint
 lineage, and metric retry receipts. They contain control metadata, never staged
 payload bytes. ClickHouse insert tokens deduplicate metric and artifact retries
 between insertion and receipt publication; the deduplication window must cover
@@ -79,8 +75,8 @@ worker startup. A `flush(timeout=...)` deadline includes queue space and automat
 A timeout leaves its upload running.
 
 A lost connection does not fail a run. Server startup and shutdown leave run
-status intact. Cached query results can be regenerated. Only explicit run
-completion changes a running run to succeeded or failed. Abandoned clients leave
+status intact. Cached query results can be regenerated. Explicit run
+completion changes a running run to succeeded or failed; initialization reopens it. Abandoned clients leave
 running records. Clients do not send heartbeats or store server session IDs.
 
 Server batch-loading admission uses `config.tensorlane.max_load_memory_bytes`

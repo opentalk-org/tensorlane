@@ -38,10 +38,12 @@ class BatchReader(Iterator[Batch]):
         deadline = time.monotonic() + timeout
         try:
             self._check()
-            if rank >= int((root / "ranks").read_text()):
+            self._ranks = int((root / "ranks").read_text())
+            if rank >= self._ranks:
                 raise RuntimeError("invalid rank")
             key = (root / "auth").read_bytes()
             directory = root / "streams" / str(stream_index)
+            self._progress = directory / f"progress-{rank}"
             self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
             self._memory_semaphore = _native.Semaphore(
                 (directory / "memory").read_text()
@@ -100,6 +102,9 @@ class BatchReader(Iterator[Batch]):
             if kind != "batch":
                 raise RuntimeError(f"unexpected rank message: {kind}")
             batch = value
+            temporary = self._progress.with_suffix(".tmp")
+            temporary.write_text(str(batch.batch_id + self._ranks))
+            temporary.replace(self._progress)
             self._memory_semaphore.post(batch._memory_units)
             self._semaphore.post()
             self._returned = time.monotonic()

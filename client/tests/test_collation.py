@@ -29,6 +29,10 @@ class CollationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "auth").write_bytes(multiprocessing.current_process().authkey)
+            for index in range(3):
+                directory = root / "streams" / str(index)
+                directory.mkdir(parents=True)
+                (directory / "start").write_text("0")
             with (
                 patch("tensorlane._process.threading.Thread"),
                 patch(

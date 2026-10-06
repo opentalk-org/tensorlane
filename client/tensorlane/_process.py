@@ -170,7 +170,10 @@ def collate_worker(
     ready.set()
     pending = {name: {} for name in streams}
     completed = {name: {} for name in streams}
-    next_batch = {name: 0 for name in streams}
+    next_batch = {
+        name: int((root / "streams" / str(index) / "start").read_text())
+        for index, name in enumerate(streams)
+    }
     ended = {name: 0 for name in streams}
     while not stopped.is_set():
         if not errors.empty():

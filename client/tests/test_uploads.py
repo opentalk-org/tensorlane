@@ -2,6 +2,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import io
+import json
 from pathlib import Path
 from unittest.mock import patch
 import time
@@ -43,7 +44,13 @@ class PipelineTests(PipelineCase):
         self.assertEqual(metadata.kind, "checkpoint")
         self.assertEqual(metadata.step, 3)
         self.assertEqual(metadata.content_type, "application/octet-stream")
-        self.assertEqual(metadata.metadata_json, '{"note": "state dictionary"}')
+        self.assertEqual(
+            json.loads(metadata.metadata_json),
+            {
+                "note": "state dictionary",
+                "_tensorlane": {"next_batches": dict.fromkeys(self.daemon.streams, 0)},
+            },
+        )
         state = torch.load(io.BytesIO(body), weights_only=True)
         restored = torch.nn.Linear(2, 1)
         restored.load_state_dict(state["model"])

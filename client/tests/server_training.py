@@ -1,4 +1,3 @@
-from pathlib import Path
 import sys
 import tempfile
 
@@ -36,11 +35,42 @@ def main():
                     optimizer.step()
                     lane.metric(batch.batch_id, "loss", loss.item())
                     steps += 1
+                    if batch.batch_id == 1:
+                        saved_weight = model.weight.detach().clone()
+                        lane.save_asset(
+                            "model",
+                            {
+                                "model": model.state_dict(),
+                                "optimizer": optimizer.state_dict(),
+                            },
+                            kind="checkpoint",
+                        )
             assert steps == 4
-            path = Path(root) / "model.pt"
-            torch.save(model.state_dict(), path)
-            lane.save_asset("model", path, step=steps, kind="checkpoint")
             lane.flush()
+        with tensorlane.init(
+            run_id,
+            transform,
+            num_workers=1,
+            collate_fn=torch.stack,
+            addr=address,
+            ipc_dir=root,
+            timeout=20,
+        ) as lane:
+            state = torch.load(lane.asset("model"), weights_only=True)
+            model.load_state_dict(state["model"])
+            optimizer.load_state_dict(state["optimizer"])
+            assert torch.equal(model.weight, saved_weight)
+            resumed = []
+            with lane.batches("training") as batches:
+                for batch in batches:
+                    resumed.append(batch.batch_id)
+                    prediction = model(batch.data)
+                    loss = (prediction - batch.data * 2).square().mean()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    lane.metric(batch.batch_id, "loss", loss.item())
+            assert resumed == [2, 3]
     print("training passed")
 
 

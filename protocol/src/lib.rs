@@ -10,6 +10,14 @@ pub struct InitResponse {
     pub config: String,
     pub assets: Vec<String>,
     pub streams: Vec<String>,
+    #[serde(default)]
+    pub checkpoint: Option<Checkpoint>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Checkpoint {
+    pub name: String,
+    pub asset_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

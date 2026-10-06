@@ -18,8 +18,14 @@ pub async fn prefetch(
         .map(|(index, name)| {
             let http = http.clone();
             let destination = root.join("assets").join(index.to_string());
+            let input = initialized
+                .checkpoint
+                .as_ref()
+                .filter(|checkpoint| checkpoint.name == *name)
+                .map(|checkpoint| checkpoint.asset_id.as_str())
+                .unwrap_or(name);
             async move {
-                let (path, metadata) = download(http, &initialized.run_id, name, destination)
+                let (path, metadata) = download(http, &initialized.run_id, input, destination)
                     .await
                     .with_context(|| format!("downloading asset {name:?}"))?;
                 Ok::<_, anyhow::Error>((name.clone(), path, metadata))

@@ -28,7 +28,6 @@ struct CreateRunRequest {
     project_id: Uuid,
     name: String,
     config: Map<String, Value>,
-    resume_from: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -129,48 +128,14 @@ async fn create_run(
     State(run_repo): State<RunRepo>,
     request: Result<Json<CreateRunRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), AppError> {
-    let Json(mut request) = request.map_err(|err| AppError::new(err.status(), err))?;
+    let Json(request) = request.map_err(|err| AppError::new(err.status(), err))?;
     if !request.config.get("queries").is_some_and(Value::is_object) {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
             anyhow::anyhow!("config.queries must map stream names to query objects"),
         ));
     }
-    let mut config = Config::parse(&request.config)
-        .map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err))?;
-    if let Some(source) = request.resume_from {
-        if run_repo.get(source).await?.is_none() {
-            return Err(AppError::new(
-                StatusCode::NOT_FOUND,
-                anyhow::anyhow!("Run not found"),
-            ));
-        }
-        let checkpoint = run_repo
-            .run_assets(source, None)
-            .await?
-            .into_iter()
-            .rev()
-            .find(|asset| asset.kind == 1)
-            .ok_or_else(|| {
-                AppError::new(
-                    StatusCode::CONFLICT,
-                    anyhow::anyhow!("run has no committed checkpoint"),
-                )
-            })?;
-        config.assets.insert(
-            checkpoint.name,
-            crate::run_config::AssetConfig {
-                object: None,
-                asset_id: Some(checkpoint.id),
-                entrypoint: None,
-            },
-        );
-        request
-            .config
-            .entry("tensorlane")
-            .or_insert_with(|| serde_json::json!({}))["assets"] =
-            serde_json::to_value(config.assets)?;
-    }
+    Config::parse(&request.config).map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err))?;
     let run_id = run_repo
         .create(request.project_id, &request.name, &request.config)
         .await?
