@@ -216,20 +216,36 @@ class TensorLane:
         name: str,
         path: str | Path | dict,
         *,
-        step: int = 0,
+        step: int | None = None,
         kind: str = "file",
         asset_type: str | None = None,
         metadata: dict | None = None,
     ) -> str:
         if metadata is not None and not isinstance(metadata, dict):
             raise TypeError("asset metadata must be an object")
+        metadata = dict(metadata or {})
+        if kind == "checkpoint":
+            next_batches = {
+                stream: min(
+                    int(
+                        (
+                            self._root / "streams" / str(index) / f"progress-{rank}"
+                        ).read_text()
+                    )
+                    for rank in range(self.ranks)
+                )
+                for index, stream in enumerate(self.streams)
+            }
+            metadata["_tensorlane"] = {"next_batches": next_batches}
+            if step is None:
+                step = max(0, max(next_batches.values(), default=0) - 1)
         self._performance_collector()
         uploads = self._upload_client()
         options = {
-            "step": step,
+            "step": step if step is not None else 0,
             "kind": kind,
             "asset_type": asset_type,
-            "metadata_json": json.dumps(metadata or {}, allow_nan=False),
+            "metadata_json": json.dumps(metadata, allow_nan=False),
         }
         if isinstance(path, dict):
             import torch

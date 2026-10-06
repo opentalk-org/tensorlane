@@ -48,6 +48,20 @@ pub(super) async fn supervise(
         );
         let (assets, asset_metadata) =
             crate::assets::prefetch(&http, &initialized, &options.root).await?;
+        let next_batches: HashMap<String, u64> = match &initialized.checkpoint {
+            Some(checkpoint) => {
+                let metadata: serde_json::Value =
+                    serde_json::from_str(&asset_metadata[&checkpoint.name])?;
+                serde_json::from_value(
+                    metadata["metadata"]["_tensorlane"]["next_batches"]
+                        .as_object()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into(),
+                )?
+            }
+            None => HashMap::new(),
+        };
         {
             let mut budgets = budgets
                 .lock()
@@ -63,6 +77,14 @@ pub(super) async fn supervise(
                 )?);
                 let directory = options.root.join("streams").join(index.to_string());
                 std::fs::create_dir_all(&directory)?;
+                let start = next_batches.get(name).copied().unwrap_or(0);
+                std::fs::write(directory.join("start"), start.to_string())?;
+                for rank in 0..settings.ranks {
+                    let next = start
+                        + (rank as u64 + settings.ranks as u64 - start % settings.ranks as u64)
+                            % settings.ranks as u64;
+                    std::fs::write(directory.join(format!("progress-{rank}")), next.to_string())?;
+                }
                 std::fs::write(directory.join("semaphore"), budget.semaphore.name()?)?;
                 std::fs::write(directory.join("memory"), budget.memory.semaphore.name()?)?;
                 budgets.insert(name.clone(), budget);
@@ -80,7 +102,7 @@ pub(super) async fn supervise(
         for _ in 0..settings.num_workers {
             work.push(Sender::<Work, _>::new(work_listener.accept().await?.0));
         }
-        anyhow::Ok((http, initialized, work))
+        anyhow::Ok((http, initialized, work, next_batches))
     };
     let started = tokio::select! {
         result = startup => result.map(Some),
@@ -92,7 +114,7 @@ pub(super) async fn supervise(
             }
         } => Err(anyhow!("TensorLane startup timed out")),
     };
-    let (http, initialized, work) = match started {
+    let (http, initialized, work, next_batches) = match started {
         Ok(Some(started)) => started,
         result => {
             let ended = match remote {
@@ -178,12 +200,14 @@ pub(super) async fn supervise(
         .map_err(|_| anyhow!("budget lock poisoned"))?
         .clone();
     for (name, budget) in stream_budgets {
+        let start = next_batches.get(&name).copied().unwrap_or(0);
         pumps.spawn(prefetch(
             http.clone(),
             initialized.run_id.clone(),
             name,
             budget,
             send_work.clone(),
+            start,
         ));
     }
     drop(send_work);

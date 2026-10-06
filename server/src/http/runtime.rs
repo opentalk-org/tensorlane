@@ -76,7 +76,7 @@ fn runtime_error(error: anyhow::Error) -> AppError {
         "run not found" | "unknown stream" | "unknown input asset" | "input asset not found" => {
             StatusCode::NOT_FOUND
         }
-        "run is terminal" | "run is not running" => StatusCode::CONFLICT,
+        "run is not running" => StatusCode::CONFLICT,
         "server is shutting down"
         | "asset download capacity reached"
         | "shared cache has insufficient free space" => StatusCode::SERVICE_UNAVAILABLE,

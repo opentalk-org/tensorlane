@@ -1,7 +1,4 @@
 from contextlib import nullcontext
-import json
-from pathlib import Path
-
 import torch
 from accelerate import Accelerator
 from accelerate.utils import send_to_device, set_seed
@@ -32,8 +29,13 @@ def main():
             optimizer = torch.optim.SGD(
                 model.parameters(), lr=lane.config["app"]["optimizer"]["learning_rate"]
             )
+            if "model" in lane.asset_metadata:
+                state = torch.load(
+                    lane.asset("model"), map_location="cpu", weights_only=True
+                )
+                model.load_state_dict(state["model"])
+                optimizer.load_state_dict(state["optimizer"])
             model, optimizer = accelerator.prepare(model, optimizer)
-            completed = 0
             with (
                 lane.batches("training") as batches,
                 model.join() if accelerator.num_processes > 1 else nullcontext(),
@@ -44,27 +46,16 @@ def main():
                     loss = torch.nn.functional.mse_loss(model(features), targets)
                     accelerator.backward(loss)
                     optimizer.step()
-                    completed += len(batch)
                     lane.metric(batch.batch_id, f"rank/{lane.rank}/loss", loss.item())
-            count = torch.tensor(completed, device=accelerator.device)
-            query = next(q for q in lane.config["queries"] if q["key"] == "training")
-            offset = query["params"]["dataset_offset"]
-            offset += accelerator.reduce(count, reduction="sum").item()
+            accelerator.wait_for_everyone()
             if accelerator.is_main_process:
-                output = Path(lane.config["app"]["output_dir"])
-                output.mkdir(parents=True, exist_ok=True)
-                weights = output / "weights.pt"
-                accelerator.save(accelerator.unwrap_model(model).state_dict(), weights)
-                asset_id = lane.save_asset(
+                lane.save_asset(
                     "model",
-                    weights,
-                    step=offset,
+                    {
+                        "model": accelerator.unwrap_model(model).state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                    },
                     kind="checkpoint",
-                    metadata={"dataset_offset": offset},
-                )
-                lane.flush()
-                (output / "progress.json").write_text(
-                    json.dumps({"asset_id": asset_id, "dataset_offset": offset}) + "\n"
                 )
             lane.flush()
             accelerator.wait_for_everyone()

@@ -43,7 +43,7 @@ pub async fn check(env: &TestEnv) -> Result<()> {
             .bind(&id)
             .fetch_one::<u64>()
             .await?,
-        4
+        6
     );
     Ok(())
 }

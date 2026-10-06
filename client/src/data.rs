@@ -52,6 +52,7 @@ pub async fn prefetch(
     stream_name: String,
     budget: Arc<BatchBudget>,
     work: mpsc::UnboundedSender<Work>,
+    start: u64,
 ) -> anyhow::Result<()> {
     let (requests, receiver) = mpsc::unbounded_channel();
     let waiting = budget.clone();
@@ -61,7 +62,7 @@ pub async fn prefetch(
             thread::Builder::new()
                 .name("tensorlane-requests".into())
                 .spawn(move || {
-                    let mut sequence = 0u64;
+                    let mut sequence = start;
                     while waiting.acquire()? {
                         if requests.send(sequence).is_err() {
                             break;
@@ -92,7 +93,7 @@ pub async fn prefetch(
                             &sequence.to_string(),
                         ],
                         memory,
-                        sequence,
+                        sequence - start,
                     )
                     .await
                     .context("receiving data batch")?;

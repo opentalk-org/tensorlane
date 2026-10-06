@@ -80,7 +80,11 @@ class PipelineTests(PipelineCase):
         self.assertEqual([row[0].asset_id for row in self.service.saved], [a, b, other])
         self.assertEqual([row[1] for row in self.service.saved], [source_id, a, None])
         self.assertEqual(
-            json.loads(self.service.saved[0][0].metadata_json), {"dataset_offset": 6}
+            json.loads(self.service.saved[0][0].metadata_json),
+            {
+                "dataset_offset": 6,
+                "_tensorlane": {"next_batches": dict.fromkeys(self.daemon.streams, 0)},
+            },
         )
         self.assertEqual(
             self.service.saved[0][2],

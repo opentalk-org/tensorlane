@@ -159,14 +159,31 @@ class Fixture:
                 if self.fail_init:
                     self.reply(handler, 422, {"message": "fixture init failure"})
                     return
+                checkpoint = next(
+                    (
+                        row[0]
+                        for row in reversed(self.saved)
+                        if row[0].kind == "checkpoint"
+                    ),
+                    None,
+                )
+                assets = list(self.assets)
+                if checkpoint and checkpoint.name not in assets:
+                    assets.append(checkpoint.name)
                 self.reply(
                     handler,
                     200,
                     {
                         "run_id": self.returned_run_id or run,
                         "config": json.dumps(self.config),
-                        "assets": list(self.assets),
+                        "assets": assets,
                         "streams": list(self.streams),
+                        "checkpoint": {
+                            "name": checkpoint.name,
+                            "asset_id": checkpoint.asset_id,
+                        }
+                        if checkpoint
+                        else None,
                     },
                 )
             case ["runs", run, "heartbeat"]:
@@ -183,7 +200,12 @@ class Fixture:
                 self.asset_requests.append(SimpleNamespace(run_id=run, name=name))
                 self.asset_started.set()
                 self.asset_gate.wait(20)
-                asset_id, body = self.assets[name]
+                saved = next(
+                    (row for row in self.saved if row[0].asset_id == name), None
+                )
+                asset_id, body = (
+                    (saved[0].asset_id, saved[2]) if saved else self.assets[name]
+                )
                 digest = hashlib.sha256(body).hexdigest()
                 self.reply(
                     handler,
@@ -195,8 +217,8 @@ class Fixture:
                         "metadata": {
                             "asset_id": asset_id,
                             "entrypoint": None,
-                            "metadata_json": "{}",
-                            "kind": "file",
+                            "metadata_json": saved[0].metadata_json if saved else "{}",
+                            "kind": saved[0].kind if saved else "file",
                             "asset_type": "generic",
                         },
                     },
@@ -205,7 +227,10 @@ class Fixture:
                 if self.fail_asset:
                     self.reply(handler, 422, {"message": "fixture asset failure"})
                     return
-                body = self.assets[name][1]
+                saved = next(
+                    (row for row in self.saved if row[0].asset_id == name), None
+                )
+                body = saved[2] if saved else self.assets[name][1]
                 start, end = map(int, handler.headers["Range"][6:].split("-"))
                 if self.truncate_asset_once:
                     self.truncate_asset_once = False
