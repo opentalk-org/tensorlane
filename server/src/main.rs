@@ -23,6 +23,7 @@ mod auth;
 mod batch_http;
 mod cache_limits;
 mod db;
+mod health;
 mod http;
 mod job;
 mod loader;

@@ -5,11 +5,14 @@ require a shared key. Generate one with `openssl rand -hex 32`. Keys must contai
 at least 32 printable ASCII characters without whitespace. All key holders have
 access to every run, query, asset, and metric.
 
-All endpoints use `Authorization: Bearer <key>` when a key is configured.
+Application endpoints use `Authorization: Bearer <key>` when a key is configured.
 Missing, invalid, or duplicate authorization headers return HTTP 401. This also
 covers downloads, uploads, metrics, heartbeats, run completion, unknown routes,
 and unsupported methods. Keys are compared using constant-time comparison of
 their SHA-256 digests.
+
+`GET /healthz` and `GET /readyz` are unauthenticated probe endpoints. They return
+only fixed status text, without dependency errors or credentials.
 
 The Python client reads `TENSORLANE_API_KEY`, or accepts `api_key=` in
 `tensorlane.init`. Secrets are not written to IPC metadata.

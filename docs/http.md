@@ -98,6 +98,15 @@ Collation may allocate a new batch tensor before its storage is shared.
 
 ## Replicas and cache
 
+`GET /healthz` returns HTTP 200 while the HTTP server is responsive. It does not
+check external dependencies. `GET /readyz` returns HTTP 200 only when ClickHouse
+answers `SELECT 1`, the configured S3 bucket accepts HEAD, and the cache directory
+is writable with at least 512 MiB of free filesystem space. These checks run
+concurrently with a two-second total deadline. Failures, timeouts, and shutdown
+return HTTP 503. Both endpoints are unauthenticated and bypass the application's
+request concurrency limit. Use `/healthz` for startup and liveness probes and
+`/readyz` for readiness, with a readiness probe timeout longer than two seconds.
+
 Replicas share ClickHouse and R2. Each replica has an independent disposable
 `CACHE_DIR`; no shared filesystem or sticky routing is required. Local locks
 coordinate preparation and eviction only within that replica. Cache loss causes
