@@ -7,7 +7,7 @@ use reqwest::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{sync::Arc, time::Duration};
-use tensorlane_protocol::{EndRequest, InitResponse, SESSION_HEADER, UploadSpec, UploadStatus};
+use tensorlane_protocol::{EndRequest, InitResponse, UploadSpec, UploadStatus};
 use tokio::time::Instant;
 use tokio::{fs::File, io::AsyncSeekExt};
 use tokio_util::io::ReaderStream;
@@ -16,7 +16,6 @@ use tokio_util::io::ReaderStream;
 pub struct HttpClient {
     client: reqwest::Client,
     base: Url,
-    session: String,
     retry_timeout: Duration,
 }
 
@@ -25,7 +24,7 @@ enum RequestBody<'a> {
     Upload(&'a UploadSpec, &'a File),
 }
 
-pub async fn connect(addr: &str, key: Option<&str>, session: String) -> Result<HttpClient> {
+pub async fn connect(addr: &str, key: Option<&str>) -> Result<HttpClient> {
     static PROVIDER: std::sync::Once = std::sync::Once::new();
     PROVIDER.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -69,7 +68,6 @@ pub async fn connect(addr: &str, key: Option<&str>, session: String) -> Result<H
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         base,
-        session,
         retry_timeout: Duration::from_secs(retry_seconds),
     })
 }
@@ -167,10 +165,7 @@ impl HttpClient {
                     .saturating_sub(started.elapsed())
                     .max(Duration::from_millis(1))
             };
-            let mut request = self
-                .client
-                .request(method.clone(), url.clone())
-                .header(SESSION_HEADER, &self.session);
+            let mut request = self.client.request(method.clone(), url.clone());
             if memory.is_none()
                 && !(self.retry_timeout.is_zero() && matches!(&body, Some(RequestBody::Upload(..))))
             {
@@ -314,18 +309,6 @@ impl HttpClient {
     pub async fn initialize(&self, run: &str) -> Result<InitResponse> {
         self.json(Method::POST, &["runs", run, "init"], &serde_json::json!({}))
             .await
-    }
-
-    pub async fn heartbeat(&self, run: &str) -> Result<()> {
-        self.request(
-            Method::POST,
-            &["runs", run, "heartbeat"],
-            None,
-            &[],
-            1024 * 1024,
-        )
-        .await?;
-        Ok(())
     }
 
     pub async fn end(&self, run: &str, failed: bool) -> Result<()> {

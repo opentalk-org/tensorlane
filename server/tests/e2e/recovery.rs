@@ -3,7 +3,7 @@ use anyhow::Result;
 use prost::Message;
 use reqwest::{Method, StatusCode};
 use serde_json::json;
-use tensorlane_protocol::{DataResponse, SESSION_HEADER};
+use tensorlane_protocol::DataResponse;
 use uuid::Uuid;
 
 pub async fn check(env: &mut TestEnv) -> Result<()> {
@@ -29,6 +29,11 @@ pub async fn check(env: &mut TestEnv) -> Result<()> {
     let result = async {
         env.ready_at(&url).await?;
         let contended = env.create_run(config(dataset, 1)).await?;
+        env.put_object(
+            &format!("checkpoints/.tensorlane/runs/{contended}/session"),
+            bytes::Bytes::from(serde_json::to_vec(&(Uuid::new_v4(), 0i64))?),
+        )
+        .await?;
         let candidates = [Uuid::new_v4(), Uuid::new_v4()];
         let addresses = [&env.url, &url];
         let responses = futures::future::join_all(addresses.iter().zip(candidates).map(
@@ -36,26 +41,19 @@ pub async fn check(env: &mut TestEnv) -> Result<()> {
                 env.http
                     .post(format!("{address}/runs/{contended}/init"))
                     .bearer_auth(KEY)
-                    .header(SESSION_HEADER, session.to_string())
+                    .header("x-tensorlane-session", session.to_string())
                     .send()
             },
         ))
         .await;
-        let mut winner = None;
-        for (index, response) in responses.into_iter().enumerate() {
-            let response = response?;
-            if response.status().is_success() {
-                assert!(winner.replace(index).is_none());
-            } else {
-                assert_eq!(response.status(), StatusCode::CONFLICT);
-            }
+        for response in responses {
+            response?.error_for_status()?;
         }
-        let winner = winner.unwrap();
         for address in addresses {
             env.http
                 .post(format!("{address}/runs/{contended}/init"))
                 .bearer_auth(KEY)
-                .header(SESSION_HEADER, candidates[winner].to_string())
+                .header("x-tensorlane-session", candidates[0].to_string())
                 .send()
                 .await?
                 .error_for_status()?;
@@ -63,12 +61,19 @@ pub async fn check(env: &mut TestEnv) -> Result<()> {
         env.http
             .post(format!("{url}/runs/{contended}/end"))
             .bearer_auth(KEY)
-            .header(SESSION_HEADER, candidates[winner].to_string())
+            .header("x-tensorlane-session", candidates[0].to_string())
             .json(&json!({"failed":false}))
             .send()
             .await?
             .error_for_status()?;
         assert_eq!(env.status(&contended).await?, "succeeded");
+        env.http
+            .post(format!("{url}/runs/{contended}/end"))
+            .bearer_auth(KEY)
+            .json(&json!({"failed":false}))
+            .send()
+            .await?
+            .error_for_status()?;
         let initialized: tensorlane_protocol::InitResponse = env
             .request_at(&url, Method::POST, &format!("/runs/{id}/init"))
             .send()
@@ -81,11 +86,11 @@ pub async fn check(env: &mut TestEnv) -> Result<()> {
             env.http
                 .post(format!("{url}/runs/{id}/init"))
                 .bearer_auth(KEY)
-                .header(SESSION_HEADER, Uuid::new_v4().to_string())
+                .header("x-tensorlane-session", Uuid::new_v4().to_string())
                 .send()
                 .await?
                 .status(),
-            StatusCode::CONFLICT
+            StatusCode::OK
         );
         for sequence in 0..5 {
             let address = if sequence % 2 == 0 { &url } else { &env.url };

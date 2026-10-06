@@ -50,3 +50,9 @@ through the committed, ordered migrations.
 Historical migration files still describe the original application dataset tables.
 Their checksums and compatibility exclusions are preserved for existing installs;
 the current declared schema and runtime do not depend on those tables.
+
+Client session ownership and heartbeat tracking have been removed. The server
+uses the existing `runs` and `run_status` tables and does not need `run_sessions`.
+The Atlas-generated `20261006115544_remove_run_sessions` migration drops that
+unused table. Historical migrations and their checksums remain unchanged.
+The new server can run before this cleanup migration is applied.

@@ -85,7 +85,6 @@ class PipelineTests(PipelineCase):
         self.service.assets = {"model": (str(uuid.uuid4()), b"input")}
         with patch.dict("os.environ", {"TENSORLANE_API_KEY": key}):
             self.start()
-        wait_for(lambda: "heartbeat" in auth.methods)
         self.daemon.metric(1, "loss", 0.5)
         self.daemon.save_asset("model", self.file())
         self.daemon.flush()
@@ -101,7 +100,6 @@ class PipelineTests(PipelineCase):
                 "model",
                 "uploads",
                 "metrics",
-                "heartbeat",
                 "end",
             },
         )

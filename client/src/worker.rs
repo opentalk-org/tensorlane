@@ -147,9 +147,6 @@ impl Worker {
             );
         }
         let resources = Resources::new(&options.root)?;
-        let session_path = options.root.join("session");
-        let session = uuid::Uuid::new_v4().to_string();
-        std::fs::write(session_path, &session)?;
         let budgets = resources.budgets.clone();
         let root = options.root.clone();
         let (stop, stopped) = oneshot::channel();
@@ -168,7 +165,6 @@ impl Worker {
                         .build()?;
                     runtime.block_on(execution::supervise(
                         options,
-                        session,
                         budgets,
                         stopped,
                         &ready,

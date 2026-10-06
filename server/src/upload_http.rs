@@ -6,12 +6,7 @@ use uuid::Uuid;
 
 use crate::runtime::Runtime;
 
-pub async fn save(
-    engine: &Runtime,
-    id: Uuid,
-    session: Uuid,
-    mut multipart: Multipart,
-) -> Result<UploadStatus> {
+pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Result<UploadStatus> {
     let mut field = multipart
         .next_field()
         .await?
@@ -72,7 +67,7 @@ pub async fn save(
             )
         }
     };
-    engine.active(run, session).await?;
+    engine.active(run).await?;
     let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&spec)?));
     let existing = engine
         .create_state(&format!("uploads/{id}"), &fingerprint)
@@ -91,8 +86,7 @@ pub async fn save(
     .await?;
     match spec.metadata {
         UploadMetadata::Asset { metadata } => {
-            crate::asset_commit::save(engine, id, session, &metadata, &spec.sha256, spec.size)
-                .await?;
+            crate::asset_commit::save(engine, id, &metadata, &spec.sha256, spec.size).await?;
         }
         UploadMetadata::Artifact { metadata, .. } => {
             engine.save_artifact(id, run, &metadata).await?;

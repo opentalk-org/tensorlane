@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tempfile::TempDir;
-use tensorlane_protocol::{DataResponse, InitResponse, SESSION_HEADER};
+use tensorlane_protocol::{DataResponse, InitResponse};
 use uuid::Uuid;
 
 pub const KEY: &str = "tensorlane-test-key-01234567890123456789";
@@ -50,7 +50,6 @@ pub struct TestEnv {
     pub s3: aws_sdk_s3::Client,
     pub http: reqwest::Client,
     pub url: String,
-    pub session: Uuid,
     pub cache: PathBuf,
     server: Child,
     command: Command,
@@ -146,7 +145,6 @@ impl TestEnv {
             s3,
             http,
             url,
-            session: Uuid::new_v4(),
             cache,
             server,
             command,
@@ -163,7 +161,6 @@ impl TestEnv {
         self.http
             .request(method, format!("{url}{path}"))
             .bearer_auth(KEY)
-            .header(SESSION_HEADER, self.session.to_string())
     }
     pub async fn ready(&self) -> Result<()> {
         self.ready_at(&self.url).await

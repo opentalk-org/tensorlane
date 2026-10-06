@@ -1,7 +1,6 @@
 CREATE TABLE projects (id UUID, name String, description String, created_at DateTime64(6), updated_at DateTime64(6)) ENGINE=ReplacingMergeTree(updated_at) ORDER BY id;
 CREATE TABLE runs (id UUID, project_id UUID, name String, config String) ENGINE=MergeTree ORDER BY (project_id,id);
 CREATE TABLE run_status (timestamp DateTime64(9), run_id UUID, status Enum8('running'=1,'succeeded'=2,'failed'=3,'cancelled'=4,'queued'=5)) ENGINE=MergeTree ORDER BY (run_id,timestamp);
-CREATE TABLE run_sessions (run_id UUID, session_id UUID, updated_at DateTime64(9)) ENGINE=ReplacingMergeTree(updated_at) ORDER BY run_id;
 CREATE TABLE metrics (timestamp DateTime64(9), run_id UUID, step UInt64, name LowCardinality(String), value Float32) ENGINE=MergeTree PARTITION BY toYYYYMM(timestamp) ORDER BY (run_id,name,step,timestamp) SETTINGS non_replicated_deduplication_window=1000000;
 CREATE TABLE array_metrics (timestamp DateTime64(9), run_id UUID, step UInt64, name LowCardinality(String), value Array(Float32)) ENGINE=MergeTree PARTITION BY toYYYYMM(timestamp) ORDER BY (run_id,name,step,timestamp) SETTINGS non_replicated_deduplication_window=1000000;
 CREATE TABLE artifacts (id UUID, run_id UUID, step UInt64, timestamp DateTime64(9), name String, path String, content_type LowCardinality(String), size_bytes UInt64) ENGINE=MergeTree ORDER BY id SETTINGS non_replicated_deduplication_window=1000000;

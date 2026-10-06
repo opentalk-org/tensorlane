@@ -29,13 +29,7 @@ struct ArrayRecord {
     value: Vec<f32>,
 }
 
-pub async fn save(
-    engine: &Runtime,
-    run: Uuid,
-    session: Uuid,
-    request: Uuid,
-    batch: MetricBatch,
-) -> Result<()> {
+pub async fn save(engine: &Runtime, run: Uuid, request: Uuid, batch: MetricBatch) -> Result<()> {
     ensure!(!request.is_nil(), "metric request ID must not be nil");
     ensure!(
         batch.scalars.len() + batch.arrays.len() <= 1000,
@@ -53,7 +47,7 @@ pub async fn save(
             "invalid array metric"
         );
     }
-    engine.active(run, session).await?;
+    engine.active(run).await?;
     let intent = format!("metrics/{run}/{request}");
     let hash = hex::encode(Sha256::digest(serde_json::to_vec(&batch)?));
     let existing = engine.create_state(&intent, &hash).await?;

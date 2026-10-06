@@ -37,10 +37,9 @@ pub(super) fn router(runtime: crate::runtime::Runtime, auth: crate::auth::Auth) 
 async fn save_metrics(
     State(engine): State<crate::runtime::Runtime>,
     Path((run, request)): Path<(Uuid, Uuid)>,
-    headers: HeaderMap,
     Json(batch): Json<tensorlane_protocol::MetricBatch>,
 ) -> Result<StatusCode, AppError> {
-    crate::metric_http::save(&engine, run, session(&headers)?, request, batch)
+    crate::metric_http::save(&engine, run, request, batch)
         .await
         .map_err(runtime_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -49,28 +48,13 @@ async fn save_metrics(
 async fn save_upload(
     State(engine): State<crate::runtime::Runtime>,
     Path(id): Path<Uuid>,
-    headers: HeaderMap,
     multipart: Multipart,
 ) -> Result<Json<tensorlane_protocol::UploadStatus>, AppError> {
     Ok(Json(
-        crate::upload_http::save(&engine, id, session(&headers)?, multipart)
+        crate::upload_http::save(&engine, id, multipart)
             .await
             .map_err(runtime_error)?,
     ))
-}
-
-fn session(headers: &HeaderMap) -> Result<Uuid, AppError> {
-    let session = headers
-        .get(tensorlane_protocol::SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<Uuid>().ok())
-        .filter(|value| !value.is_nil());
-    session.ok_or_else(|| {
-        AppError::new(
-            StatusCode::BAD_REQUEST,
-            anyhow::anyhow!("a nonnil x-tensorlane-session UUID header is required"),
-        )
-    })
 }
 
 fn runtime_error(error: anyhow::Error) -> AppError {
@@ -92,11 +76,7 @@ fn runtime_error(error: anyhow::Error) -> AppError {
         "run not found" | "unknown stream" | "unknown input asset" | "input asset not found" => {
             StatusCode::NOT_FOUND
         }
-        "run is terminal"
-        | "run is already started"
-        | "run is not running"
-        | "run belongs to another client session"
-        | "run is not initialized" => StatusCode::CONFLICT,
+        "run is terminal" | "run is not running" => StatusCode::CONFLICT,
         "server is shutting down"
         | "asset download capacity reached"
         | "shared cache has insufficient free space" => StatusCode::SERVICE_UNAVAILABLE,
@@ -131,36 +111,25 @@ fn runtime_error(error: anyhow::Error) -> AppError {
 async fn initialize(
     State(engine): State<crate::runtime::Runtime>,
     Path(id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<Json<tensorlane_protocol::InitResponse>, AppError> {
-    Ok(Json(
-        engine
-            .initialize(id, session(&headers)?)
-            .await
-            .map_err(runtime_error)?,
-    ))
+    Ok(Json(engine.initialize(id).await.map_err(runtime_error)?))
 }
 
 async fn heartbeat(
     State(engine): State<crate::runtime::Runtime>,
     Path(id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, AppError> {
-    engine
-        .heartbeat(id, session(&headers)?)
-        .await
-        .map_err(runtime_error)?;
+    engine.active(id).await.map_err(runtime_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn end(
     State(engine): State<crate::runtime::Runtime>,
     Path(id): Path<Uuid>,
-    headers: HeaderMap,
     Json(request): Json<tensorlane_protocol::EndRequest>,
 ) -> Result<StatusCode, AppError> {
     engine
-        .end(id, session(&headers)?, request.failed)
+        .end(id, request.failed)
         .await
         .map_err(runtime_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -169,11 +138,10 @@ async fn end(
 async fn batch(
     State(engine): State<crate::runtime::Runtime>,
     Path((id, stream, sequence)): Path<(Uuid, String, u64)>,
-    headers: HeaderMap,
 ) -> Result<Response, AppError> {
     use prost::Message;
     match engine
-        .batch(id, session(&headers)?, &stream, sequence)
+        .batch(id, &stream, sequence)
         .await
         .map_err(runtime_error)?
     {
@@ -208,11 +176,10 @@ async fn batch(
 async fn input_asset(
     State(engine): State<crate::runtime::Runtime>,
     Path((id, name)): Path<(Uuid, String)>,
-    headers: HeaderMap,
 ) -> Result<Json<tensorlane_protocol::AssetDownload>, AppError> {
     Ok(Json(
         engine
-            .asset(id, session(&headers)?, &name)
+            .asset(id, &name)
             .await
             .map_err(runtime_error)?
             .download,
@@ -224,10 +191,7 @@ async fn input_bytes(
     Path((id, name)): Path<(Uuid, String)>,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let source = engine
-        .asset(id, session(&headers)?, &name)
-        .await
-        .map_err(runtime_error)?;
+    let source = engine.asset(id, &name).await.map_err(runtime_error)?;
     let range = headers
         .get("range")
         .and_then(|h| h.to_str().ok())

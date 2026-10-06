@@ -11,7 +11,6 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 use tokio::{
     net::UnixListener,
@@ -21,7 +20,6 @@ use tokio_util::sync::CancellationToken;
 
 pub(super) async fn supervise(
     options: Options,
-    session: String,
     budgets: Arc<Mutex<HashMap<String, Arc<BatchBudget>>>>,
     mut stop: oneshot::Receiver<anyhow::Result<()>>,
     ready: &std::sync::mpsc::SyncSender<anyhow::Result<Initialized>>,
@@ -32,14 +30,9 @@ pub(super) async fn supervise(
     let mut remote = None;
     let startup_timeout = options.startup_timeout;
     let startup = async {
-        let http =
-            crate::transport::connect(&options.addr, options.api_key.as_deref(), session).await?;
+        let http = crate::transport::connect(&options.addr, options.api_key.as_deref()).await?;
         let initialized = http.initialize(&options.run_id).await?;
         remote = Some((http.clone(), initialized.run_id.clone()));
-        let heartbeat = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(send_heartbeats(
-            http.clone(),
-            initialized.run_id.clone(),
-        )));
         let settings = Settings::resolve(&options, &initialized.config)?;
         std::fs::write(options.root.join("ranks"), settings.ranks.to_string())?;
         ensure!(
@@ -87,7 +80,7 @@ pub(super) async fn supervise(
         for _ in 0..settings.num_workers {
             work.push(Sender::<Work, _>::new(work_listener.accept().await?.0));
         }
-        anyhow::Ok((http, initialized, work, heartbeat))
+        anyhow::Ok((http, initialized, work))
     };
     let started = tokio::select! {
         result = startup => result.map(Some),
@@ -99,7 +92,7 @@ pub(super) async fn supervise(
             }
         } => Err(anyhow!("TensorLane startup timed out")),
     };
-    let (http, initialized, work, mut heartbeat) = match started {
+    let (http, initialized, work) = match started {
         Ok(Some(started)) => started,
         result => {
             let ended = match remote {
@@ -202,10 +195,6 @@ pub(super) async fn supervise(
             tokio::select! {
                 biased;
                 result = &mut stop => return result.unwrap_or(Ok(())),
-                result = &mut heartbeat => {
-                    result.context("heartbeat task panicked")??;
-                    return Err(anyhow!("heartbeat stopped unexpectedly"));
-                },
                 result = &mut uploads => {
                     uploads_complete = true;
                     result.context("upload task panicked")??;
@@ -251,13 +240,4 @@ pub(super) async fn supervise(
         .await
         .context("ending run failed");
     result.and(ended)
-}
-
-async fn send_heartbeats(http: crate::transport::HttpClient, run_id: String) -> anyhow::Result<()> {
-    loop {
-        if let Err(error) = http.heartbeat(&run_id).await {
-            eprintln!("TensorLane heartbeat failed: {error:#}");
-        }
-        tokio::time::sleep(Duration::from_secs(10)).await;
-    }
 }
