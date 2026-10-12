@@ -2,12 +2,17 @@ use anyhow::{Context, ensure};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::{Method, StatusCode};
 use sha2::{Digest, Sha256};
+use fs2::FileExt;
 use std::{
     collections::HashMap,
+    os::unix::fs::FileExt as _,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tensorlane_protocol::{AssetDownload, InitResponse, TRANSFER_CHUNK_BYTES};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::fs;
+
+const PARALLEL_RANGES: usize = 16;
 
 pub async fn prefetch(
     http: &crate::transport::HttpClient,
@@ -62,64 +67,128 @@ async fn download(
         "asset_type": info.metadata.asset_type,
     })
     .to_string();
-    fs::create_dir_all(&destination).await?;
-    let partial = destination.join("download.part");
-    let path = destination.join("data");
-    let mut file = fs::File::create(&partial).await?;
-    let mut offset = 0u64;
-    let mut digest = Sha256::new();
-    while offset < info.size {
-        let end = (offset + TRANSFER_CHUNK_BYTES as u64).min(info.size) - 1;
-        let (status, headers, bytes) = http
-            .request(
-                Method::GET,
-                &["runs", run_id, "inputs", name, "bytes"],
-                None,
-                &[
-                    ("range", format!("bytes={offset}-{end}")),
-                    ("if-match", info.etag.clone()),
-                ],
-            )
-            .await?;
-        ensure!(
-            status == StatusCode::PARTIAL_CONTENT,
-            "server did not honor asset Range"
-        );
-        ensure!(
-            headers.get("content-range").and_then(|v| v.to_str().ok())
-                == Some(format!("bytes {offset}-{end}/{}", info.size).as_str()),
-            "unexpected asset Content-Range"
-        );
-        ensure!(
-            headers.get("etag").and_then(|v| v.to_str().ok()) == Some(info.etag.as_str()),
-            "input asset changed during download"
-        );
-        ensure!(
-            bytes.len() as u64 == end - offset + 1,
-            "truncated asset range"
-        );
-        file.write_all(&bytes).await?;
-        digest.update(&bytes);
-        offset = end + 1;
+
+    // Asset bytes are immutable, so a finished entry is keyed by asset id and content hash.
+    let cache = std::env::var_os("TENSORLANE_ASSET_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/root".into()))
+                .join(".cache/tensorlane/assets")
+        });
+    fs::create_dir_all(&cache).await?;
+    let cache = fs::canonicalize(cache).await?;
+    let content = info.sha256.as_deref().unwrap_or(&info.etag);
+    let asset_id = info.metadata.asset_id.as_deref().unwrap_or("");
+    let key = hex::encode(Sha256::digest(format!("{asset_id}\n{content}")));
+    let entry = cache.join(&key);
+
+    if !entry.exists() {
+        // The lock serializes processes; the entry only appears by atomic rename after a
+        // complete download and extraction.
+        let lock_path = cache.join(format!("{key}.lock"));
+        let lock = tokio::task::spawn_blocking(move || {
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(lock_path)?;
+            lock.lock_exclusive()?;
+            Ok::<_, std::io::Error>(lock)
+        })
+        .await??;
+        if !entry.exists() {
+            let partial = cache.join(format!("{key}.part"));
+            let _ = fs::remove_dir_all(&partial).await;
+            fs::create_dir_all(&partial).await?;
+            let data = partial.join("data");
+            fetch(&http, run_id, name, &info, &data).await?;
+            let extract_to = partial.clone();
+            tokio::task::spawn_blocking(move || extract(&extract_to))
+                .await
+                .context("asset extraction task failed")??;
+            fs::rename(&partial, &entry).await?;
+        }
+        drop(lock);
     }
-    if let Some(expected) = info.sha256 {
-        ensure!(
-            hex::encode(digest.finalize()) == expected,
-            "downloaded asset hash does not match metadata"
-        );
-    }
-    file.flush().await?;
-    drop(file);
-    fs::rename(partial, &path).await?;
-    let path = tokio::task::spawn_blocking(move || materialize(&path, entrypoint.as_deref()))
-        .await
-        .context("asset extraction task failed")??;
-    Ok((fs::canonicalize(path).await?, metadata))
+
+    let selected = select(&entry, entrypoint.as_deref())?;
+    fs::create_dir_all(destination.parent().context("asset destination has no parent")?).await?;
+    fs::symlink(&entry, &destination).await?;
+    Ok((destination.join(selected.strip_prefix(&entry)?), metadata))
 }
 
-fn materialize(path: &Path, entrypoint: Option<&str>) -> anyhow::Result<PathBuf> {
+/// Download `info.size` bytes with parallel Range requests into a preallocated file.
+async fn fetch(
+    http: &crate::transport::HttpClient,
+    run_id: &str,
+    name: &str,
+    info: &AssetDownload,
+    data: &Path,
+) -> anyhow::Result<()> {
+    let file = std::fs::File::create(data)?;
+    file.set_len(info.size)?;
+    let file = Arc::new(file);
+    let chunk = TRANSFER_CHUNK_BYTES as u64;
+    stream::iter((0..info.size).step_by(TRANSFER_CHUNK_BYTES))
+        .map(|offset| {
+            let file = file.clone();
+            async move {
+                let end = (offset + chunk).min(info.size) - 1;
+                let (status, headers, bytes) = http
+                    .request(
+                        Method::GET,
+                        &["runs", run_id, "inputs", name, "bytes"],
+                        None,
+                        &[
+                            ("range", format!("bytes={offset}-{end}")),
+                            ("if-match", info.etag.clone()),
+                        ],
+                    )
+                    .await?;
+                ensure!(
+                    status == StatusCode::PARTIAL_CONTENT,
+                    "server did not honor asset Range"
+                );
+                ensure!(
+                    headers.get("content-range").and_then(|v| v.to_str().ok())
+                        == Some(format!("bytes {offset}-{end}/{}", info.size).as_str()),
+                    "unexpected asset Content-Range"
+                );
+                ensure!(
+                    headers.get("etag").and_then(|v| v.to_str().ok()) == Some(info.etag.as_str()),
+                    "input asset changed during download"
+                );
+                ensure!(
+                    bytes.len() as u64 == end - offset + 1,
+                    "truncated asset range"
+                );
+                tokio::task::spawn_blocking(move || file.write_all_at(&bytes, offset))
+                    .await
+                    .context("asset write task failed")??;
+                Ok::<_, anyhow::Error>(())
+            }
+        })
+        .buffer_unordered(PARALLEL_RANGES)
+        .try_collect::<()>()
+        .await?;
+    if let Some(expected) = info.sha256.clone() {
+        let path = data.to_owned();
+        let actual = tokio::task::spawn_blocking(move || {
+            let mut digest = Sha256::new();
+            std::io::copy(&mut std::fs::File::open(path)?, &mut digest)?;
+            Ok::<_, std::io::Error>(hex::encode(digest.finalize()))
+        })
+        .await??;
+        ensure!(actual == expected, "downloaded asset hash does not match metadata");
+    }
+    Ok(())
+}
+
+/// Unpack `<dir>/data` into `<dir>/extracted` and remove it when it is a tar archive.
+fn extract(dir: &Path) -> anyhow::Result<()> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
+    let path = dir.join("data");
+    let mut file = std::fs::File::open(&path)?;
     let mut block = [0u8; 512];
     let count = file.read(&mut block)?;
     let header = tar::Header::from_byte_slice(&block);
@@ -133,10 +202,10 @@ fn materialize(path: &Path, entrypoint: Option<&str>) -> anyhow::Result<PathBuf>
         && (header.cksum().ok() == Some(checksum)
             || (block == [0; 512] && file.metadata()?.len() >= 1024));
     if !is_tar {
-        return Ok(path.to_owned());
+        return Ok(());
     }
     file.seek(SeekFrom::Start(0))?;
-    let extracted = path.with_file_name("extracted");
+    let extracted = dir.join("extracted");
     std::fs::create_dir_all(&extracted)?;
     for entry in tar::Archive::new(file).entries()? {
         let mut entry = entry?;
@@ -149,7 +218,19 @@ fn materialize(path: &Path, entrypoint: Option<&str>) -> anyhow::Result<PathBuf>
             "asset archive path escapes extraction directory"
         );
     }
-    let result = if let Some(entrypoint) = entrypoint {
+    std::fs::remove_file(path)?;
+    Ok(())
+}
+
+/// The path handed to the training process: the raw file, or the entrypoint / single child
+/// of the extracted archive.
+fn select(dir: &Path, entrypoint: Option<&str>) -> anyhow::Result<PathBuf> {
+    let data = dir.join("data");
+    if data.exists() {
+        return Ok(data);
+    }
+    let extracted = dir.join("extracted");
+    if let Some(entrypoint) = entrypoint {
         let selected = extracted
             .join(entrypoint)
             .canonicalize()
@@ -158,15 +239,12 @@ fn materialize(path: &Path, entrypoint: Option<&str>) -> anyhow::Result<PathBuf>
             selected.starts_with(extracted.canonicalize()?),
             "asset entrypoint escapes extraction directory"
         );
-        selected
+        return Ok(selected);
+    }
+    let children = std::fs::read_dir(&extracted)?.collect::<Result<Vec<_>, _>>()?;
+    if children.len() == 1 {
+        Ok(children[0].path())
     } else {
-        let children = std::fs::read_dir(&extracted)?.collect::<Result<Vec<_>, _>>()?;
-        if children.len() == 1 {
-            children[0].path()
-        } else {
-            extracted
-        }
-    };
-    std::fs::remove_file(path)?;
-    Ok(result)
+        Ok(extracted)
+    }
 }
