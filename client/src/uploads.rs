@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::{
     io::{Seek, SeekFrom},
     path::PathBuf,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tensorlane_protocol::{
@@ -17,10 +18,13 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
     net::{UnixListener, UnixStream},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     task::JoinSet,
+    time::{Duration, interval},
 };
 use tokio_util::sync::CancellationToken;
+
+const CONCURRENT_ARTIFACTS: usize = 16;
 
 pub async fn serve(
     listener: UnixListener,
@@ -88,7 +92,25 @@ async fn receive(
     let mut automatic = false;
     let processing = async {
         let mut metrics = Metrics::new(http.clone(), run_id.clone());
-        while let Some(job) = queue.recv().await {
+        // Artifacts upload concurrently on their own tasks so scalars never wait for them.
+        let permits = Arc::new(Semaphore::new(CONCURRENT_ARTIFACTS));
+        let mut artifacts = JoinSet::new();
+        let mut tick = interval(Duration::from_secs(1));
+        loop {
+            let job = tokio::select! {
+                job = queue.recv() => match job {
+                    Some(job) => job,
+                    None => break,
+                },
+                Some(result) = artifacts.join_next() => {
+                    result??;
+                    continue;
+                }
+                _ = tick.tick() => {
+                    metrics.flush().await?;
+                    continue;
+                }
+            };
             match job {
                 Upload::Automatic => automatic = true,
                 Upload::SaveAsset {
@@ -118,28 +140,58 @@ async fn receive(
                     .await?
                 }
                 Upload::Flush => {
+                    while let Some(result) = artifacts.join_next().await {
+                        result??;
+                    }
                     metrics.flush().await?;
                     replies.send(&Ok(())).await?;
                 }
-                Upload::Metric { step, name, value } => {
+                Upload::Metric {
+                    step,
+                    name,
+                    value,
+                    timestamp_unix_ms,
+                } => {
                     metrics
                         .metric(ScalarMetric {
                             step,
                             name,
                             value,
-                            timestamp_unix_ms: timestamp()?,
+                            timestamp_unix_ms,
                         })
                         .await?;
                 }
                 Upload::Artifact {
                     step,
+                    timestamp_unix_ms,
                     path,
                     name,
                     content_type,
                 } => {
-                    metrics.artifact(step, path, name, content_type).await?;
+                    let http = http.clone();
+                    let run_id = run_id.clone();
+                    let permits = permits.clone();
+                    artifacts.spawn(async move {
+                        let _permit = permits.acquire().await?;
+                        artifact(
+                            http,
+                            run_id,
+                            ArtifactMetric {
+                                step,
+                                timestamp_unix_ms,
+                                name,
+                                size_bytes: 0,
+                                content_type,
+                            },
+                            path,
+                        )
+                        .await
+                    });
                 }
             }
+        }
+        while let Some(result) = artifacts.join_next().await {
+            result??;
         }
         metrics.flush().await
     };
@@ -157,7 +209,7 @@ async fn receive(
     }
 }
 
-fn timestamp() -> anyhow::Result<i64> {
+pub(crate) fn timestamp() -> anyhow::Result<i64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_millis()
@@ -203,39 +255,24 @@ impl Metrics {
         self.batch = MetricBatch::default();
         Ok(())
     }
+}
 
-    async fn artifact(
-        &mut self,
-        step: u64,
-        path: PathBuf,
-        name: String,
-        content_type: String,
-    ) -> anyhow::Result<()> {
-        self.flush().await?;
-        let (file, directory) = upload_source(path).await?;
-        let size = file.metadata().await?.len();
-        let metadata = UploadMetadata::Artifact {
-            run_id: self.run_id.clone(),
-            metadata: ArtifactMetric {
-                step,
-                timestamp_unix_ms: timestamp()?,
-                name,
-                size_bytes: size,
-                content_type: if directory {
-                    "application/x-tar".into()
-                } else {
-                    content_type
-                },
-            },
-        };
-        transfer(
-            &self.client,
-            &uuid::Uuid::new_v4().to_string(),
-            metadata,
-            file,
-        )
-        .await
+async fn artifact(
+    client: crate::transport::HttpClient,
+    run_id: String,
+    mut metric: ArtifactMetric,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    let (file, directory) = upload_source(path).await?;
+    metric.size_bytes = file.metadata().await?.len();
+    if directory {
+        metric.content_type = "application/x-tar".into();
     }
+    let metadata = UploadMetadata::Artifact {
+        run_id,
+        metadata: metric,
+    };
+    transfer(&client, &uuid::Uuid::new_v4().to_string(), metadata, file).await
 }
 
 async fn save_asset(

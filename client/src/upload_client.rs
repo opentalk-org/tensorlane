@@ -22,9 +22,11 @@ pub(crate) enum Upload {
         step: u64,
         name: String,
         value: f32,
+        timestamp_unix_ms: i64,
     },
     Artifact {
         step: u64,
+        timestamp_unix_ms: i64,
         path: PathBuf,
         name: String,
         content_type: String,
@@ -150,7 +152,12 @@ impl UploadClient {
         value: f32,
         timeout: Option<f64>,
     ) -> anyhow::Result<()> {
-        let command = Command::Send(Upload::Metric { step, name, value });
+        let command = Command::Send(Upload::Metric {
+            step,
+            name,
+            value,
+            timestamp_unix_ms: crate::uploads::timestamp()?,
+        });
         let Some(timeout) = timeout else {
             return py.allow_threads(|| self.enqueue(command));
         };
@@ -178,6 +185,7 @@ impl UploadClient {
             py,
             Upload::Artifact {
                 step,
+                timestamp_unix_ms: crate::uploads::timestamp()?,
                 path,
                 name,
                 content_type,
