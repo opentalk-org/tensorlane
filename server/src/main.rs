@@ -113,7 +113,7 @@ struct Args {
         help = "Directory for disposable query, batch, and input asset caches."
     )]
     cache_dir: PathBuf,
-    #[arg(long, env = "CACHE_BYTES", default_value_t = 15 * 1024 * 1024 * 1024u64)]
+    #[arg(long, env = "CACHE_BYTES", default_value_t = 50 * 1024 * 1024 * 1024u64)]
     cache_bytes: u64,
     #[arg(
         long,
