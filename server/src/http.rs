@@ -214,7 +214,7 @@ mod tests {
             s3,
             "test",
             cache.path().to_owned(),
-            0,
+            crate::cache_limits::Budget::new(cache.path().to_owned(), u64::MAX),
             shutdown.clone(),
             "checkpoints",
             "metrics",

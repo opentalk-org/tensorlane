@@ -10,12 +10,14 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::SeekFrom,
     path::Path,
+    sync::Arc,
 };
 use tokio::{
     fs::{self, File},
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
 };
 
+const PLAN_RESERVATION: u64 = 64 * 1024 * 1024;
 const IO_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Deserialize)]
@@ -70,6 +72,7 @@ pub struct QuerySampler {
 }
 impl QuerySampler {
     pub async fn create(
+        budget: &Arc<crate::cache_limits::Budget>,
         name: &str,
         rows: impl Stream<Item = Result<SampleRow>> + Send,
         path: &Path,
@@ -79,6 +82,7 @@ impl QuerySampler {
         let mut previous = None;
         let mut offsets = Vec::new();
         let mut bytes = 0u64;
+        let mut reserved = Vec::new();
         futures::pin_mut!(rows);
         while let Some(row) = rows.try_next().await? {
             let key = (row.batch_idx, row.sample_idx);
@@ -95,6 +99,11 @@ impl QuerySampler {
             }
             previous = Some(key);
             let encoded = row.encode_to_vec();
+            while bytes + offsets.len() as u64 + encoded.len() as u64 + 8
+                > reserved.len() as u64 * PLAN_RESERVATION
+            {
+                reserved.push(budget.reserve(PLAN_RESERVATION).await?);
+            }
             writer.write_u64_le(encoded.len() as u64).await?;
             writer.write_all(&encoded).await?;
             bytes += encoded.len() as u64 + 8;

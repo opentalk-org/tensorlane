@@ -41,8 +41,13 @@ impl Runtime {
             crate::job::check(&path.with_extension("error")).await?;
             if !fs::try_exists(&ready).await? {
                 let rows = stream_samples(&self.database, &query.sql, &query.params);
-                self.tasks
-                    .spawn(prepare_plan(name.to_owned(), rows, path.clone(), lock));
+                self.tasks.spawn(prepare_plan(
+                    self.budget.clone(),
+                    name.to_owned(),
+                    rows,
+                    path.clone(),
+                    lock,
+                ));
             }
             if !crate::job::wait_for_file(&ready).await? {
                 return Ok(Batch::Pending);
@@ -92,12 +97,13 @@ impl Runtime {
 }
 
 async fn prepare_plan(
+    budget: Arc<crate::cache_limits::Budget>,
     name: String,
     rows: impl Stream<Item = Result<SampleRow>> + Send,
     path: PathBuf,
     _lock: Lock,
 ) {
-    if let Err(error) = QuerySampler::create(&name, rows, &path).await {
+    if let Err(error) = QuerySampler::create(&budget, &name, rows, &path).await {
         crate::job::failed(&path.with_extension("error"), &error).await;
     }
 }
@@ -127,13 +133,7 @@ async fn write_batch(
     let (response, _permit) =
         load_batch(engine.loader.as_ref(), stream, plan, memory, limit).await?;
     let bytes = response.encode_to_vec();
-    crate::cache_limits::reserve(
-        &engine.cache,
-        engine.cache_bytes,
-        &engine.cache_written,
-        bytes.len() as u64,
-    )
-    .await?;
+    let _reserved = engine.budget.reserve(bytes.len() as u64).await?;
     write_atomic(path, &bytes).await
 }
 

@@ -18,7 +18,13 @@ async fn sampler(
 ) -> anyhow::Result<(tempfile::TempDir, QuerySampler)> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("plan");
-    QuerySampler::create("training", stream::iter(rows.into_iter().map(Ok)), &path).await?;
+    QuerySampler::create(
+        &crate::cache_limits::Budget::new(dir.path().to_owned(), u64::MAX),
+        "training",
+        stream::iter(rows.into_iter().map(Ok)),
+        &path,
+    )
+    .await?;
     let sampler = QuerySampler::open(&path, repeat).await?;
     Ok((dir, sampler))
 }
@@ -123,17 +129,27 @@ async fn query_errors_and_cancellation_remove_partial_plans() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plan");
     let rows = stream::iter([Ok(row(0, 0, "a")), Err(anyhow::anyhow!("query failed"))]);
-    let error = QuerySampler::create("training", rows, &path)
-        .await
-        .err()
-        .unwrap();
+    let error = QuerySampler::create(
+        &crate::cache_limits::Budget::new(dir.path().to_owned(), u64::MAX),
+        "training",
+        rows,
+        &path,
+    )
+    .await
+    .err()
+    .unwrap();
     assert!(error.to_string().contains("query failed"));
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     let rows = futures::StreamExt::chain(stream::iter([Ok(row(0, 0, "a"))]), stream::pending());
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(100),
-            QuerySampler::create("training", rows, &path)
+            QuerySampler::create(
+                &crate::cache_limits::Budget::new(dir.path().to_owned(), u64::MAX),
+                "training",
+                rows,
+                &path
+            )
         )
         .await
         .is_err()

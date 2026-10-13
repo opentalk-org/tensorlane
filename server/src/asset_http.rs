@@ -47,19 +47,12 @@ pub async fn download(engine: Runtime, source: AssetSource, range: (u64, u64)) -
         object.content_length() == Some(length as i64),
         "R2 returned an unexpected asset range size"
     );
-    crate::cache_limits::reserve(
-        &engine.cache,
-        engine.cache_bytes,
-        &engine.cache_written,
-        length,
-    )
-    .await?;
-    crate::cache_limits::space(&dir, length).await?;
+    let reserved = engine.budget.reserve(length).await?;
     let part = TemporaryFile(path.with_extension(format!("{}.part", uuid::Uuid::new_v4())));
     let file = fs::File::create(&part.0).await?;
     let body = Body::from_stream(
         async_stream::try_stream! {
-            let (_lock, _permit, part) = (lock, permit, part);
+            let (_lock, _permit, _reserved, part) = (lock, permit, reserved, part);
             let mut file = BufWriter::with_capacity(256 * 1024, file);
             let mut upstream = object.body;
             let mut received = 0u64;

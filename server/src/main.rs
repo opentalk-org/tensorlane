@@ -195,8 +195,8 @@ async fn main() -> anyhow::Result<()> {
         database,
         s3_client,
         args.bucket.leak(),
-        args.cache_dir,
-        args.cache_bytes,
+        args.cache_dir.clone(),
+        cache_limits::Budget::open(args.cache_dir, args.cache_bytes).await?,
         shutdown.clone(),
         args.checkpoint_prefix.leak(),
         args.metrics_prefix.leak(),
@@ -218,9 +218,7 @@ async fn main() -> anyhow::Result<()> {
 async fn maintain(runtime: runtime::Runtime) {
     let started = Instant::now();
     loop {
-        if let Err(error) =
-            cache_limits::prune(&runtime.cache, runtime.cache_bytes, &runtime.cache_written).await
-        {
+        if let Err(error) = runtime.budget.prune(0).await {
             warn!(error = %error, "cache cleanup failed");
         }
         if started.elapsed() >= Duration::from_secs(120)

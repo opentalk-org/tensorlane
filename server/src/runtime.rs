@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
+    sync::{Arc, Mutex, Weak},
 };
 use tensorlane_protocol::{AssetDownload, AssetMetadata, Checkpoint, InitResponse};
 use tokio::{fs, sync::Semaphore};
@@ -28,8 +28,7 @@ pub struct Runtime {
     pub s3: aws_sdk_s3::Client,
     pub bucket: &'static str,
     pub cache: Arc<PathBuf>,
-    pub cache_bytes: u64,
-    pub cache_written: Arc<AtomicU64>,
+    pub budget: Arc<crate::cache_limits::Budget>,
     pub shutdown: CancellationToken,
     pub tasks: TaskTracker,
     pub(super) checkpoint_prefix: &'static str,
@@ -59,7 +58,7 @@ impl Runtime {
         s3: aws_sdk_s3::Client,
         bucket: &'static str,
         cache: PathBuf,
-        cache_bytes: u64,
+        budget: Arc<crate::cache_limits::Budget>,
         shutdown: CancellationToken,
         checkpoint_prefix: &'static str,
         metrics_prefix: &'static str,
@@ -75,8 +74,7 @@ impl Runtime {
             s3,
             bucket,
             cache: Arc::new(cache),
-            cache_bytes,
-            cache_written: Arc::new(AtomicU64::new(0)),
+            budget,
             shutdown,
             tasks: TaskTracker::new(),
             checkpoint_prefix,
@@ -263,7 +261,7 @@ mod tests {
             aws_sdk_s3::Client::from_conf(config),
             "test",
             PathBuf::from("unused"),
-            0,
+            crate::cache_limits::Budget::new(PathBuf::from("unused"), u64::MAX),
             CancellationToken::new(),
             "checkpoints",
             "metrics",

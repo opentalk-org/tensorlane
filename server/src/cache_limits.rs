@@ -5,8 +5,8 @@ use std::{
     ffi::OsStr,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::SystemTime,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
 };
 use tokio::fs;
 
@@ -22,51 +22,108 @@ pub async fn space(path: &Path, bytes: u64) -> Result<()> {
     Ok(())
 }
 
-pub async fn reserve(root: &Path, limit: u64, written: &AtomicU64, bytes: u64) -> Result<()> {
-    if written.fetch_add(bytes, Ordering::Relaxed) + bytes > limit / 16 {
-        prune(root, limit, written).await?;
-    }
-    Ok(())
+pub struct Budget {
+    root: PathBuf,
+    limit: u64,
+    usage: Mutex<(u64, u64)>,
 }
 
-pub async fn prune(root: &Path, limit: u64, written: &AtomicU64) -> Result<()> {
-    let Some(_lock) = Lock::try_acquire(&root.join("prune.lock")).await? else {
-        return Ok(());
-    };
-    written.store(0, Ordering::Relaxed);
-    let root = root.to_owned();
-    let mut groups = tokio::task::spawn_blocking(move || groups(&root)).await??;
-    let mut used: u64 = groups.iter().map(|(_, size, _)| size).sum();
-    groups.sort();
-    for (_, size, mut members) in groups {
-        if used <= limit {
-            break;
+pub struct Reservation {
+    budget: Arc<Budget>,
+    bytes: u64,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut usage = self.budget.usage.lock().unwrap();
+        usage.0 += self.bytes;
+        usage.1 -= self.bytes;
+    }
+}
+
+impl Budget {
+    pub fn new(root: PathBuf, limit: u64) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            limit,
+            usage: Mutex::new((0, 0)),
+        })
+    }
+
+    pub async fn open(root: PathBuf, limit: u64) -> Result<Arc<Self>> {
+        let scan = root.clone();
+        let (_, parts) = tokio::task::spawn_blocking(move || groups(&scan)).await??;
+        for part in parts {
+            let _ = fs::remove_file(part).await;
         }
-        let lock = members[0].with_extension("lock");
-        let Some(_lock) = Lock::try_acquire(&lock).await? else {
-            continue;
-        };
-        members.push(lock);
-        members.sort_by_key(|path| {
-            (
-                path.extension() != Some(OsStr::new("ready")),
-                path.extension() == Some(OsStr::new("lock")),
-            )
-        });
-        for member in members {
-            match fs::remove_file(member).await {
-                Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),
-                _ => {}
+        let budget = Self::new(root, limit);
+        budget.prune(0).await?;
+        Ok(budget)
+    }
+
+    pub async fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation> {
+        ensure!(
+            bytes <= self.limit,
+            "cache entry of {bytes} bytes exceeds CACHE_BYTES"
+        );
+        loop {
+            {
+                let mut usage = self.usage.lock().unwrap();
+                if usage.0 + usage.1 + bytes <= self.limit {
+                    usage.1 += bytes;
+                    return Ok(Reservation {
+                        budget: self.clone(),
+                        bytes,
+                    });
+                }
+            }
+            if !self.prune(bytes).await? {
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
-        used -= size;
     }
-    Ok(())
+
+    pub async fn prune(&self, incoming: u64) -> Result<bool> {
+        let _lock = Lock::acquire(&self.root.join("prune.lock")).await?;
+        let root = self.root.clone();
+        let (mut groups, _) = tokio::task::spawn_blocking(move || groups(&root)).await??;
+        let mut used: u64 = groups.iter().map(|(_, size, _)| size).sum();
+        let target = self
+            .limit
+            .saturating_sub(self.usage.lock().unwrap().1 + incoming);
+        groups.sort();
+        for (_, size, mut members) in groups {
+            if used <= target {
+                break;
+            }
+            let lock = members[0].with_extension("lock");
+            let Some(_lock) = Lock::try_acquire(&lock).await? else {
+                continue;
+            };
+            members.push(lock);
+            members.sort_by_key(|path| {
+                (
+                    path.extension() != Some(OsStr::new("ready")),
+                    path.extension() == Some(OsStr::new("lock")),
+                )
+            });
+            for member in members {
+                match fs::remove_file(member).await {
+                    Err(error) if error.kind() != ErrorKind::NotFound => return Err(error.into()),
+                    _ => {}
+                }
+            }
+            used -= size;
+        }
+        self.usage.lock().unwrap().0 = used;
+        Ok(used <= target)
+    }
 }
 
-fn groups(root: &Path) -> std::io::Result<Vec<Group>> {
+fn groups(root: &Path) -> std::io::Result<(Vec<Group>, Vec<PathBuf>)> {
     let mut pending = vec![root.join("assets"), root.join("runs")];
     let mut groups: HashMap<PathBuf, Group> = HashMap::new();
+    let mut parts = Vec::new();
     while let Some(path) = pending.pop() {
         let dir = match std::fs::read_dir(&path) {
             Ok(dir) => dir,
@@ -80,7 +137,9 @@ fn groups(root: &Path) -> std::io::Result<Vec<Group>> {
             };
             if metadata.is_dir() {
                 pending.push(path);
-            } else if path.extension() != Some(OsStr::new("part")) {
+            } else if path.extension() == Some(OsStr::new("part")) {
+                parts.push(path);
+            } else {
                 let group = groups.entry(path.with_extension("")).or_insert((
                     SystemTime::UNIX_EPOCH,
                     0,
@@ -92,13 +151,12 @@ fn groups(root: &Path) -> std::io::Result<Vec<Group>> {
             }
         }
     }
-    Ok(groups.into_values().collect())
+    Ok((groups.into_values().collect(), parts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[tokio::test]
     async fn pruning_removes_whole_unlocked_groups_and_keeps_locked_ones() -> Result<()> {
@@ -120,8 +178,8 @@ mod tests {
         fs::write(inputs.join("h.json"), b"{}").await?;
         let range_lock = Lock::acquire(&range.join("0-3.lock")).await?;
         let plan_lock = Lock::acquire(&plans.join("0.lock")).await?;
-        let written = AtomicU64::new(0);
-        prune(temp.path(), 0, &written).await?;
+        let budget = Budget::new(temp.path().to_owned(), 0);
+        budget.prune(0).await?;
         assert!(range.join("0-3").exists());
         for name in ["0.plan", "0.index", "0.ready", "0.error"] {
             assert!(plans.join(name).exists());
@@ -130,7 +188,7 @@ mod tests {
         assert_eq!(std::fs::read_dir(&inputs)?.count(), 0);
         drop(range_lock);
         drop(plan_lock);
-        prune(temp.path(), 0, &written).await?;
+        budget.prune(0).await?;
         assert_eq!(std::fs::read_dir(&range)?.count(), 0);
         let left: Vec<_> = std::fs::read_dir(&plans)?
             .map(|entry| entry.unwrap().file_name())
@@ -151,7 +209,7 @@ mod tests {
         fs::write(data.join("0.batch"), b"data").await?;
         std::fs::File::open(data.join("0.batch"))?
             .set_modified(SystemTime::now() - Duration::from_secs(60))?;
-        prune(temp.path(), 9, &AtomicU64::new(0)).await?;
+        Budget::new(temp.path().to_owned(), 9).prune(0).await?;
         assert!(!data.join("0.batch").exists());
         assert!(plans.join("0.plan").exists());
         for name in ["0.plan", "0.ready"] {
@@ -159,7 +217,7 @@ mod tests {
                 .set_modified(SystemTime::now() - Duration::from_secs(60))?;
         }
         fs::write(data.join("1.batch"), b"data").await?;
-        prune(temp.path(), 4, &AtomicU64::new(0)).await?;
+        Budget::new(temp.path().to_owned(), 4).prune(0).await?;
         assert!(!plans.join("0.plan").exists());
         assert!(!plans.join("0.ready").exists());
         assert!(data.join("1.batch").exists());
@@ -167,17 +225,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writes_prune_once_they_exceed_the_slack() -> Result<()> {
+    async fn reservations_never_exceed_the_limit_and_evict_old_entries() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let data = temp.path().join("runs/r/data");
         fs::create_dir_all(&data).await?;
-        fs::write(data.join("0.batch"), vec![0; 100]).await?;
-        let written = AtomicU64::new(0);
-        reserve(temp.path(), 32, &written, 2).await?;
-        assert!(data.join("0.batch").exists());
-        reserve(temp.path(), 32, &written, 1).await?;
+        fs::write(data.join("0.batch"), vec![0; 20]).await?;
+        fs::write(data.join("1.batch.x.part"), vec![0; 20]).await?;
+        let budget = Budget::open(temp.path().to_owned(), 32).await?;
+        assert!(!data.join("1.batch.x.part").exists());
+        let first = budget.reserve(20).await?;
         assert!(!data.join("0.batch").exists());
-        assert_eq!(written.load(Ordering::Relaxed), 0);
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.reserve(20).await.map(drop) }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), waiting).await???;
+        assert!(budget.reserve(33).await.is_err());
         Ok(())
     }
 }
