@@ -1,25 +1,34 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 from multiprocessing.connection import Client, wait
 from pathlib import Path
-import queue
+import os
+import select
+import signal
 import threading
-import traceback
 import time
 
 from . import _native
 from . import _ipc
 from .data import Batch, RawSample
 
+SIGNALS = {signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGUSR1, signal.SIGUSR2}
 
-def _connect(path: Path, key: bytes, stopped):
-    while not stopped.is_set():
-        try:
-            return Client(str(path), family="AF_UNIX", authkey=key)
-        except (FileNotFoundError, ConnectionRefusedError):
-            time.sleep(0.02)
-    raise RuntimeError("daemon stopped during connection")
+
+def _exit_with(owner: int) -> None:
+    select.select([os.pidfd_open(owner)], [], [])
+    os._exit(1)
+
+
+def _connect(path: Path, key: bytes):
+    try:
+        connection = Client(str(path), family="AF_UNIX", authkey=key)
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    connection.send(("ready", None))
+    return connection
 
 
 def share(value):
@@ -44,75 +53,54 @@ def share(value):
     raise TypeError(f"unsupported worker output: {type(value).__name__}")
 
 
-def transform_worker(root: Path, transform, streams, output, stopped) -> None:
-    receiver = _native.Listener(root / "work.sock")
-    try:
-        import torch
+def transform_worker(
+    owner: int, root: Path, transform, streams, output, stopped
+) -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    threading.Thread(target=_exit_with, args=(owner,), daemon=True).start()
+    import torch
 
-        torch.set_num_threads(1)
-        ended = set()
-        with torch.no_grad():
-            while not stopped.is_set():
-                message = receiver.recv() if len(ended) < len(streams) else None
-                if len(ended) == len(streams):
-                    stopped.wait(0.1)
-                    continue
-                if message is None:
-                    if stopped.is_set():
-                        return
-                    raise RuntimeError("data stream ended before End")
-                stream = message["stream"]
-                if stream not in streams or stream in ended:
-                    raise RuntimeError("unexpected or already ended stream")
-                if message["kind"] == "batch":
-                    parts = []
-                    for item in message["samples"]:
-                        try:
-                            started = time.monotonic()
-                            metadata = json.loads(item["metadata_json"])
-                            if not isinstance(metadata, dict):
-                                raise TypeError("sample metadata must be an object")
-                            sample = RawSample(
-                                item["sample_id"], stream, metadata, item["blobs"]
-                            )
-                            transform_fn = transform.get(stream)
-                            transformed = share(
-                                transform_fn(sample) if transform_fn else sample
-                            )
-                            parts.append(
-                                (item["index"], transformed, time.monotonic() - started)
-                            )
-                        except Exception as error:
-                            raise RuntimeError(
-                                f"stream {stream} batch {message['batch']} sample {item['index']}: {error}"
-                            ) from error
-                    _ipc.send(
-                        output,
-                        (
-                            "samples",
-                            stream,
-                            (
-                                message["batch"],
-                                message["query_batch_idx"],
-                                parts,
-                                message["timings"],
-                                message["memory_units"],
-                            ),
-                        ),
-                    )
-                elif message["kind"] == "end":
-                    _ipc.send(output, ("end", stream, None))
-                    ended.add(stream)
-                else:
-                    raise RuntimeError("unexpected work message")
-    except Exception:
-        if not stopped.is_set():
-            raise
-    finally:
-        output.close()
+    torch.set_num_threads(1)
+    receiver = _native.Listener(root / "work.sock")
+    ended = set()
+    with torch.no_grad(), output:
+        while (message := receiver.recv()) is not None:
+            stream = message["stream"]
+            if message["kind"] == "end":
+                _ipc.send(output, ("end", stream, None))
+                ended.add(stream)
+                continue
+            function = transform.get(stream)
+            parts = []
+            for item in message["samples"]:
+                started = time.monotonic()
+                sample = RawSample(
+                    item["sample_id"],
+                    stream,
+                    json.loads(item["metadata_json"]),
+                    item["blobs"],
+                )
+                try:
+                    value = share(function(sample) if function else sample)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"stream {stream} batch {message['batch']} sample {item['index']}: {error}"
+                    ) from error
+                parts.append((item["index"], value, time.monotonic() - started))
+            batch = (
+                message["batch"],
+                message["query_batch_idx"],
+                parts,
+                message["timings"],
+                message["memory_units"],
+            )
+            _ipc.send(output, ("samples", stream, batch))
+    if len(ended) < len(streams) and not stopped.is_set():
+        raise RuntimeError("data stream ended before End")
 
 
 def collate_worker(
+    owner: int,
     root: Path,
     ranks: int,
     num_workers: int,
@@ -123,143 +111,88 @@ def collate_worker(
     stopped,
     ready,
 ) -> None:
+    signal.pthread_sigmask(signal.SIG_BLOCK, SIGNALS)
+    threading.Thread(target=_exit_with, args=(owner,), daemon=True).start()
     collate_fn = collate_fn or {}
     key = (root / "auth").read_bytes()
-    outputs = {name: [queue.Queue() for _ in range(ranks)] for name in streams}
-    errors = queue.Queue()
+    directories = [root / "streams" / str(index) for index in range(len(streams))]
+    slots = [(stream, rank) for stream in streams for rank in range(ranks)]
+    readers = dict.fromkeys(slots)
+    outbox = {slot: deque() for slot in slots}
+    requested = set()
     activated = set()
-    activation = threading.Lock()
-
-    def activate(stream: str, stream_index: int) -> None:
-        with activation:
-            if stream not in activated:
-                directory = root / "streams" / str(stream_index)
+    assembling = {stream: {} for stream in streams}
+    finished = {stream: {} for stream in streams}
+    next_batch = {
+        stream: int((directory / "start").read_text())
+        for stream, directory in zip(streams, directories)
+    }
+    ended = dict.fromkeys(streams, 0)
+    ready.set()
+    while not stopped.is_set():
+        for stream, rank in slots:
+            if readers[stream, rank] is not None:
+                continue
+            directory = directories[streams.index(stream)]
+            readers[stream, rank] = _connect(directory / f"rank-{rank}.sock", key)
+            if readers[stream, rank] is not None and stream not in activated:
                 _native.Semaphore((directory / "semaphore").read_text()).post(
                     ranks * prefetch_factor
                 )
                 activated.add(stream)
-
-    def take(stream: str, rank: int):
-        while not stopped.is_set():
-            try:
-                return outputs[stream][rank].get(timeout=0.1)
-            except queue.Empty:
-                pass
-        return None
-
-    def deliver(rank: int, stream: str, stream_index: int) -> None:
-        path = root / "streams" / str(stream_index) / f"rank-{rank}.sock"
-        connection = None
-        message = None
-        try:
-            while not stopped.is_set():
-                if connection is None:
-                    connection = _connect(path, key, stopped)
-                    connection.send(("ready", None))
-                    activate(stream, stream_index)
+        owners = {
+            reader: slot for slot, reader in readers.items() if reader is not None
+        }
+        for connection in wait([*incoming, *owners], timeout=0.1):
+            slot = owners.get(connection)
+            if slot is not None:
                 try:
-                    if not connection.poll(0.1):
-                        continue
                     connection.recv()
-                    message = message or take(stream, rank)
-                    _ipc.send(connection, message)
-                except (OSError, EOFError):
+                    requested.add(slot)
+                except (EOFError, OSError):
                     connection.close()
-                    connection = None
-                    continue
-                if message is None or message[0] == "end":
-                    return
-                message = None
-        except Exception:
-            if not stopped.is_set():
-                errors.put(traceback.format_exc())
-        finally:
-            if connection is not None:
-                connection.close()
-
-    for stream_index, stream in enumerate(streams):
-        for rank in range(ranks):
-            threading.Thread(
-                target=deliver, args=(rank, stream, stream_index), daemon=True
-            ).start()
-    ready.set()
-    pending = {name: {} for name in streams}
-    completed = {name: {} for name in streams}
-    next_batch = {
-        name: int((root / "streams" / str(index) / "start").read_text())
-        for index, name in enumerate(streams)
-    }
-    ended = {name: 0 for name in streams}
-    while not stopped.is_set():
-        if not errors.empty():
-            raise RuntimeError(errors.get())
-        available = wait(incoming, timeout=0.1)
-        if not available:
-            continue
-        connection = available[0]
-        try:
-            kind, stream, value = _ipc.recv(connection)
-        except (EOFError, OSError):
-            if stopped.is_set():
-                return
-            raise
-        incoming.remove(connection)
-        incoming.append(connection)
-        if stream not in outputs:
-            raise RuntimeError("unexpected stream")
-        if kind == "end":
-            ended[stream] += 1
-            if ended[stream] > num_workers:
-                raise RuntimeError("duplicate stream end")
-            if ended[stream] == num_workers:
-                if pending[stream] or completed[stream]:
-                    raise RuntimeError(
-                        "stream ended with incomplete or missing batches"
-                    )
-                for output in outputs[stream]:
-                    output.put(("end", None))
-            continue
-        if kind != "samples" or ended[stream] == num_workers:
-            raise RuntimeError(f"unexpected transformation message: {kind}")
-        (batch_id, batch_size), query_idx, incoming_parts, timings, memory_units = value
-        if batch_id < next_batch[stream] or batch_id in completed[stream]:
-            raise RuntimeError("message for an already completed batch")
-        if batch_size <= 0 or not incoming_parts:
-            raise RuntimeError("invalid sample position")
-        size, expected_query_idx, expected_units, parts = pending[stream].setdefault(
-            batch_id, (batch_size, query_idx, memory_units, {})
-        )
-        if (
-            size != batch_size
-            or expected_query_idx != query_idx
-            or expected_units != memory_units
-        ):
-            raise RuntimeError("inconsistent batch or duplicate sample position")
-        for index, sample, seconds in incoming_parts:
-            if index < 0 or index >= batch_size:
-                raise RuntimeError("invalid sample position")
-            if index in parts:
-                raise RuntimeError("inconsistent batch or duplicate sample position")
-            parts[index] = (sample, seconds)
-        if len(parts) == size:
-            samples = tuple(parts[index][0] for index in range(size))
-            timings = (*timings, sum(part[1] for part in parts.values()))
+                    readers[slot] = None
+                    requested.discard(slot)
+                continue
+            try:
+                kind, stream, value = _ipc.recv(connection)
+            except (EOFError, OSError):
+                incoming.remove(connection)
+                continue
+            if kind == "end":
+                ended[stream] += 1
+                if ended[stream] == num_workers:
+                    for rank in range(ranks):
+                        outbox[stream, rank].append(("end", None))
+                continue
+            (batch_id, size), query_idx, parts, timings, memory_units = value
+            batch = assembling[stream].setdefault(batch_id, {})
+            batch.update({index: (sample, seconds) for index, sample, seconds in parts})
+            if len(batch) < size:
+                continue
+            del assembling[stream][batch_id]
+            samples = tuple(batch[index][0] for index in range(size))
+            timings = (*timings, sum(seconds for _, seconds in batch.values()))
             started = time.monotonic()
             collator = collate_fn.get(stream)
             data = share(collator(samples)) if collator else samples
-            completed[stream][batch_id] = Batch(
-                stream,
-                batch_id,
-                query_idx,
-                samples,
-                data,
-                (*timings, time.monotonic() - started),
-                memory_units,
+            timings = (*timings, time.monotonic() - started)
+            finished[stream][batch_id] = Batch(
+                stream, batch_id, query_idx, samples, data, timings, memory_units
             )
-            del pending[stream][batch_id]
-        while next_batch[stream] in completed[stream]:
-            batch_id = next_batch[stream]
-            outputs[stream][batch_id % ranks].put(
-                ("batch", completed[stream].pop(batch_id))
-            )
-            next_batch[stream] += 1
+            while next_batch[stream] in finished[stream]:
+                rank = next_batch[stream] % ranks
+                outbox[stream, rank].append(
+                    ("batch", finished[stream].pop(next_batch[stream]))
+                )
+                next_batch[stream] += 1
+        for slot in [slot for slot in requested if outbox[slot]]:
+            message = outbox[slot][0]
+            try:
+                _ipc.send(readers[slot], message)
+            except OSError:
+                readers[slot].close()
+                readers[slot] = None
+            requested.discard(slot)
+            if readers[slot] is not None and message[0] != "end":
+                outbox[slot].popleft()

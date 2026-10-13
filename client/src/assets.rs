@@ -1,3 +1,4 @@
+use crate::transport::HttpClient;
 use anyhow::{Context, ensure};
 use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::{Method, StatusCode};
@@ -12,9 +13,10 @@ use std::{
     time::SystemTime,
 };
 use tensorlane_protocol::{AssetDownload, InitResponse, TRANSFER_CHUNK_BYTES};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-const DEFAULT_CACHE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::spawn_blocking,
+};
 
 pub struct Prefetched {
     pub paths: HashMap<String, PathBuf>,
@@ -37,26 +39,28 @@ struct Cache {
     dir: PathBuf,
     limit: u64,
     memory: Arc<Semaphore>,
-    chunk: usize,
+    chunk: u64,
 }
 
-fn cache_dir() -> io::Result<PathBuf> {
-    let home = std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"));
-    let dir = std::env::var_os("TENSORLANE_ASSET_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            home.unwrap_or_else(std::env::temp_dir)
-                .join("tensorlane/assets")
-        });
-    std::fs::create_dir_all(&dir)?;
-    dir.canonicalize()
-}
+type Chunk = (u64, Vec<u8>, OwnedSemaphorePermit);
 
-fn cache_limit() -> anyhow::Result<u64> {
-    std::env::var("TENSORLANE_ASSET_CACHE_MAX_BYTES")
-        .map(|limit| limit.parse())
-        .unwrap_or(Ok(DEFAULT_CACHE_BYTES))
-        .context("invalid TENSORLANE_ASSET_CACHE_MAX_BYTES")
+fn cache() -> anyhow::Result<(PathBuf, u64)> {
+    let dir = match std::env::var_os("TENSORLANE_ASSET_CACHE") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::var_os("HOME")
+            .map_or_else(std::env::temp_dir, |home| {
+                PathBuf::from(home).join(".cache")
+            })
+            .join("tensorlane/assets"),
+    };
+    std::fs::create_dir_all(&dir).context("creating asset cache")?;
+    let limit = match std::env::var("TENSORLANE_ASSET_CACHE_MAX_BYTES") {
+        Ok(limit) => limit
+            .parse()
+            .context("invalid TENSORLANE_ASSET_CACHE_MAX_BYTES")?,
+        Err(_) => 40 << 30,
+    };
+    Ok((dir.canonicalize()?, limit))
 }
 
 fn cache_key(asset_id: &str, content: &str) -> String {
@@ -64,7 +68,7 @@ fn cache_key(asset_id: &str, content: &str) -> String {
 }
 
 pub fn store(asset_id: &str, sha256: &str, mut source: File) -> anyhow::Result<()> {
-    let dir = cache_dir()?;
+    let (dir, limit) = cache()?;
     let key = cache_key(asset_id, sha256);
     let entry = dir.join(&key);
     let _lock = lock(&dir.join(format!("{key}.lock")))?;
@@ -73,44 +77,31 @@ pub fn store(asset_id: &str, sha256: &str, mut source: File) -> anyhow::Result<(
     }
     let partial = entry.with_extension("part");
     let size = source.metadata()?.len();
-    evict(&dir, cache_limit()?, size)?;
+    evict(&dir, limit, size)?;
     let _ = std::fs::remove_dir_all(&partial);
     std::fs::create_dir_all(&partial)?;
-    source.seek(io::SeekFrom::Start(0))?;
+    source.rewind()?;
     unpack(&partial, &mut source, size)?;
     std::fs::rename(&partial, &entry)?;
     Ok(())
 }
 
 pub async fn prefetch(
-    http: &crate::transport::HttpClient,
+    http: &HttpClient,
     initialized: &InitResponse,
     memory_bytes: usize,
 ) -> anyhow::Result<Prefetched> {
+    let (dir, limit) = spawn_blocking(cache).await??;
     let cache = Cache {
-        dir: blocking(cache_dir).await.context("creating asset cache")?,
-        limit: cache_limit()?,
+        dir,
+        limit,
         memory: Arc::new(Semaphore::new(
             memory_bytes.clamp(1, Semaphore::MAX_PERMITS),
         )),
-        chunk: TRANSFER_CHUNK_BYTES.min(memory_bytes).max(1),
+        chunk: TRANSFER_CHUNK_BYTES.min(memory_bytes).max(1) as u64,
     };
-    let downloads: Vec<_> = stream::iter(initialized.assets.iter())
-        .map(|name| {
-            let input = initialized
-                .checkpoint
-                .as_ref()
-                .filter(|checkpoint| checkpoint.name == *name)
-                .map(|checkpoint| checkpoint.asset_id.as_str())
-                .unwrap_or(name);
-            let cache = &cache;
-            async move {
-                let (path, metadata, lease) = download(http, cache, &initialized.run_id, input)
-                    .await
-                    .with_context(|| format!("downloading asset {name:?}"))?;
-                Ok::<_, anyhow::Error>((name.clone(), path, metadata, lease))
-            }
-        })
+    let downloads: Vec<_> = stream::iter(&initialized.assets)
+        .map(|name| download(http, &cache, initialized, name))
         .buffer_unordered(8)
         .try_collect()
         .await?;
@@ -119,35 +110,39 @@ pub async fn prefetch(
         metadata: HashMap::new(),
         leases: Vec::new(),
     };
-    for (name, path, info, lease) in downloads {
+    for (name, path, metadata, lease) in downloads {
         prefetched.paths.insert(name.clone(), path);
-        prefetched.metadata.insert(name, info);
+        prefetched.metadata.insert(name, metadata);
         prefetched.leases.push(lease);
     }
     Ok(prefetched)
 }
 
 async fn download(
-    http: &crate::transport::HttpClient,
+    http: &HttpClient,
     cache: &Cache,
-    run_id: &str,
+    initialized: &InitResponse,
     name: &str,
-) -> anyhow::Result<(PathBuf, String, Lease)> {
+) -> anyhow::Result<(String, PathBuf, String, Lease)> {
+    let input = match &initialized.checkpoint {
+        Some(checkpoint) if checkpoint.name == name => &checkpoint.asset_id,
+        _ => name,
+    };
+    let run_id = &initialized.run_id;
+    let context = format!("downloading asset {name:?}");
     let (_, _, bytes) = http
-        .request(Method::GET, &["runs", run_id, "inputs", name], None, &[])
-        .await?;
+        .request(Method::GET, &["runs", run_id, "inputs", input], None, &[])
+        .await
+        .context(context.clone())?;
     let info: AssetDownload = serde_json::from_slice(&bytes)?;
-    let entrypoint = info.metadata.entrypoint.clone();
-    let asset_metadata: serde_json::Value = serde_json::from_str(&info.metadata.metadata_json)?;
     let metadata = serde_json::json!({
         "asset_id": info.metadata.asset_id,
         "entrypoint": info.metadata.entrypoint,
-        "metadata": asset_metadata,
+        "metadata": serde_json::from_str::<serde_json::Value>(&info.metadata.metadata_json)?,
         "kind": info.metadata.kind,
         "asset_type": info.metadata.asset_type,
     })
     .to_string();
-
     let key = cache_key(
         info.metadata.asset_id.as_deref().unwrap_or(""),
         info.sha256.as_deref().unwrap_or(&info.etag),
@@ -156,52 +151,61 @@ async fn download(
     let lock_path = cache.dir.join(format!("{key}.lock"));
     let lock = loop {
         let path = lock_path.clone();
-        let lock = blocking(move || lock(&path)).await?;
+        let mut held = spawn_blocking(move || lock(&path)).await??;
+        let waited = entry.clone();
+        held = spawn_blocking(move || {
+            held.unlock()?;
+            while !waited.exists() && held.try_lock().is_err() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            io::Result::Ok(held)
+        })
+        .await??;
         if !entry.exists() {
-            fill(http, cache, run_id, name, &info, &entry)
+            fill(http, cache, run_id, input, &info, &entry)
                 .await
-                .inspect_err(|_| {
-                    let _ = std::fs::remove_dir_all(entry.with_extension("part"));
-                    let _ = std::fs::remove_file(&lock_path);
-                })?;
+                .context(context.clone())?;
         }
         let used = entry.clone();
-        let shared = blocking(move || {
-            lock.lock_shared()?;
-            let touched = File::open(&used).and_then(|entry| entry.set_modified(SystemTime::now()));
-            Ok(touched.is_ok().then_some(lock))
+        let (shared, touched) = spawn_blocking(move || {
+            held.lock_shared()?;
+            let touched = File::open(&used).and_then(|used| used.set_modified(SystemTime::now()));
+            io::Result::Ok((held, touched.is_ok()))
         })
-        .await?;
-        if let Some(lock) = shared {
-            break lock;
+        .await??;
+        if touched {
+            break shared;
         }
     };
-    let used = entry.clone();
-    let selected = tokio::task::spawn_blocking(move || select(&used, entrypoint.as_deref()))
-        .await
-        .context("asset selection task failed")??;
-    Ok((selected, metadata, Lease { _lock: lock, entry }))
+    let (used, entrypoint) = (entry.clone(), info.metadata.entrypoint);
+    let selected = spawn_blocking(move || select(&used, entrypoint.as_deref())).await??;
+    Ok((
+        name.to_owned(),
+        selected,
+        metadata,
+        Lease { _lock: lock, entry },
+    ))
 }
 
 async fn fill(
-    http: &crate::transport::HttpClient,
+    http: &HttpClient,
     cache: &Cache,
     run_id: &str,
-    name: &str,
+    input: &str,
     info: &AssetDownload,
     entry: &Path,
 ) -> anyhow::Result<()> {
     let partial = entry.with_extension("part");
-    let (dir, limit, size, part) = (cache.dir.clone(), cache.limit, info.size, partial.clone());
-    blocking(move || {
+    let (dir, limit, size, target) = (cache.dir.clone(), cache.limit, info.size, partial.clone());
+    spawn_blocking(move || {
         evict(&dir, limit, size)?;
-        let _ = std::fs::remove_dir_all(&part);
-        std::fs::create_dir_all(&part)
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::create_dir_all(&target)
     })
-    .await?;
+    .await??;
     let (sender, chunks) = mpsc::channel();
     let target = partial.clone();
-    let unpacking = tokio::task::spawn_blocking(move || {
+    let unpacking = spawn_blocking(move || {
         let mut ordered = Ordered {
             chunks,
             ready: BTreeMap::new(),
@@ -210,13 +214,20 @@ async fn fill(
             digest: Sha256::new(),
         };
         unpack(&target, &mut ordered, size)?;
-        ensure!(ordered.next == size, "asset download ended early");
         anyhow::Ok(hex::encode(ordered.digest.finalize()))
     });
-    let fetched = fetch(http, cache, run_id, name, info, sender).await;
-    let unpacked = unpacking.await.context("asset unpack task failed")?;
+    let fetched = stream::iter((0..size).step_by(cache.chunk as usize))
+        .then(|offset| reserve(cache, size, offset))
+        .map(|(offset, reserved)| {
+            fetch(http, run_id, input, info, offset, reserved, sender.clone())
+        })
+        .buffer_unordered(1024)
+        .try_collect::<()>()
+        .await;
+    drop(sender);
+    let actual = unpacking.await?;
     fetched?;
-    let actual = unpacked?;
+    let actual = actual?;
     ensure!(
         info.sha256
             .as_ref()
@@ -227,22 +238,52 @@ async fn fill(
     Ok(())
 }
 
-async fn blocking<T: Send + 'static>(
-    work: impl FnOnce() -> io::Result<T> + Send + 'static,
-) -> anyhow::Result<T> {
-    Ok(tokio::task::spawn_blocking(work)
-        .await
-        .context("asset cache task failed")??)
+async fn reserve(
+    cache: &Cache,
+    size: u64,
+    offset: u64,
+) -> (u64, anyhow::Result<OwnedSemaphorePermit>) {
+    let length = cache.chunk.min(size - offset) as u32;
+    let reserved = cache.memory.clone().acquire_many_owned(length).await;
+    (offset, reserved.map_err(anyhow::Error::from))
+}
+
+async fn fetch(
+    http: &HttpClient,
+    run_id: &str,
+    input: &str,
+    info: &AssetDownload,
+    offset: u64,
+    reserved: anyhow::Result<OwnedSemaphorePermit>,
+    chunks: mpsc::Sender<Chunk>,
+) -> anyhow::Result<()> {
+    let reserved = reserved?;
+    let length = reserved.num_permits() as u64;
+    let range = format!("bytes={offset}-{}", offset + length - 1);
+    let (status, _, bytes) = http
+        .request(
+            Method::GET,
+            &["runs", run_id, "inputs", input, "bytes"],
+            None,
+            &[("range", range), ("if-match", info.etag.clone())],
+        )
+        .await?;
+    ensure!(
+        status == StatusCode::PARTIAL_CONTENT && bytes.len() as u64 == length,
+        "server returned an unexpected asset range"
+    );
+    chunks.send((offset, bytes, reserved))?;
+    Ok(())
 }
 
 fn lock(path: &Path) -> io::Result<File> {
     loop {
-        let file = std::fs::OpenOptions::new()
+        let file = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(path)?;
-        file.lock()?;
+        file.lock_shared()?;
         let (held, current) = (file.metadata()?, std::fs::metadata(path));
         if current.is_ok_and(|current| current.ino() == held.ino() && current.dev() == held.dev()) {
             return Ok(file);
@@ -251,15 +292,15 @@ fn lock(path: &Path) -> io::Result<File> {
 }
 
 fn evict(dir: &Path, limit: u64, incoming: u64) -> io::Result<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(Result::ok)
-        .map(|item| item.path())
-        .filter(|path| path.is_dir())
-        .filter_map(|path| {
-            let used = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-            Some((used, disk_usage(&path), path))
-        })
-        .collect();
+    let mut entries = Vec::new();
+    for item in std::fs::read_dir(dir)?.flatten() {
+        let path = item.path();
+        if let Ok(used) = std::fs::metadata(&path).and_then(|m| m.modified())
+            && path.is_dir()
+        {
+            entries.push((used, disk_usage(&path), path));
+        }
+    }
     entries.sort();
     let mut total: u64 = entries.iter().map(|(_, size, _)| size).sum();
     let mut free = fs2::available_space(dir)?;
@@ -269,7 +310,7 @@ fn evict(dir: &Path, limit: u64, incoming: u64) -> io::Result<()> {
             break;
         }
         let lock_path = path.with_extension("lock");
-        let Ok(lock) = std::fs::OpenOptions::new()
+        let Ok(lock) = File::options()
             .create(true)
             .truncate(false)
             .write(true)
@@ -277,10 +318,9 @@ fn evict(dir: &Path, limit: u64, incoming: u64) -> io::Result<()> {
         else {
             continue;
         };
-        let Ok(()) = lock.try_lock() else {
+        if lock.try_lock().is_err() || std::fs::remove_dir_all(&path).is_err() {
             continue;
-        };
-        std::fs::remove_dir_all(&path)?;
+        }
         let _ = std::fs::remove_file(&lock_path);
         total -= size;
         free += size;
@@ -302,69 +342,13 @@ fn disk_usage(path: &Path) -> u64 {
         return std::fs::metadata(path).map_or(0, |metadata| metadata.len());
     };
     children
-        .filter_map(Result::ok)
+        .flatten()
         .map(|child| disk_usage(&child.path()))
         .sum()
 }
 
-async fn fetch(
-    http: &crate::transport::HttpClient,
-    cache: &Cache,
-    run_id: &str,
-    name: &str,
-    info: &AssetDownload,
-    chunks: mpsc::Sender<(u64, Vec<u8>, OwnedSemaphorePermit)>,
-) -> anyhow::Result<()> {
-    let (size, chunk) = (info.size, cache.chunk as u64);
-    stream::iter((0..size).step_by(cache.chunk))
-        .map(|offset| {
-            let chunks = chunks.clone();
-            async move {
-                let end = (offset + chunk).min(size) - 1;
-                let reserved = cache
-                    .memory
-                    .clone()
-                    .acquire_many_owned((end - offset + 1) as u32)
-                    .await?;
-                let (status, headers, bytes) = http
-                    .request(
-                        Method::GET,
-                        &["runs", run_id, "inputs", name, "bytes"],
-                        None,
-                        &[
-                            ("range", format!("bytes={offset}-{end}")),
-                            ("if-match", info.etag.clone()),
-                        ],
-                    )
-                    .await?;
-                ensure!(
-                    status == StatusCode::PARTIAL_CONTENT,
-                    "server did not honor asset Range"
-                );
-                ensure!(
-                    headers.get("content-range").and_then(|v| v.to_str().ok())
-                        == Some(format!("bytes {offset}-{end}/{size}").as_str()),
-                    "unexpected asset Content-Range"
-                );
-                ensure!(
-                    headers.get("etag").and_then(|v| v.to_str().ok()) == Some(info.etag.as_str()),
-                    "input asset changed during download"
-                );
-                ensure!(
-                    bytes.len() as u64 == end - offset + 1,
-                    "truncated asset range"
-                );
-                let _ = chunks.send((offset, bytes, reserved));
-                Ok::<_, anyhow::Error>(())
-            }
-        })
-        .buffer_unordered(1024)
-        .try_collect()
-        .await
-}
-
 struct Ordered {
-    chunks: mpsc::Receiver<(u64, Vec<u8>, OwnedSemaphorePermit)>,
+    chunks: mpsc::Receiver<Chunk>,
     ready: BTreeMap<u64, (Vec<u8>, OwnedSemaphorePermit)>,
     current: (io::Cursor<Vec<u8>>, Option<OwnedSemaphorePermit>),
     next: u64,
@@ -397,11 +381,14 @@ fn unpack(dir: &Path, source: &mut impl Read, size: u64) -> anyhow::Result<()> {
     source.by_ref().take(512).read_to_end(&mut head)?;
     let mut block = [0u8; 512];
     block[..head.len()].copy_from_slice(&head);
-    let checksum = block[..148].iter().chain(&block[156..]);
-    let checksum = checksum.map(|byte| u32::from(*byte)).sum::<u32>() + 8 * 32;
+    let checksum: u32 = block[..148]
+        .iter()
+        .chain(&block[156..])
+        .map(|&b| u32::from(b))
+        .sum();
     let header = tar::Header::from_byte_slice(&block);
     let is_tar = head.len() == 512
-        && (header.cksum().ok() == Some(checksum) || (block == [0; 512] && size >= 1024));
+        && (header.cksum().ok() == Some(checksum + 8 * 32) || (block == [0; 512] && size >= 1024));
     let mut source = io::Cursor::new(head).chain(source);
     if !is_tar {
         let mut data = io::BufWriter::with_capacity(1 << 20, File::create(dir.join("data"))?);
@@ -413,8 +400,9 @@ fn unpack(dir: &Path, source: &mut impl Read, size: u64) -> anyhow::Result<()> {
     std::fs::create_dir_all(&extracted)?;
     for entry in tar::Archive::new(&mut source).entries()? {
         let mut entry = entry?;
+        let kind = entry.header().entry_type();
         ensure!(
-            entry.header().entry_type().is_file() || entry.header().entry_type().is_dir(),
+            kind.is_file() || kind.is_dir(),
             "asset archive entries must be regular files or directories"
         );
         ensure!(
@@ -437,16 +425,15 @@ fn select(dir: &Path, entrypoint: Option<&str>) -> anyhow::Result<PathBuf> {
             .join(entrypoint)
             .canonicalize()
             .context("asset entrypoint does not exist")?;
-        anyhow::ensure!(
+        ensure!(
             selected.starts_with(extracted.canonicalize()?),
             "asset entrypoint escapes extraction directory"
         );
         return Ok(selected);
     }
     let children = std::fs::read_dir(&extracted)?.collect::<Result<Vec<_>, _>>()?;
-    if children.len() == 1 {
-        Ok(children[0].path())
-    } else {
-        Ok(extracted)
+    match children.as_slice() {
+        [child] => Ok(child.path()),
+        _ => Ok(extracted),
     }
 }

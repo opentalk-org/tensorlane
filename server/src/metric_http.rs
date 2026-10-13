@@ -5,28 +5,17 @@ use tensorlane_protocol::MetricBatch;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{db, runtime::Runtime};
+use crate::runtime::Runtime;
 
 #[derive(clickhouse::Row, Serialize)]
-struct ScalarRecord {
+struct MetricRecord<V> {
     #[serde(with = "clickhouse::serde::time::datetime64::nanos")]
     timestamp: OffsetDateTime,
     #[serde(with = "clickhouse::serde::uuid")]
     run_id: Uuid,
     step: u64,
     name: String,
-    value: f32,
-}
-
-#[derive(clickhouse::Row, Serialize)]
-struct ArrayRecord {
-    #[serde(with = "clickhouse::serde::time::datetime64::nanos")]
-    timestamp: OffsetDateTime,
-    #[serde(with = "clickhouse::serde::uuid")]
-    run_id: Uuid,
-    step: u64,
-    name: String,
-    value: Vec<f32>,
+    value: V,
 }
 
 pub async fn save(engine: &Runtime, run: Uuid, request: Uuid, batch: MetricBatch) -> Result<()> {
@@ -57,13 +46,13 @@ pub async fn save(engine: &Runtime, run: Uuid, request: Uuid, batch: MetricBatch
         .clone()
         .with_setting("insert_deduplication_token", format!("{run}/{request}"));
     if !batch.scalars.is_empty() {
-        let mut insert = db::request(client.insert::<ScalarRecord>("metrics"))
-            .await?
-            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
+        let mut insert = client.insert::<MetricRecord<f32>>("metrics").await?;
         for metric in batch.scalars {
             insert
-                .write(&ScalarRecord {
-                    timestamp: timestamp(metric.timestamp_unix_ms)?,
+                .write(&MetricRecord {
+                    timestamp: OffsetDateTime::from_unix_timestamp_nanos(
+                        i128::from(metric.timestamp_unix_ms) * 1_000_000,
+                    )?,
                     run_id: run,
                     step: metric.step,
                     name: metric.name,
@@ -74,13 +63,15 @@ pub async fn save(engine: &Runtime, run: Uuid, request: Uuid, batch: MetricBatch
         insert.end().await?;
     }
     if !batch.arrays.is_empty() {
-        let mut insert = db::request(client.insert::<ArrayRecord>("array_metrics"))
-            .await?
-            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
+        let mut insert = client
+            .insert::<MetricRecord<Vec<f32>>>("array_metrics")
+            .await?;
         for metric in batch.arrays {
             insert
-                .write(&ArrayRecord {
-                    timestamp: timestamp(metric.timestamp_unix_ms)?,
+                .write(&MetricRecord {
+                    timestamp: OffsetDateTime::from_unix_timestamp_nanos(
+                        i128::from(metric.timestamp_unix_ms) * 1_000_000,
+                    )?,
                     run_id: run,
                     step: metric.step,
                     name: metric.name,
@@ -92,10 +83,4 @@ pub async fn save(engine: &Runtime, run: Uuid, request: Uuid, batch: MetricBatch
     }
     engine.create_state(&receipt, &true).await?;
     Ok(())
-}
-
-fn timestamp(ms: i64) -> Result<OffsetDateTime> {
-    Ok(OffsetDateTime::from_unix_timestamp_nanos(
-        i128::from(ms) * 1_000_000,
-    )?)
 }

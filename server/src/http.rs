@@ -13,14 +13,16 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
+    asset_repo::{AssetInfo, AssetRecord},
+    auth::Auth,
     run_config::Config,
     run_repo::{Run, RunRepo, RunStatus},
+    runtime::Runtime,
 };
 
 #[derive(Deserialize)]
@@ -41,6 +43,11 @@ struct ErrorResponse {
     message: String,
 }
 
+#[derive(Deserialize)]
+struct AssetFilter {
+    name: Option<String>,
+}
+
 pub(super) struct AppError {
     status: StatusCode,
     error: anyhow::Error,
@@ -52,15 +59,6 @@ impl AppError {
             status,
             error: error.into(),
         }
-    }
-}
-
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(error: E) -> Self {
-        Self::new(StatusCode::INTERNAL_SERVER_ERROR, error)
     }
 }
 
@@ -79,31 +77,24 @@ impl IntoResponse for AppError {
     }
 }
 
-pub async fn serve(
-    port: u16,
-    auth: crate::auth::Auth,
-    shutdown: CancellationToken,
-    runtime: crate::runtime::Runtime,
-) -> anyhow::Result<()> {
-    let app = app(runtime, auth);
+pub async fn serve(port: u16, auth: Auth, runtime: Runtime) -> anyhow::Result<()> {
     let address = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
     let listener = tokio::net::TcpListener::bind(address).await?;
     info!(%address, "HTTP server listening");
-    axum::serve(listener, app)
+    let shutdown = runtime.shutdown.clone();
+    axum::serve(listener, app(runtime, auth))
         .with_graceful_shutdown(shutdown.cancelled_owned())
         .await?;
     Ok(())
 }
 
-fn app(runtime: crate::runtime::Runtime, auth: crate::auth::Auth) -> Router {
-    let probes = crate::health::router(runtime.clone());
+fn app(runtime: Runtime, auth: Auth) -> Router {
     router(runtime.repo.clone(), auth.clone())
-        .merge(runtime::router(runtime, auth))
-        .layer(tower::limit::ConcurrencyLimitLayer::new(64))
-        .merge(probes)
+        .merge(runtime::router(runtime.clone(), auth))
+        .merge(crate::health::router(runtime))
 }
 
-fn router(run_repo: RunRepo, auth: crate::auth::Auth) -> Router {
+fn router(run_repo: RunRepo, auth: Auth) -> Router {
     Router::new()
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run))
@@ -130,12 +121,6 @@ async fn create_run(
     request: Result<Json<CreateRunRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), AppError> {
     let Json(request) = request.map_err(|err| AppError::new(err.status(), err))?;
-    if !request.config.get("queries").is_some_and(Value::is_object) {
-        return Err(AppError::new(
-            StatusCode::BAD_REQUEST,
-            anyhow::anyhow!("config.queries must map stream names to query objects"),
-        ));
-    }
     Config::parse(&request.config).map_err(|err| AppError::new(StatusCode::BAD_REQUEST, err))?;
     let run_id = run_repo
         .create(request.project_id, &request.name, &request.config)
@@ -158,41 +143,33 @@ async fn get_run(
     run_id: Result<Path<Uuid>, PathRejection>,
 ) -> Result<Json<Run>, AppError> {
     let Path(run_id) = run_id.map_err(|err| AppError::new(err.status(), err))?;
-    let run = run_repo.get(run_id).await?;
-
-    match run {
-        Some(run) => Ok(Json(run)),
-        None => Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            anyhow::anyhow!("Run not found"),
-        )),
-    }
+    let run = run_repo
+        .get(run_id)
+        .await?
+        .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Run not found")))?;
+    Ok(Json(run))
 }
 
 async fn list_runs(State(run_repo): State<RunRepo>) -> Result<Json<Vec<Run>>, AppError> {
-    let runs = run_repo.list().await?;
-    Ok(Json(runs))
+    Ok(Json(run_repo.list().await?))
 }
 
-#[derive(Deserialize)]
-struct AssetFilter {
-    name: Option<String>,
-}
 async fn get_asset(
     State(repo): State<RunRepo>,
     Path(id): Path<Uuid>,
-) -> Result<Json<crate::asset_repo::AssetInfo>, AppError> {
+) -> Result<Json<AssetInfo>, AppError> {
     let asset = repo
         .get_asset(id)
         .await?
         .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow::anyhow!("Asset not found")))?;
     Ok(Json(asset.info()?))
 }
+
 async fn run_assets(
     State(repo): State<RunRepo>,
     Path(id): Path<Uuid>,
     Query(filter): Query<AssetFilter>,
-) -> Result<Json<Vec<crate::asset_repo::AssetInfo>>, AppError> {
+) -> Result<Json<Vec<AssetInfo>>, AppError> {
     if repo.get(id).await?.is_none() {
         return Err(AppError::new(
             StatusCode::NOT_FOUND,
@@ -203,7 +180,7 @@ async fn run_assets(
         .run_assets(id, filter.name.as_deref())
         .await?
         .into_iter()
-        .map(|asset| asset.info())
+        .map(AssetRecord::info)
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok(Json(assets))
 }
@@ -212,6 +189,7 @@ async fn run_assets(
 mod tests {
     use super::*;
     use axum::{body::Body, http::Request};
+    use tokio_util::sync::CancellationToken;
     use tower::ServiceExt;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
@@ -231,16 +209,17 @@ mod tests {
         );
         let cache = tempfile::tempdir()?;
         let shutdown = CancellationToken::new();
-        let runtime = crate::runtime::Runtime::new(
+        let runtime = Runtime::new(
             clickhouse::Client::default().with_url("http://127.0.0.1:9"),
             s3,
             "test",
             cache.path().to_owned(),
+            0,
             shutdown.clone(),
             "checkpoints",
             "metrics",
         )?;
-        let app = app(runtime, crate::auth::Auth::new(Some(KEY))?);
+        let app = app(runtime, Auth::new(Some(KEY))?);
         for (path, expected) in [
             ("/healthz", StatusCode::OK),
             ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
@@ -271,7 +250,7 @@ mod tests {
     async fn anonymous_http_is_allowed_without_a_configured_key() {
         let app = router(
             RunRepo::new(clickhouse::Client::default()),
-            crate::auth::Auth::new(None).unwrap(),
+            Auth::new(None).unwrap(),
         );
         for (path, expected) in [
             ("/runs/invalid", StatusCode::BAD_REQUEST),
@@ -289,7 +268,7 @@ mod tests {
     async fn authentication_covers_routes_fallbacks_and_wrong_methods() {
         let app = router(
             RunRepo::new(clickhouse::Client::default()),
-            crate::auth::Auth::new(Some(KEY)).unwrap(),
+            Auth::new(Some(KEY)).unwrap(),
         );
         for (method, path) in [
             ("GET", "/runs"),
@@ -319,33 +298,30 @@ mod tests {
                 assert_eq!(response.headers()["www-authenticate"], "Bearer");
             }
         }
-        let request = Request::builder()
-            .uri("/runs/invalid")
-            .header("authorization", format!("Bearer {KEY}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(request).await.unwrap().status(),
-            StatusCode::BAD_REQUEST
-        );
-        let request = Request::builder()
-            .uri("/unknown")
-            .header("authorization", format!("Bearer {KEY}"))
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            app.clone().oneshot(request).await.unwrap().status(),
-            StatusCode::NOT_FOUND
-        );
-        let request = Request::builder()
-            .uri("/unknown")
-            .header("authorization", format!("Bearer {KEY}"))
-            .header("authorization", "Bearer wrong")
-            .body(Body::empty())
-            .unwrap();
-        assert_eq!(
-            app.oneshot(request).await.unwrap().status(),
-            StatusCode::UNAUTHORIZED
-        );
+        let bearer = format!("Bearer {KEY}");
+        for (path, values, expected) in [
+            (
+                "/runs/invalid",
+                vec![bearer.as_str()],
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/unknown", vec![bearer.as_str()], StatusCode::NOT_FOUND),
+            (
+                "/unknown",
+                vec![bearer.as_str(), "Bearer wrong"],
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let mut request = Request::builder().uri(path);
+            for value in values {
+                request = request.header("authorization", value);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+        }
     }
 }

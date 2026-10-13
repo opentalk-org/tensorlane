@@ -1,17 +1,14 @@
 use crate::ipc::{Receiver, Sender};
-use anyhow::{Context, anyhow, bail, ensure};
+use anyhow::{Context, anyhow, ensure};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    net::{
-        UnixStream,
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
+    net::UnixStream,
     sync::{mpsc, oneshot},
 };
 
@@ -46,32 +43,6 @@ pub(crate) enum Upload {
 
 pub(crate) type Reply = Result<(), String>;
 
-struct Connection {
-    sender: Sender<Upload, OwnedWriteHalf>,
-    receiver: Receiver<Reply, OwnedReadHalf>,
-    dirty: bool,
-}
-
-impl Connection {
-    async fn flush(&mut self) -> anyhow::Result<()> {
-        if !self.dirty {
-            return Ok(());
-        }
-        let sent = self.sender.send(&Upload::Flush).await;
-        match self.receiver.recv().await? {
-            Some(reply) => {
-                reply.map_err(|error| anyhow!(error))?;
-                self.dirty = false;
-                Ok(())
-            }
-            None => {
-                sent?;
-                bail!("upload connection closed");
-            }
-        }
-    }
-}
-
 enum Command {
     Send(Upload),
     Flush(oneshot::Sender<Reply>),
@@ -95,46 +66,9 @@ impl UploadClient {
                 .enable_all()
                 .build()?;
             let socket = runtime.block_on(UnixStream::connect(path))?;
-            let (read, write) = socket.into_split();
-            let (sender, mut commands) = mpsc::channel(1024);
+            let (sender, commands) = mpsc::channel(1024);
             let failure = Arc::new(Mutex::new(None));
-            let failed = failure.clone();
-            runtime.spawn(async move {
-                let mut connection = Connection {
-                    sender: Sender::new(write),
-                    receiver: Receiver::new(read),
-                    dirty: false,
-                };
-                let result = async {
-                    if automatic {
-                        connection.sender.send(&Upload::Automatic).await?;
-                    }
-                    while let Some(command) = commands.recv().await {
-                        match command {
-                            Command::Send(message) => {
-                                connection.sender.send(&message).await?;
-                                connection.dirty = true;
-                            }
-                            Command::Flush(reply) => {
-                                let result = connection
-                                    .flush()
-                                    .await
-                                    .map_err(|error| format!("{error:#}"));
-                                let failed = result.is_err();
-                                let _ = reply.send(result.clone());
-                                if failed {
-                                    return Err(anyhow!(result.unwrap_err()));
-                                }
-                            }
-                        }
-                    }
-                    anyhow::Ok(())
-                }
-                .await;
-                if let Err(error) = result {
-                    *failed.lock().unwrap() = Some(format!("{error:#}"));
-                }
-            });
+            runtime.spawn(forward(socket, commands, automatic, failure.clone()));
             Ok(Self {
                 sender: Mutex::new(Some(sender)),
                 failure,
@@ -152,25 +86,14 @@ impl UploadClient {
         value: f32,
         timeout: Option<f64>,
     ) -> anyhow::Result<()> {
-        let command = Command::Send(Upload::Metric {
+        let timestamp_unix_ms = timestamp()?;
+        let metric = Upload::Metric {
             step,
             name,
             value,
-            timestamp_unix_ms: crate::uploads::timestamp()?,
-        });
-        let Some(timeout) = timeout else {
-            return py.allow_threads(|| self.enqueue(command));
+            timestamp_unix_ms,
         };
-        let timeout = Duration::try_from_secs_f64(timeout)?;
-        let sender = self.command_sender()?;
-        py.allow_threads(|| {
-            self.runtime.block_on(async {
-                tokio::time::timeout(timeout, sender.send(command))
-                    .await
-                    .context("metric enqueue timed out")?
-                    .map_err(|_| self.error())
-            })
-        })
+        self.send(py, metric, timeout)
     }
 
     fn metric_artifact(
@@ -181,16 +104,15 @@ impl UploadClient {
         name: String,
         content_type: String,
     ) -> anyhow::Result<()> {
-        self.send(
-            py,
-            Upload::Artifact {
-                step,
-                timestamp_unix_ms: crate::uploads::timestamp()?,
-                path,
-                name,
-                content_type,
-            },
-        )
+        let timestamp_unix_ms = timestamp()?;
+        let artifact = Upload::Artifact {
+            step,
+            timestamp_unix_ms,
+            path,
+            name,
+            content_type,
+        };
+        self.send(py, artifact, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -213,104 +135,143 @@ impl UploadClient {
         );
         let _: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&metadata_json)?;
         let asset_id = uuid::Uuid::new_v4().to_string();
-        self.send(
-            py,
-            Upload::SaveAsset {
-                asset_id: asset_id.clone(),
-                name,
-                step,
-                path,
-                kind,
-                asset_type,
-                metadata_json,
-                content_type,
-            },
-        )?;
+        let asset = Upload::SaveAsset {
+            asset_id: asset_id.clone(),
+            name,
+            step,
+            path,
+            kind,
+            asset_type,
+            metadata_json,
+            content_type,
+        };
+        self.send(py, asset, None)?;
         Ok(asset_id)
     }
 
     #[pyo3(signature = (timeout=None))]
     fn flush(&self, py: Python<'_>, timeout: Option<f64>) -> anyhow::Result<()> {
-        let timeout = timeout.map(Duration::try_from_secs_f64).transpose()?;
-        let sender = self.command_sender()?;
-        let (reply, received) = oneshot::channel();
-        py.allow_threads(|| {
-            self.runtime.block_on(async {
-                let operation = async {
-                    sender
-                        .send(Command::Flush(reply))
-                        .await
-                        .map_err(|_| self.error())?;
-                    received
-                        .await
-                        .map_err(|_| self.error())?
-                        .map_err(|error| anyhow!(error))
-                };
-                let result = match timeout {
-                    Some(timeout) => tokio::time::timeout(timeout, operation)
-                        .await
-                        .context("upload flush timed out")?,
-                    None => operation.await,
-                };
-                if result.is_err() {
-                    self.sender.lock().unwrap().take();
-                }
-                result
-            })
-        })
-    }
-
-    fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
-        let (reply, received) = oneshot::channel();
         let sender = self
             .sender
             .lock()
-            .map_err(|_| anyhow!("upload lock poisoned"))?
-            .take();
-        if let Some(sender) = sender {
-            py.allow_threads(|| {
-                sender
-                    .blocking_send(Command::Flush(reply))
-                    .map_err(|_| self.error())
-            })?;
-            drop(sender);
-            py.allow_threads(|| {
-                self.runtime.block_on(async {
-                    received
-                        .await
-                        .map_err(|_| self.error())?
-                        .map_err(|error| anyhow!(error))
-                })
-            })?;
-        }
-        Ok(())
+            .unwrap()
+            .clone()
+            .context("upload client is closed")?;
+        self.wait(py, sender, timeout)
+    }
+
+    fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
+        let Some(sender) = self.sender.lock().unwrap().take() else {
+            return Ok(());
+        };
+        self.wait(py, sender, None)
     }
 }
 
 impl UploadClient {
-    fn error(&self) -> anyhow::Error {
-        anyhow!(
-            self.failure
-                .lock()
-                .ok()
-                .and_then(|error| error.clone())
-                .unwrap_or_else(|| "upload connection closed".into())
-        )
-    }
-    fn command_sender(&self) -> anyhow::Result<mpsc::Sender<Command>> {
-        self.sender
+    fn send(&self, py: Python<'_>, message: Upload, timeout: Option<f64>) -> anyhow::Result<()> {
+        let timeout = timeout.map(Duration::try_from_secs_f64).transpose()?;
+        let sender = self
+            .sender
             .lock()
-            .map_err(|_| anyhow!("upload lock poisoned"))?
-            .as_ref()
-            .context("upload client is closed")
-            .cloned()
+            .unwrap()
+            .clone()
+            .context("upload client is closed")?;
+        let sent = py.allow_threads(|| match timeout {
+            None => Ok(sender.blocking_send(Command::Send(message))),
+            Some(timeout) => self
+                .runtime
+                .block_on(async {
+                    tokio::time::timeout(timeout, sender.send(Command::Send(message))).await
+                })
+                .context("upload enqueue timed out"),
+        })?;
+        sent.map_err(|_| self.error())
     }
-    fn enqueue(&self, command: Command) -> anyhow::Result<()> {
-        self.command_sender()?
-            .blocking_send(command)
-            .map_err(|_| self.error())
+
+    fn wait(
+        &self,
+        py: Python<'_>,
+        sender: mpsc::Sender<Command>,
+        timeout: Option<f64>,
+    ) -> anyhow::Result<()> {
+        let timeout = timeout.map(Duration::try_from_secs_f64).transpose()?;
+        let (reply, received) = oneshot::channel();
+        py.allow_threads(|| {
+            self.runtime.block_on(async {
+                let flushed = async {
+                    sender
+                        .send(Command::Flush(reply))
+                        .await
+                        .map_err(|_| self.error())?;
+                    drop(sender);
+                    received
+                        .await
+                        .map_err(|_| self.error())?
+                        .map_err(anyhow::Error::msg)
+                };
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, flushed)
+                        .await
+                        .context("upload flush timed out")?,
+                    None => flushed.await,
+                }
+            })
+        })
     }
-    fn send(&self, py: Python<'_>, message: Upload) -> anyhow::Result<()> {
-        py.allow_threads(|| self.enqueue(Command::Send(message)))
+
+    fn error(&self) -> anyhow::Error {
+        let failure = self.failure.lock().unwrap().clone();
+        anyhow!(failure.unwrap_or_else(|| "upload connection closed".into()))
     }
+}
+
+async fn forward(
+    socket: UnixStream,
+    mut commands: mpsc::Receiver<Command>,
+    automatic: bool,
+    failure: Arc<Mutex<Option<String>>>,
+) {
+    let (read, write) = socket.into_split();
+    let mut sender = Sender::<Upload, _>::new(write);
+    let mut receiver = Receiver::<Reply, _>::new(read);
+    let mut dirty = false;
+    if automatic && let Err(error) = sender.send(&Upload::Automatic).await {
+        *failure.lock().unwrap() = Some(format!("{error:#}"));
+        return;
+    }
+    while let Some(command) = commands.recv().await {
+        let reply = match command {
+            Command::Send(message) => {
+                if let Err(error) = sender.send(&message).await {
+                    *failure.lock().unwrap() = Some(format!("{error:#}"));
+                    return;
+                }
+                dirty = true;
+                continue;
+            }
+            Command::Flush(reply) => reply,
+        };
+        if !dirty {
+            let _ = reply.send(Ok(()));
+            continue;
+        }
+        let sent = sender.send(&Upload::Flush).await;
+        let result = match receiver.recv().await {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(sent
+                .err()
+                .map_or("upload connection closed".into(), |e| format!("{e:#}"))),
+            Err(error) => Err(format!("{error:#}")),
+        };
+        dirty = result.is_err();
+        let _ = reply.send(result);
+    }
+}
+
+fn timestamp() -> anyhow::Result<i64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)?
+        .as_millis()
+        .try_into()?)
 }

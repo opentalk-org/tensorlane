@@ -1,4 +1,7 @@
-use crate::semaphore::BatchBudget;
+use crate::{
+    semaphore::{BatchBudget, MemoryBudget, MemoryLease},
+    transport::HttpClient,
+};
 use anyhow::{Context, ensure};
 use futures_util::StreamExt;
 use prost::Message;
@@ -47,9 +50,9 @@ impl Drop for Requests {
     }
 }
 pub async fn prefetch(
-    http: crate::transport::HttpClient,
+    http: HttpClient,
     run_id: String,
-    stream_name: String,
+    stream: String,
     budget: Arc<BatchBudget>,
     work: mpsc::UnboundedSender<Work>,
     start: u64,
@@ -57,80 +60,49 @@ pub async fn prefetch(
     let (requests, receiver) = mpsc::unbounded_channel();
     let waiting = budget.clone();
     let mut request_task = Requests {
-        budget,
+        budget: budget.clone(),
         thread: Some(
             thread::Builder::new()
                 .name("tensorlane-requests".into())
                 .spawn(move || {
                     let mut sequence = start;
-                    while waiting.acquire()? {
-                        if requests.send(sequence).is_err() {
-                            break;
-                        }
+                    while waiting.acquire()? && requests.send(sequence).is_ok() {
                         sequence += 1;
                     }
                     Ok(())
                 })?,
         ),
     };
-    let memory = request_task.budget.memory.clone();
     let batches = UnboundedReceiverStream::new(receiver)
         .map(|sequence| {
-            let http = http.clone();
-            let run_id = run_id.clone();
-            let stream_name = stream_name.clone();
-            let memory = memory.clone();
-            async move {
-                let started = std::time::Instant::now();
-                let (status, bytes, lease) = http
-                    .batch(
-                        &[
-                            "runs",
-                            &run_id,
-                            "streams",
-                            &stream_name,
-                            "batches",
-                            &sequence.to_string(),
-                        ],
-                        memory,
-                        sequence - start,
-                    )
-                    .await
-                    .context("receiving data batch")?;
-                anyhow::Ok((
-                    sequence,
-                    status,
-                    bytes,
-                    lease,
-                    started.elapsed().as_secs_f64(),
-                ))
-            }
+            fetch(
+                &http,
+                &run_id,
+                &stream,
+                budget.memory.clone(),
+                sequence,
+                start,
+            )
         })
-        .buffered(request_task.budget.capacity);
+        .buffered(budget.capacity);
     futures_util::pin_mut!(batches);
     while let Some(batch) = batches.next().await {
-        let (expected_id, status, bytes, lease, receive_seconds) = batch?;
+        let (status, bytes, lease, receive_seconds) = batch?;
         if status == StatusCode::NO_CONTENT {
             break;
         }
         let response =
             DataResponse::decode(bytes::Bytes::from(bytes)).context("invalid data batch")?;
-        let timings = [
-            response.load_seconds,
-            response.server_wait_seconds,
-            receive_seconds,
-        ];
-        ensure!(
-            response.stream == stream_name && response.batch_id == expected_id,
-            "unexpected stream or batch ID"
-        );
-        let batch_size = response.batch.len();
-        ensure!(batch_size > 0, "empty batches are unsupported");
+        ensure!(!response.batch.is_empty(), "empty batches are unsupported");
         work.send(Work::Batch {
-            stream: stream_name.clone(),
-            batch: (response.batch_id, batch_size),
+            stream: stream.clone(),
+            batch: (response.batch_id, response.batch.len()),
             query_batch_idx: response.query_batch_idx,
-            timings,
+            timings: [
+                response.load_seconds,
+                response.server_wait_seconds,
+                receive_seconds,
+            ],
             samples: response.batch.into_iter().enumerate().collect(),
             memory_units: lease.units,
         })
@@ -139,8 +111,26 @@ pub async fn prefetch(
     }
     request_task.finish()?;
     work.send(Work::End {
-        stream: stream_name.clone(),
+        stream: stream.clone(),
     })
     .context("transform worker disconnected")?;
     Ok(())
+}
+
+async fn fetch(
+    http: &HttpClient,
+    run_id: &str,
+    stream: &str,
+    memory: Arc<MemoryBudget>,
+    sequence: u64,
+    start: u64,
+) -> anyhow::Result<(StatusCode, Vec<u8>, MemoryLease, f64)> {
+    let started = std::time::Instant::now();
+    let sequence_id = sequence.to_string();
+    let path = ["runs", run_id, "streams", stream, "batches", &sequence_id];
+    let (status, bytes, lease) = http
+        .batch(&path, memory, sequence - start)
+        .await
+        .context("receiving data batch")?;
+    Ok((status, bytes, lease, started.elapsed().as_secs_f64()))
 }

@@ -103,9 +103,6 @@ impl BatchBudget {
     }
 
     pub fn acquire(&self) -> Result<bool> {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Ok(false);
-        }
         self.semaphore.wait()?;
         Ok(!self.cancelled.load(Ordering::Acquire))
     }
@@ -118,7 +115,7 @@ impl BatchBudget {
     }
 }
 
-pub const MEMORY_UNIT: usize = 1024 * 1024;
+const MEMORY_UNIT: usize = 1024 * 1024;
 
 pub struct MemoryBudget {
     pub semaphore: PosixSemaphore,
@@ -144,10 +141,6 @@ impl MemoryBudget {
     }
 
     pub async fn acquire(self: &Arc<Self>, sequence: u64, bytes: usize) -> Result<MemoryLease> {
-        anyhow::ensure!(
-            !self.cancelled.load(Ordering::Acquire),
-            "memory budget cancelled"
-        );
         let mut next = self.next.subscribe();
         while *next.borrow_and_update() != sequence {
             anyhow::ensure!(
@@ -169,10 +162,6 @@ impl MemoryBudget {
             anyhow::Ok(())
         })
         .await??;
-        anyhow::ensure!(
-            !self.cancelled.load(Ordering::Acquire),
-            "memory budget cancelled"
-        );
         self.next.send_replace(sequence + 1);
         Ok(MemoryLease {
             memory: self.clone(),

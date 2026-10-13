@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{asset_repo::AssetRecord, db};
+use crate::asset_repo::AssetRecord;
 
 const SELECT_RUNS: &str = "
 select ?fields from runs
@@ -109,13 +109,12 @@ impl RunRepo {
         name: &str,
         config: &Map<String, Value>,
     ) -> Result<Option<Uuid>> {
-        let project = db::request(
-            self.client
-                .query("SELECT 1 FROM projects WHERE id = ? LIMIT 1")
-                .bind(project_id)
-                .fetch_optional::<u8>(),
-        )
-        .await?;
+        let project = self
+            .client
+            .query("SELECT 1 FROM projects WHERE id = ? LIMIT 1")
+            .bind(project_id)
+            .fetch_optional::<u8>()
+            .await?;
         if project.is_none() {
             return Ok(None);
         }
@@ -125,9 +124,7 @@ impl RunRepo {
             name: name.to_owned(),
             config: serde_json::to_string(config)?,
         };
-        let mut insert = db::request(self.client.insert::<RunConfigRow>("runs"))
-            .await?
-            .with_timeouts(Some(db::TIMEOUT), Some(db::TIMEOUT));
+        let mut insert = self.client.insert::<RunConfigRow>("runs").await?;
         insert.write(&row).await?;
         insert.end().await?;
         self.append_status(row.id, RunStatus::Queued).await?;
@@ -135,13 +132,12 @@ impl RunRepo {
     }
 
     pub async fn get_asset(&self, id: Uuid) -> Result<Option<AssetRecord>> {
-        Ok(db::request(
-            self.client
-                .query("SELECT ?fields FROM assets FINAL WHERE id = ? AND NOT deleted")
-                .bind(id)
-                .fetch_optional(),
-        )
-        .await?)
+        Ok(self
+            .client
+            .query("SELECT ?fields FROM assets FINAL WHERE id = ? AND NOT deleted")
+            .bind(id)
+            .fetch_optional()
+            .await?)
     }
     pub async fn run_assets(&self, id: Uuid, name: Option<&str>) -> Result<Vec<AssetRecord>> {
         let sql = if name.is_some() {
@@ -153,61 +149,62 @@ impl RunRepo {
         if let Some(name) = name {
             query = query.bind(name);
         }
-        Ok(db::request(query.fetch_all()).await?)
+        Ok(query.fetch_all().await?)
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Run>> {
-        db::request(
-            self.client
-                .query(&format!("{SELECT_RUNS} where id = ?"))
-                .bind(id.to_string())
-                .fetch_optional::<RunRow>(),
-        )
-        .await?
-        .map(Run::try_from)
-        .transpose()
+        self.client
+            .query(&format!(
+                "{} where id = ?",
+                SELECT_RUNS.replace("from run_status", "from run_status where run_id = ?")
+            ))
+            .bind(id)
+            .bind(id.to_string())
+            .fetch_optional::<RunRow>()
+            .await?
+            .map(Run::try_from)
+            .transpose()
     }
 
     pub async fn list(&self) -> Result<Vec<Run>> {
-        db::request(
-            self.client
-                .query(&format!("{SELECT_RUNS} order by project_id, id"))
-                .fetch_all::<RunRow>(),
-        )
-        .await?
-        .into_iter()
-        .map(Run::try_from)
-        .collect()
+        self.client
+            .query(&format!("{SELECT_RUNS} order by project_id, id"))
+            .fetch_all::<RunRow>()
+            .await?
+            .into_iter()
+            .map(Run::try_from)
+            .collect()
     }
 
     pub async fn fail_silent_runs(&self) -> Result<()> {
-        db::request(self.client
-            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT now64(9), run_id, ? FROM run_status GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ? AND max(timestamp) < now64(9) - INTERVAL 10 MINUTE")
+        self.client
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT now64(9), run_id, ? FROM run_status GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ? AND max(timestamp) < now64(9) - INTERVAL 2 MINUTE")
             .bind(RunStatus::Failed as i8)
             .bind(RunStatus::Running as i8)
-            .execute())
+            .execute()
             .await
             .context("failed to fail silent runs")
     }
 
-    pub async fn refresh_running(&self, run_id: Uuid) -> Result<()> {
-        db::request(self.client
-            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), run_id, ? FROM run_status WHERE run_id = ? GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ?")
+    pub async fn touch(&self, run_id: Uuid) -> Result<()> {
+        self.client
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), run_id, ? FROM run_status WHERE run_id = ? GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) NOT IN (?, ?)")
             .bind(RunStatus::Running as i8)
             .bind(run_id)
-            .bind(RunStatus::Running as i8)
-            .execute())
+            .bind(RunStatus::Succeeded as i8)
+            .bind(RunStatus::Cancelled as i8)
+            .execute()
             .await
-            .context("failed to refresh a running run")
+            .context("failed to refresh run liveness")
     }
 
     pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> Result<()> {
-        db::request(self.client
+        self.client
             .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), ?, ? FROM run_status WHERE run_id = ?")
             .bind(run_id)
             .bind(status as i8)
             .bind(run_id)
-            .execute())
+            .execute()
             .await
             .context("failed to append a run status")
     }

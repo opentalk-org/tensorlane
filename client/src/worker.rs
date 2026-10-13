@@ -1,15 +1,15 @@
-use crate::semaphore::BatchBudget;
 mod execution;
-use anyhow::{Context, anyhow, ensure};
+use anyhow::{Context, anyhow, bail, ensure};
 use fs2::FileExt;
+use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::Write,
+    fs::{File, OpenOptions, Permissions},
+    num::NonZeroUsize,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -41,38 +41,40 @@ pub struct Settings {
     pub num_workers: usize,
     pub memory_bytes: usize,
 }
+#[derive(Deserialize)]
+struct Config {
+    #[serde(default)]
+    tensorlane: Tunables,
+}
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Tunables {
+    ranks: Option<NonZeroUsize>,
+    prefetch_factor: Option<NonZeroUsize>,
+    num_workers: Option<NonZeroUsize>,
+    max_prefetch_memory_bytes: Option<NonZeroUsize>,
+}
 impl Settings {
     fn resolve(options: &Options, config: &str) -> anyhow::Result<Self> {
-        let config: serde_json::Map<String, serde_json::Value> = serde_json::from_str(config)?;
-        let settings = match config.get("tensorlane") {
-            Some(value) => Some(
-                value
-                    .as_object()
-                    .context("config.tensorlane must be an object")?,
-            ),
-            None => None,
-        };
-        let count =
-            |name: &str, explicit: Option<usize>, default: usize| -> anyhow::Result<usize> {
-                if let Some(value) = explicit {
-                    return Ok(value);
-                }
-                match settings.and_then(|settings| settings.get(name)) {
-                    Some(value) if !value.is_null() => {
-                        let value =
-                            value.as_u64().filter(|value| *value > 0).with_context(|| {
-                                format!("config.tensorlane.{name} must be a positive integer")
-                            })?;
-                        Ok(usize::try_from(value)?)
-                    }
-                    _ => Ok(default),
-                }
-            };
+        let config: Config = serde_json::from_str(config)
+            .context("config.tensorlane settings must be positive integers")?;
+        let tunables = config.tensorlane;
         let settings = Self {
-            ranks: count("ranks", options.ranks, 1)?,
-            factor: count("prefetch_factor", options.factor, 2)?,
-            num_workers: count("num_workers", options.num_workers, 5)?,
-            memory_bytes: count("max_prefetch_memory_bytes", None, 2 * 1024 * 1024 * 1024)?,
+            ranks: options
+                .ranks
+                .or(tunables.ranks.map(NonZeroUsize::get))
+                .unwrap_or(1),
+            factor: options
+                .factor
+                .or(tunables.prefetch_factor.map(NonZeroUsize::get))
+                .unwrap_or(32),
+            num_workers: options
+                .num_workers
+                .or(tunables.num_workers.map(NonZeroUsize::get))
+                .unwrap_or(5),
+            memory_bytes: tunables
+                .max_prefetch_memory_bytes
+                .map_or(2 * 1024 * 1024 * 1024, NonZeroUsize::get),
         };
         ensure!(options.rank < settings.ranks, "invalid rank");
         Ok(settings)
@@ -82,19 +84,15 @@ pub struct Worker {
     stop: Option<oneshot::Sender<anyhow::Result<()>>>,
     thread: Option<JoinHandle<()>>,
     connected: Arc<AtomicBool>,
-    outcome: Arc<Mutex<Option<Result<(), String>>>>,
-    _resources: Resources,
-}
-
-struct Resources {
+    outcome: Arc<OnceLock<Result<(), String>>>,
     root: PathBuf,
-    budgets: Arc<Mutex<HashMap<String, Arc<BatchBudget>>>>,
     _lock: File,
 }
-impl Resources {
-    fn new(root: &Path) -> anyhow::Result<Self> {
-        std::fs::create_dir_all(root)?;
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))?;
+impl Worker {
+    pub fn start(options: Options) -> anyhow::Result<(Self, Initialized)> {
+        let root = options.root.clone();
+        std::fs::create_dir_all(&root)?;
+        std::fs::set_permissions(&root, Permissions::from_mode(0o700))?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -103,134 +101,63 @@ impl Resources {
             .open(root.join("lock"))?;
         lock.try_lock_exclusive()
             .context("a daemon is already active for this run")?;
-        Self::clear(root)?;
-        let mut auth = File::create(root.join("auth"))?;
-        auth.write_all(uuid::Uuid::new_v4().as_bytes())?;
-        auth.write_all(uuid::Uuid::new_v4().as_bytes())?;
-        let budgets = Arc::new(Mutex::new(HashMap::new()));
-        Ok(Self {
-            root: root.to_owned(),
-            budgets,
-            _lock: lock,
-        })
-    }
-
-    fn clear(root: &Path) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(root)? {
-            let entry = entry?;
-            if entry.file_name() != "lock" {
-                if entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
-                } else {
-                    std::fs::remove_file(entry.path())?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-impl Drop for Resources {
-    fn drop(&mut self) {
-        let _ = Self::clear(&self.root);
-    }
-}
-impl Worker {
-    pub fn start(options: Options) -> anyhow::Result<(Self, Initialized)> {
-        for (name, value) in [
-            ("ranks", options.ranks),
-            ("prefetch_factor", options.factor),
-            ("num_workers", options.num_workers),
-        ] {
-            ensure!(
-                value.is_none_or(|value| value > 0),
-                "{name} must be positive"
-            );
-        }
-        let resources = Resources::new(&options.root)?;
-        let budgets = resources.budgets.clone();
-        let root = options.root.clone();
+        clear(&root)?;
+        let auth = [
+            uuid::Uuid::new_v4().into_bytes(),
+            uuid::Uuid::new_v4().into_bytes(),
+        ];
+        std::fs::write(root.join("auth"), auth.concat())?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?;
         let (stop, stopped) = oneshot::channel();
         let (ready, initialized) = std::sync::mpsc::sync_channel(1);
         let connected = Arc::new(AtomicBool::new(false));
-        let outcome = Arc::new(Mutex::new(None));
-        let thread_connected = connected.clone();
-        let thread_outcome = outcome.clone();
+        let outcome = Arc::new(OnceLock::new());
+        let (thread_connected, thread_outcome) = (connected.clone(), outcome.clone());
         let thread = thread::Builder::new()
             .name("tensorlane-daemon".into())
             .spawn(move || {
-                let result = (|| -> anyhow::Result<()> {
-                    let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .worker_threads(2)
-                        .enable_all()
-                        .build()?;
-                    runtime.block_on(execution::supervise(
-                        options,
-                        budgets,
-                        stopped,
-                        &ready,
-                        &thread_connected,
-                    ))
-                })();
-                let _ = std::fs::remove_file(root.join("init.json"));
-                if let Ok(mut outcome) = thread_outcome.lock() {
-                    *outcome = Some(
-                        result
-                            .as_ref()
-                            .map(|_| ())
-                            .map_err(|error| format!("{error:#}")),
-                    );
+                let supervise = execution::supervise(options, stopped, ready, thread_connected);
+                let result = runtime
+                    .block_on(supervise)
+                    .map_err(|error| format!("{error:#}"));
+                if let Err(error) = &result {
+                    eprintln!("TensorLane daemon failed: {error}");
                 }
-                if let Err(error) = result {
-                    let message = format!("{error:#}");
-                    eprintln!("TensorLane daemon failed: {message}");
-                    let _ = ready.send(Err(anyhow!(message)));
-                }
+                let _ = thread_outcome.set(result);
             })?;
         let mut worker = Self {
             stop: Some(stop),
             thread: Some(thread),
             connected,
             outcome,
-            _resources: resources,
+            root,
+            _lock: lock,
         };
-        match initialized
-            .recv()
-            .context("daemon stopped during startup")?
-        {
-            Ok(response) => Ok((worker, response)),
-            Err(error) => {
-                worker.shutdown()?;
-                Err(error)
-            }
-        }
+        let Ok(initialized) = initialized.recv() else {
+            worker.shutdown()?;
+            return Err(worker.check().expect_err("daemon thread has exited"));
+        };
+        Ok((worker, initialized))
     }
     pub fn stop(&mut self, error: Option<String>) {
-        let _ = std::fs::remove_file(self._resources.root.join("init.json"));
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(error.map_or(Ok(()), |message| Err(anyhow!(message))));
         }
-        if let Ok(budgets) = self._resources.budgets.lock() {
-            for budget in budgets.values() {
-                budget.cancel();
-            }
-        }
     }
     pub fn check(&self) -> anyhow::Result<()> {
-        let outcome = self
-            .outcome
-            .lock()
-            .map_err(|_| anyhow!("daemon outcome lock poisoned"))?;
-        match outcome.as_ref() {
-            Some(Err(error)) => return Err(anyhow!(error.clone())),
-            Some(Ok(())) => return Err(anyhow!("TensorLane daemon is closed")),
-            None => {}
+        match self.outcome.get() {
+            Some(Err(error)) => bail!("{error}"),
+            Some(Ok(())) => bail!("TensorLane daemon is closed"),
+            None => ensure!(
+                self.thread
+                    .as_ref()
+                    .is_some_and(|thread| !thread.is_finished()),
+                "TensorLane daemon stopped unexpectedly"
+            ),
         }
-        ensure!(
-            self.thread
-                .as_ref()
-                .is_some_and(|thread| !thread.is_finished()),
-            "TensorLane daemon stopped unexpectedly"
-        );
         Ok(())
     }
     pub fn ready(&self) -> anyhow::Result<bool> {
@@ -250,7 +177,22 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.shutdown();
+        let _ = clear(&self.root);
     }
+}
+fn clear(root: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        if entry.file_name() == "lock" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod settings_tests {
@@ -304,7 +246,7 @@ mod settings_tests {
         let settings = Settings::resolve(&options(), config).unwrap();
         assert_eq!(
             (settings.ranks, settings.num_workers, settings.factor),
-            (1, 5, 2)
+            (1, 5, 32)
         );
     }
 }

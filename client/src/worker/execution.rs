@@ -1,135 +1,56 @@
 use super::{Initialized, Options, Settings};
 use crate::{
+    assets::{Lease, Prefetched},
     data::{Work, prefetch},
     ipc::Sender,
     semaphore::BatchBudget,
+    transport::HttpClient,
 };
 use anyhow::{Context, anyhow, ensure};
+use reqwest::Method;
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::SyncSender,
     },
+    time::Duration,
 };
 use tokio::{
     net::UnixListener,
     sync::{mpsc, oneshot},
+    task::JoinSet,
+    time::MissedTickBehavior,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
+
+type Budgets = Vec<(String, Arc<BatchBudget>, u64)>;
 
 pub(super) async fn supervise(
     options: Options,
-    budgets: Arc<Mutex<HashMap<String, Arc<BatchBudget>>>>,
     mut stop: oneshot::Receiver<anyhow::Result<()>>,
-    ready: &std::sync::mpsc::SyncSender<anyhow::Result<Initialized>>,
-    connected: &AtomicBool,
+    ready: SyncSender<Initialized>,
+    connected: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let work_listener = UnixListener::bind(options.root.join("work.sock"))?;
     let upload_listener = UnixListener::bind(options.root.join("uploads.sock"))?;
     let mut remote = None;
-    let startup_timeout = options.startup_timeout;
-    let startup = async {
-        let http = crate::transport::connect(&options.addr, options.api_key.as_deref()).await?;
-        let initialized = http.initialize(&options.run_id).await?;
-        remote = Some((http.clone(), initialized.run_id.clone()));
-        let settings = Settings::resolve(&options, &initialized.config)?;
-        std::fs::write(options.root.join("ranks"), settings.ranks.to_string())?;
-        ensure!(
-            !initialized.streams.is_empty(),
-            "server returned no streams"
-        );
-        ensure!(
-            !initialized
-                .streams
-                .iter()
-                .any(|name| matches!(name.as_str(), "." | "..")),
-            "stream name must not be . or .."
-        );
-        let crate::assets::Prefetched {
-            paths: assets,
-            metadata: asset_metadata,
-            leases,
-        } = crate::assets::prefetch(&http, &initialized, settings.memory_bytes).await?;
-        let next_batches: HashMap<String, u64> = match &initialized.checkpoint {
-            Some(checkpoint) => {
-                let metadata: serde_json::Value =
-                    serde_json::from_str(&asset_metadata[&checkpoint.name])?;
-                serde_json::from_value(
-                    metadata["metadata"]["_tensorlane"]["next_batches"]
-                        .as_object()
-                        .cloned()
-                        .unwrap_or_default()
-                        .into(),
-                )?
-            }
-            None => HashMap::new(),
-        };
-        {
-            let mut budgets = budgets
-                .lock()
-                .map_err(|_| anyhow!("budget lock poisoned"))?;
-            for (index, name) in initialized.streams.iter().enumerate() {
-                ensure!(!budgets.contains_key(name), "duplicate stream name");
-                let budget = Arc::new(BatchBudget::new(
-                    settings
-                        .ranks
-                        .checked_mul(settings.factor)
-                        .context("prefetch capacity overflow")?,
-                    (settings.memory_bytes / initialized.streams.len()).max(1),
-                )?);
-                let directory = options.root.join("streams").join(index.to_string());
-                std::fs::create_dir_all(&directory)?;
-                let start = next_batches.get(name).copied().unwrap_or(0);
-                std::fs::write(directory.join("start"), start.to_string())?;
-                for rank in 0..settings.ranks {
-                    let next = start
-                        + (rank as u64 + settings.ranks as u64 - start % settings.ranks as u64)
-                            % settings.ranks as u64;
-                    std::fs::write(directory.join(format!("progress-{rank}")), next.to_string())?;
-                }
-                std::fs::write(directory.join("semaphore"), budget.semaphore.name()?)?;
-                std::fs::write(directory.join("memory"), budget.memory.semaphore.name()?)?;
-                budgets.insert(name.clone(), budget);
-            }
-        }
-        ready
-            .send(Ok(Initialized {
-                response: initialized.clone(),
-                assets,
-                asset_metadata,
-                settings,
-            }))
-            .map_err(|_| anyhow!("initializer disconnected"))?;
-        let mut work = Vec::new();
-        for _ in 0..settings.num_workers {
-            work.push(Sender::<Work, _>::new(work_listener.accept().await?.0));
-        }
-        anyhow::Ok((http, initialized, work, next_batches, leases))
-    };
     let started = tokio::select! {
-        result = startup => result.map(Some),
+        result = start(&options, &work_listener, ready, &mut remote) => result.map(Some),
         result = &mut stop => result.unwrap_or(Ok(())).map(|()| None),
-        _ = async {
-            match startup_timeout {
-                Some(timeout) => tokio::time::sleep(timeout).await,
-                None => std::future::pending().await,
-            }
-        } => Err(anyhow!("TensorLane startup timed out")),
+        _ = tokio::time::sleep(options.startup_timeout.unwrap_or(Duration::MAX)) => {
+            Err(anyhow!("TensorLane startup timed out"))
+        }
     };
-    let (http, initialized, work, next_batches, _leases) = match started {
+    let Some((http, run_id)) = remote else {
+        return started.map(|_| ());
+    };
+    let (work, budgets, _leases, heartbeat) = match started {
         Ok(Some(started)) => started,
         result => {
-            let ended = match remote {
-                Some((http, run_id)) => http
-                    .end(
-                        &run_id,
-                        result.is_err() || options.root.join("failed").exists(),
-                    )
-                    .await
-                    .context("ending run failed"),
-                None => Ok(()),
-            };
+            let failed = result.is_err() || options.root.join("failed").exists();
+            let ended = http.end(&run_id, failed).await.context("ending run failed");
             return result.map(|_| ()).and(ended);
         }
     };
@@ -137,106 +58,26 @@ pub(super) async fn supervise(
     let mut uploads = tokio::spawn(crate::uploads::serve(
         upload_listener,
         http.clone(),
-        initialized.run_id.clone(),
+        run_id.clone(),
         uploads_stopping.clone(),
     ));
-    let beating = (http.clone(), initialized.run_id.clone());
-    let heartbeat = tokio::spawn(async move {
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        loop {
-            tick.tick().await;
-            let beat = beating
-                .0
-                .request(
-                    reqwest::Method::POST,
-                    &["runs", &beating.1, "heartbeat"],
-                    None,
-                    &[],
-                )
-                .await;
-            if let Err(error) = beat {
-                eprintln!("TensorLane heartbeat failed: {error:#}");
-            }
-        }
-    });
-    let mut uploads_complete = false;
-    let (send_work, mut receive_work) = mpsc::unbounded_channel::<Work>();
-    let mut sender = tokio::spawn(async move {
-        let mut senders = work;
-        let mut next_worker = 0;
-        while let Some(message) = receive_work.recv().await {
-            match message {
-                Work::End { ref stream } => {
-                    for sender in &mut senders {
-                        sender
-                            .send(&Work::End {
-                                stream: stream.clone(),
-                            })
-                            .await
-                            .context("transform worker disconnected")?;
-                    }
-                }
-                Work::Batch {
-                    stream,
-                    batch,
-                    query_batch_idx,
-                    timings,
-                    samples,
-                    memory_units,
-                } => {
-                    let mut parts = vec![Vec::new(); senders.len()];
-                    for sample in samples {
-                        parts[next_worker].push(sample);
-                        next_worker = (next_worker + 1) % senders.len();
-                    }
-                    futures_util::future::try_join_all(senders.iter_mut().zip(parts).map(
-                        |(sender, samples)| {
-                            let stream = stream.clone();
-                            async move {
-                                if !samples.is_empty() {
-                                    sender
-                                        .send(&Work::Batch {
-                                            stream,
-                                            batch,
-                                            query_batch_idx,
-                                            timings,
-                                            samples,
-                                            memory_units,
-                                        })
-                                        .await
-                                        .context("transform worker disconnected")?;
-                                }
-                                anyhow::Ok(())
-                            }
-                        },
-                    ))
-                    .await?;
-                }
-            }
-        }
-        anyhow::Ok(senders)
-    });
-    let mut pumps = tokio::task::JoinSet::new();
-    let stream_budgets = budgets
-        .lock()
-        .map_err(|_| anyhow!("budget lock poisoned"))?
-        .clone();
-    for (name, budget) in stream_budgets {
-        let start = next_batches.get(&name).copied().unwrap_or(0);
+    let (send_work, receive_work) = mpsc::unbounded_channel();
+    let mut sender = AbortOnDropHandle::new(tokio::spawn(distribute(work, receive_work)));
+    let mut pumps = JoinSet::new();
+    for (name, budget, start) in &budgets {
         pumps.spawn(prefetch(
             http.clone(),
-            initialized.run_id.clone(),
-            name,
-            budget,
+            run_id.clone(),
+            name.clone(),
+            budget.clone(),
             send_work.clone(),
-            start,
+            *start,
         ));
     }
     drop(send_work);
-    let mut idle_senders = None;
-    let mut sender_complete = false;
+    connected.store(true, Ordering::Release);
+    let mut uploads_complete = false;
     let result = async {
-        connected.store(true, Ordering::Release);
         loop {
             tokio::select! {
                 biased;
@@ -245,46 +86,163 @@ pub(super) async fn supervise(
                     uploads_complete = true;
                     result.context("upload task panicked")??;
                     return Err(anyhow!("upload listener stopped unexpectedly"));
-                },
-                Some(result) = pumps.join_next(), if !pumps.is_empty() => {
-                    result.context("prefetch task panicked")??;
-                },
-                result = &mut sender, if !sender_complete => {
-                    sender_complete = true;
-                    idle_senders = Some(result.context("socket sender panicked")??);
-                },
+                }
+                Some(result) = pumps.join_next() => result.context("prefetch task panicked")??,
+                result = &mut sender => return result.context("socket sender panicked")?,
             }
         }
     }
     .await;
     let _ = std::fs::remove_file(options.root.join("init.json"));
-    if let Ok(budgets) = budgets.lock() {
-        for budget in budgets.values() {
-            budget.cancel();
-        }
+    for (_, budget, _) in &budgets {
+        budget.cancel();
     }
     pumps.abort_all();
     while pumps.join_next().await.is_some() {}
-    drop(idle_senders);
-    if !sender_complete {
-        sender.abort();
-        let _ = sender.await;
-    }
+    drop(sender);
     uploads_stopping.cancel();
-    let result = if !uploads_complete {
-        let uploaded = uploads
-            .await
-            .context("upload task panicked")
-            .and_then(|result| result);
-        result.and(uploaded)
-    } else {
+    let result = if uploads_complete {
         result
+    } else {
+        let uploaded = uploads.await.context("upload task panicked");
+        result.and(uploaded.and_then(|uploaded| uploaded))
     };
-    heartbeat.abort();
+    drop(heartbeat);
     let failed = result.is_err() || options.root.join("failed").exists();
-    let ended = http
-        .end(&initialized.run_id, failed)
-        .await
-        .context("ending run failed");
+    let ended = http.end(&run_id, failed).await.context("ending run failed");
     result.and(ended)
+}
+
+async fn start(
+    options: &Options,
+    work_listener: &UnixListener,
+    ready: SyncSender<Initialized>,
+    remote: &mut Option<(HttpClient, String)>,
+) -> anyhow::Result<(
+    Vec<Sender<Work>>,
+    Budgets,
+    Vec<Lease>,
+    AbortOnDropHandle<()>,
+)> {
+    let http = crate::transport::connect(&options.addr, options.api_key.as_deref()).await?;
+    let initialized = http.initialize(&options.run_id).await?;
+    *remote = Some((http.clone(), initialized.run_id.clone()));
+    let heartbeat = AbortOnDropHandle::new(tokio::spawn(heartbeat(
+        http.clone(),
+        initialized.run_id.clone(),
+    )));
+    let settings = Settings::resolve(options, &initialized.config)?;
+    std::fs::write(options.root.join("ranks"), settings.ranks.to_string())?;
+    ensure!(
+        !initialized.streams.is_empty(),
+        "server returned no streams"
+    );
+    let Prefetched {
+        paths,
+        metadata,
+        leases,
+    } = crate::assets::prefetch(&http, &initialized, settings.memory_bytes).await?;
+    let mut next_batches = HashMap::new();
+    if let Some(checkpoint) = &initialized.checkpoint {
+        let mut checkpoint: serde_json::Value = serde_json::from_str(&metadata[&checkpoint.name])?;
+        let next = checkpoint["metadata"]["_tensorlane"]["next_batches"].take();
+        next_batches =
+            serde_json::from_value::<Option<HashMap<String, u64>>>(next)?.unwrap_or_default();
+    }
+    let ranks = settings.ranks as u64;
+    let mut budgets = Vec::new();
+    for (index, name) in initialized.streams.iter().enumerate() {
+        let budget = Arc::new(BatchBudget::new(
+            settings.ranks * settings.factor,
+            settings.memory_bytes / initialized.streams.len(),
+        )?);
+        let directory = options.root.join("streams").join(index.to_string());
+        std::fs::create_dir_all(&directory)?;
+        let start = next_batches.get(name).copied().unwrap_or(0);
+        std::fs::write(directory.join("start"), start.to_string())?;
+        for rank in 0..ranks {
+            let next = start + (rank + ranks - start % ranks) % ranks;
+            std::fs::write(directory.join(format!("progress-{rank}")), next.to_string())?;
+        }
+        std::fs::write(directory.join("semaphore"), budget.semaphore.name()?)?;
+        std::fs::write(directory.join("memory"), budget.memory.semaphore.name()?)?;
+        budgets.push((name.clone(), budget, start));
+    }
+    ready
+        .send(Initialized {
+            response: initialized,
+            assets: paths,
+            asset_metadata: metadata,
+            settings,
+        })
+        .map_err(|_| anyhow!("initializer disconnected"))?;
+    let mut work = Vec::new();
+    for _ in 0..settings.num_workers {
+        work.push(Sender::new(work_listener.accept().await?.0));
+    }
+    Ok((work, budgets, leases, heartbeat))
+}
+
+async fn heartbeat(http: HttpClient, run_id: String) {
+    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let path = ["runs", &run_id, "heartbeat"];
+        if let Err(error) = http.request(Method::POST, &path, None, &[]).await {
+            eprintln!("TensorLane heartbeat failed: {error:#}");
+        }
+    }
+}
+
+async fn distribute(
+    mut senders: Vec<Sender<Work>>,
+    mut work: mpsc::UnboundedReceiver<Work>,
+) -> anyhow::Result<()> {
+    let mut next_worker = 0;
+    while let Some(message) = work.recv().await {
+        match message {
+            Work::End { .. } => {
+                for sender in &mut senders {
+                    sender
+                        .send(&message)
+                        .await
+                        .context("transform worker disconnected")?;
+                }
+            }
+            Work::Batch {
+                stream,
+                batch,
+                query_batch_idx,
+                timings,
+                samples,
+                memory_units,
+            } => {
+                let mut parts = vec![Vec::new(); senders.len()];
+                for sample in samples {
+                    parts[next_worker].push(sample);
+                    next_worker = (next_worker + 1) % senders.len();
+                }
+                let mut sends = Vec::new();
+                for (sender, samples) in senders.iter_mut().zip(parts) {
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    let message = Work::Batch {
+                        stream: stream.clone(),
+                        batch,
+                        query_batch_idx,
+                        timings,
+                        samples,
+                        memory_units,
+                    };
+                    sends.push(async move { sender.send(&message).await });
+                }
+                futures_util::future::try_join_all(sends)
+                    .await
+                    .context("transform worker disconnected")?;
+            }
+        }
+    }
+    std::future::pending().await
 }

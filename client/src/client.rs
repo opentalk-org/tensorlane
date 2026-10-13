@@ -4,7 +4,7 @@ use crate::{
     semaphore::PosixSemaphore,
     worker::{Options, Worker},
 };
-use anyhow::anyhow;
+use anyhow::Context;
 use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyList},
@@ -76,45 +76,30 @@ impl Daemon {
         })
     }
     #[pyo3(signature = (error=None))]
-    fn stop(&self, error: Option<String>) -> anyhow::Result<()> {
-        if let Some(worker) = self
-            .worker
-            .lock()
-            .map_err(|_| anyhow!("daemon lock poisoned"))?
-            .as_mut()
-        {
+    fn stop(&self, error: Option<String>) {
+        if let Some(worker) = self.worker.lock().unwrap().as_mut() {
             worker.stop(error);
         }
-        Ok(())
     }
     fn check(&self) -> anyhow::Result<()> {
-        self.worker
-            .lock()
-            .map_err(|_| anyhow!("daemon lock poisoned"))?
+        let worker = self.worker.lock().unwrap();
+        worker
             .as_ref()
-            .ok_or_else(|| anyhow!("TensorLane daemon is closed"))?
+            .context("TensorLane daemon is closed")?
             .check()
     }
     fn ready(&self) -> anyhow::Result<bool> {
-        self.worker
-            .lock()
-            .map_err(|_| anyhow!("daemon lock poisoned"))?
+        let worker = self.worker.lock().unwrap();
+        worker
             .as_ref()
-            .ok_or_else(|| anyhow!("TensorLane daemon is closed"))?
+            .context("TensorLane daemon is closed")?
             .ready()
     }
     fn close(&self, py: Python<'_>) -> anyhow::Result<()> {
-        py.allow_threads(|| {
-            if let Some(mut worker) = self
-                .worker
-                .lock()
-                .map_err(|_| anyhow!("daemon lock poisoned"))?
-                .take()
-            {
-                worker.shutdown()?;
-            }
-            Ok(())
-        })
+        if let Some(mut worker) = self.worker.lock().unwrap().take() {
+            py.allow_threads(|| worker.shutdown())?;
+        }
+        Ok(())
     }
 }
 #[pyclass]
@@ -131,39 +116,18 @@ impl Listener {
                 .worker_threads(1)
                 .enable_all()
                 .build()?;
-            let receiver = runtime.block_on(async move {
-                let stream = tokio::net::UnixStream::connect(path).await?;
-                let mut reader = Receiver::<Work, _>::new(stream);
-
-                let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
-                tokio::spawn(async move {
-                    loop {
-                        match reader.recv().await {
-                            Ok(Some(message)) => {
-                                if messages.send(Ok(message)).is_err() {
-                                    break;
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(error) => {
-                                let _ = messages.send(Err(error));
-                                break;
-                            }
-                        }
-                    }
-                });
-
-                anyhow::Ok(Mutex::new(receiver))
-            })?;
-            anyhow::Ok(Self { receiver, runtime })
+            let stream = runtime.block_on(tokio::net::UnixStream::connect(path))?;
+            let (messages, receiver) = tokio::sync::mpsc::unbounded_channel();
+            runtime.spawn(forward(Receiver::new(stream), messages));
+            Ok(Self {
+                receiver: Mutex::new(receiver),
+                runtime,
+            })
         })
     }
     fn recv(&self, py: Python<'_>) -> anyhow::Result<Option<Py<PyAny>>> {
         let message = py.allow_threads(|| {
-            let mut receiver = self
-                .receiver
-                .lock()
-                .map_err(|_| anyhow!("listener lock poisoned"))?;
+            let mut receiver = self.receiver.lock().unwrap();
             self.runtime.block_on(receiver.recv()).transpose()
         })?;
         let Some(message) = message else {
@@ -206,6 +170,18 @@ impl Listener {
             }
         }
         Ok(Some(object.into_any().unbind()))
+    }
+}
+
+async fn forward(
+    mut reader: Receiver<Work>,
+    messages: tokio::sync::mpsc::UnboundedSender<anyhow::Result<Work>>,
+) {
+    while let Some(message) = reader.recv().await.transpose() {
+        let failed = message.is_err();
+        if messages.send(message).is_err() || failed {
+            return;
+        }
     }
 }
 

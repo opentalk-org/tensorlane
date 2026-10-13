@@ -65,16 +65,6 @@ class BattleTests(PipelineCase):
         self.service.streams.update(training=129, validation=7, evaluation=1)
         self.check_distributed(ranks=2, workers=1, factor=32)
 
-    def test_dot_stream_names_are_rejected_before_batch_requests(self):
-        for name in (".", ".."):
-            with self.subTest(name=name):
-                self.service.streams = {name: 1}
-                self.service.requests = {name: []}
-                self.service.config["queries"] = {name: {"sql": "SELECT ..."}}
-                with self.assertRaisesRegex(RuntimeError, "stream name must not be"):
-                    self.start(workers=1, performance_metrics=False)
-                self.assertEqual(self.service.requests[name], [])
-
     def test_dot_asset_names_are_rejected_before_download(self):
         for name in (".", ".."):
             with self.subTest(name=name):

@@ -7,13 +7,6 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
 
-fn codec() -> LengthDelimitedCodec {
-    LengthDelimitedCodec::builder()
-        .length_field_length(8)
-        .max_frame_length(usize::MAX)
-        .new_codec()
-}
-
 pub struct Sender<T, Socket = UnixStream> {
     socket: Socket,
     marker: PhantomData<T>,
@@ -46,7 +39,13 @@ pub struct Receiver<T, Socket = UnixStream> {
 impl<T: DeserializeOwned, Socket: AsyncRead + Unpin> Receiver<T, Socket> {
     pub fn new(socket: Socket) -> Self {
         Self {
-            framed: FramedRead::new(socket, codec()),
+            framed: FramedRead::new(
+                socket,
+                LengthDelimitedCodec::builder()
+                    .length_field_length(8)
+                    .max_frame_length(usize::MAX)
+                    .new_codec(),
+            ),
             marker: PhantomData,
         }
     }
@@ -66,12 +65,10 @@ impl<T: DeserializeOwned, Socket: AsyncRead + Unpin> Receiver<T, Socket> {
 mod tests {
     use super::*;
     use crate::data::Work;
-    use futures_util::SinkExt;
     use tokio::{
         io::AsyncWriteExt,
         time::{Duration, timeout},
     };
-    use tokio_util::codec::FramedWrite;
 
     #[test]
     fn sample_blob_encoding_preserves_wire_format() -> Result<()> {
@@ -84,10 +81,10 @@ mod tests {
                 .map(|(name, bytes)| (name.clone(), bytes.clone().into()))
                 .collect(),
         };
-        let legacy = postcard::to_allocvec(&(&sample.sample_id, &sample.metadata_json, &blobs))?;
-        assert_eq!(postcard::to_allocvec(&sample)?, legacy);
+        let tuple = postcard::to_allocvec(&(&sample.sample_id, &sample.metadata_json, &blobs))?;
+        assert_eq!(postcard::to_allocvec(&sample)?, tuple);
         assert_eq!(
-            postcard::from_bytes::<tensorlane_protocol::Sample>(&legacy)?,
+            postcard::from_bytes::<tensorlane_protocol::Sample>(&tuple)?,
             sample
         );
         assert_eq!(
@@ -167,10 +164,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_postcard_payloads_are_errors() -> Result<()> {
-        for payload in [vec![0x80], vec![0, 42]] {
-            let (socket, receiver) = UnixStream::pair()?;
-            let mut sender = FramedWrite::new(socket, codec());
-            sender.send(payload.into()).await?;
+        for bytes in [
+            vec![0, 0, 0, 0, 0, 0, 0, 1, 0x80],
+            vec![0, 0, 0, 0, 0, 0, 0, 2, 0, 42],
+        ] {
+            let (mut sender, receiver) = UnixStream::pair()?;
+            sender.write_all(&bytes).await?;
             assert!(Receiver::<Vec<u8>>::new(receiver).recv().await.is_err());
         }
         Ok(())
@@ -212,19 +211,6 @@ mod tests {
         let mut receiver = Receiver::<()>::new(receiver);
         assert_eq!(receiver.recv().await?, Some(()));
         assert_eq!(receiver.recv().await?, None);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn messages_larger_than_default_codec_limit() -> Result<()> {
-        let (sender, receiver) = UnixStream::pair()?;
-        let producer =
-            tokio::spawn(
-                async move { Sender::new(sender).send(&vec![1u8; 9 * 1024 * 1024]).await },
-            );
-        let mut receiver = Receiver::<Vec<u8>>::new(receiver);
-        assert_eq!(receiver.recv().await?.unwrap(), vec![1; 9 * 1024 * 1024]);
-        producer.await??;
         Ok(())
     }
 

@@ -47,7 +47,9 @@ class PipelineTests(PipelineCase):
         self.service.assets = {"model": (str(uuid.uuid4()), b"b" * 2 * 1024 * 1024)}
         self.run_id = str(uuid.uuid4())
         self.start()
-        self.assertEqual(self.daemon.asset("model").read_bytes(), b"b" * 2 * 1024 * 1024)
+        self.assertEqual(
+            self.daemon.asset("model").read_bytes(), b"b" * 2 * 1024 * 1024
+        )
         self.assertFalse(first.exists())
 
     def test_saved_assets_are_cached_without_redownload(self):

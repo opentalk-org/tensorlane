@@ -1,15 +1,17 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, Weak, atomic::AtomicU64},
 };
-use tensorlane_protocol::InitResponse;
+use tensorlane_protocol::{AssetDownload, AssetMetadata, Checkpoint, InitResponse};
 use tokio::{fs, sync::Semaphore};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use uuid::Uuid;
 
 use crate::{
+    asset_repo::kind_name,
     loader::{Loader, S3Loader},
     run_config::Config,
     run_repo::{RunRepo, RunStatus},
@@ -26,6 +28,8 @@ pub struct Runtime {
     pub s3: aws_sdk_s3::Client,
     pub bucket: &'static str,
     pub cache: Arc<PathBuf>,
+    pub cache_bytes: u64,
+    pub cache_written: Arc<AtomicU64>,
     pub shutdown: CancellationToken,
     pub tasks: TaskTracker,
     pub(super) checkpoint_prefix: &'static str,
@@ -34,7 +38,6 @@ pub struct Runtime {
     pub upload_slots: Arc<Semaphore>,
     pub(super) loader: Arc<dyn Loader>,
     load_memory: Arc<Mutex<LoadingPools>>,
-    alive: Arc<Mutex<HashMap<Uuid, std::time::Instant>>>,
 }
 
 pub enum Batch {
@@ -43,12 +46,20 @@ pub enum Batch {
     Ready(PathBuf),
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct AssetSource {
+    pub object: String,
+    pub download: AssetDownload,
+}
+
 impl Runtime {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         database: clickhouse::Client,
         s3: aws_sdk_s3::Client,
         bucket: &'static str,
         cache: PathBuf,
+        cache_bytes: u64,
         shutdown: CancellationToken,
         checkpoint_prefix: &'static str,
         metrics_prefix: &'static str,
@@ -64,6 +75,8 @@ impl Runtime {
             s3,
             bucket,
             cache: Arc::new(cache),
+            cache_bytes,
+            cache_written: Arc::new(AtomicU64::new(0)),
             shutdown,
             tasks: TaskTracker::new(),
             checkpoint_prefix,
@@ -71,12 +84,15 @@ impl Runtime {
             asset_slots: Arc::new(Semaphore::new(128)),
             upload_slots: Arc::new(Semaphore::new(2)),
             load_memory: Arc::new(Mutex::new(HashMap::new())),
-            alive: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     pub fn run_dir(&self, run: Uuid) -> PathBuf {
         self.cache.join("runs").join(run.to_string())
+    }
+
+    pub fn asset_key(&self, id: Uuid) -> String {
+        format!("{}/{id}", self.checkpoint_prefix)
     }
 
     pub(super) fn loading_memory(
@@ -88,7 +104,7 @@ impl Runtime {
         let mut streams = self
             .load_memory
             .lock()
-            .map_err(|_| anyhow::anyhow!("loading memory lock poisoned"))?;
+            .map_err(|_| anyhow!("loading memory lock poisoned"))?;
         streams.retain(|_, budget| budget.strong_count() > 0);
         let key = (run, stream.to_owned());
         if let Some(budget) = streams.get(&key).and_then(Weak::upgrade) {
@@ -108,9 +124,8 @@ impl Runtime {
             .run_assets(id, None)
             .await?
             .into_iter()
-            .rev()
-            .find(|asset| asset.kind == 1)
-            .map(|asset| tensorlane_protocol::Checkpoint {
+            .rfind(|asset| asset.kind == 1)
+            .map(|asset| Checkpoint {
                 name: asset.name,
                 asset_id: asset.id.to_string(),
             });
@@ -127,7 +142,7 @@ impl Runtime {
             run_id: id.to_string(),
             config: serde_json::to_string(&record.config)?,
             assets,
-            streams: config.queries.keys().cloned().collect(),
+            streams: config.queries.into_keys().collect(),
             checkpoint,
         })
     }
@@ -135,8 +150,8 @@ impl Runtime {
     pub async fn active(&self, id: Uuid) -> Result<Config> {
         let record = self.repo.get(id).await?.context("run not found")?;
         ensure!(
-            record.status == Some(RunStatus::Running),
-            "run is not running"
+            record.status != Some(RunStatus::Cancelled),
+            "run is cancelled"
         );
         Config::parse(&record.config)
     }
@@ -145,7 +160,7 @@ impl Runtime {
         let record = self.repo.get(id).await?.context("run not found")?;
         if matches!(
             record.status,
-            Some(RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled)
+            Some(RunStatus::Succeeded | RunStatus::Cancelled)
         ) {
             return Ok(());
         }
@@ -157,23 +172,8 @@ impl Runtime {
         self.repo.append_status(id, status).await
     }
 
-    pub async fn alive(&self, id: Uuid) {
-        let now = std::time::Instant::now();
-        let stale = self.alive.lock().map(|mut alive| {
-            alive.retain(|_, seen| now.duration_since(*seen) < std::time::Duration::from_secs(600));
-            let seen = alive.insert(id, now);
-            seen.is_none_or(|seen| now.duration_since(seen) >= std::time::Duration::from_secs(60))
-        });
-        if stale.unwrap_or(false)
-            && let Err(error) = self.repo.refresh_running(id).await
-        {
-            tracing::warn!(run=%id, error=%error, "run liveness refresh failed");
-        }
-    }
-
     pub async fn asset(&self, id: Uuid, name: &str) -> Result<AssetSource> {
         let config = self.active(id).await?;
-        use sha2::{Digest, Sha256};
         let dir = self.run_dir(id).join("inputs");
         fs::create_dir_all(&dir).await?;
         let path = dir
@@ -183,8 +183,8 @@ impl Runtime {
             return Ok(serde_json::from_slice(&bytes)?);
         }
         let _lock = Lock::acquire(&path.with_extension("lock")).await?;
-        if fs::try_exists(&path).await? {
-            return Ok(serde_json::from_slice(&fs::read(&path).await?)?);
+        if let Ok(bytes) = fs::read(&path).await {
+            return Ok(serde_json::from_slice(&bytes)?);
         }
         let input = match config.assets.get(name) {
             Some(input) => input.clone(),
@@ -194,20 +194,38 @@ impl Runtime {
                 entrypoint: None,
             },
         };
-        let record = match input.asset_id {
-            Some(id) => Some(
-                self.repo
-                    .get_asset(id)
+        let (object, metadata, sha256) = match input.asset_id {
+            Some(asset_id) => {
+                let record = self
+                    .repo
+                    .get_asset(asset_id)
                     .await?
-                    .context("input asset not found")?,
-            ),
-            None => None,
+                    .context("input asset not found")?;
+                let metadata = AssetMetadata {
+                    entrypoint: input.entrypoint,
+                    asset_id: Some(asset_id.to_string()),
+                    metadata_json: record.metadata,
+                    kind: kind_name(record.kind)?.into(),
+                    asset_type: record.asset_type,
+                };
+                let sha256 = String::from_utf8(record.content_hash.to_vec())?;
+                (record.path, metadata, Some(sha256))
+            }
+            None => {
+                let metadata = AssetMetadata {
+                    entrypoint: input.entrypoint,
+                    asset_id: None,
+                    metadata_json: "{}".into(),
+                    kind: "file".into(),
+                    asset_type: String::new(),
+                };
+                (
+                    input.object.context("missing asset object")?,
+                    metadata,
+                    None,
+                )
+            }
         };
-        let object = record
-            .as_ref()
-            .map(|r| r.path.clone())
-            .or_else(|| input.object.clone())
-            .context("missing asset object")?;
         let head = self
             .s3
             .head_object()
@@ -215,48 +233,18 @@ impl Runtime {
             .key(&object)
             .send()
             .await?;
-        let etag = head.e_tag().context("asset is missing ETag")?.to_owned();
-        let size = u64::try_from(head.content_length().context("asset is missing size")?)?;
-        let metadata = tensorlane_protocol::AssetMetadata {
-            entrypoint: input.entrypoint.clone(),
-            asset_id: input.asset_id.map(|id| id.to_string()),
-            metadata_json: record
-                .as_ref()
-                .map(|r| r.metadata.clone())
-                .unwrap_or_else(|| "{}".into()),
-            kind: record
-                .as_ref()
-                .map(|r| crate::asset_repo::kind_name(r.kind))
-                .transpose()?
-                .unwrap_or("file")
-                .into(),
-            asset_type: record
-                .as_ref()
-                .map(|r| r.asset_type.clone())
-                .unwrap_or_default(),
-        };
-        let sha256 = record
-            .as_ref()
-            .map(|r| String::from_utf8(r.content_hash.to_vec()))
-            .transpose()?;
         let source = AssetSource {
             object,
-            download: tensorlane_protocol::AssetDownload {
+            download: AssetDownload {
                 metadata,
-                size,
-                etag,
+                size: u64::try_from(head.content_length().context("asset is missing size")?)?,
+                etag: head.e_tag().context("asset is missing ETag")?.to_owned(),
                 sha256,
             },
         };
         write_atomic(&path, &serde_json::to_vec(&source)?).await?;
         Ok(source)
     }
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct AssetSource {
-    pub object: String,
-    pub download: tensorlane_protocol::AssetDownload,
 }
 
 #[cfg(test)]
@@ -275,6 +263,7 @@ mod tests {
             aws_sdk_s3::Client::from_conf(config),
             "test",
             PathBuf::from("unused"),
+            0,
             CancellationToken::new(),
             "checkpoints",
             "metrics",

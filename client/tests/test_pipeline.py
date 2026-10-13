@@ -107,6 +107,7 @@ class PipelineTests(PipelineCase):
             auth.methods,
             {
                 "init",
+                "heartbeat",
                 "batches",
                 "inputs",
                 "model",

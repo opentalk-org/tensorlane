@@ -22,6 +22,7 @@ pub async fn load_blobs(
     loader: &dyn Loader,
     references: Vec<(BlobRef, usize)>,
 ) -> Result<Vec<Bytes>> {
+    let mut blobs = vec![Bytes::new(); references.len()];
     let mut references: Vec<_> = references.into_iter().enumerate().collect();
     references.sort_unstable_by(|(_, (a, _)), (_, (b, _))| {
         (&a.object, a.byte_offset).cmp(&(&b.object, b.byte_offset))
@@ -30,13 +31,12 @@ pub async fn load_blobs(
     for (index, (reference, size)) in references {
         if let Some(previous) = reads.last_mut()
             && previous.reference.object == reference.object
-            && let (Some(start), Some(count), Some(offset)) = (
+            && let (Some(start), Some(length), Some(offset)) = (
                 previous.reference.byte_offset,
                 previous.reference.byte_length,
                 reference.byte_offset,
             )
-            && start.checked_add(count) == Some(offset)
-            && reference.byte_length.is_some()
+            && start + length == offset
         {
             previous.parts.push((index, previous.size, size));
             previous.size += size;
@@ -49,29 +49,19 @@ pub async fn load_blobs(
             parts: vec![(index, 0, size)],
         });
     }
-    let mut blobs: Vec<_> = try_join_all(reads.into_iter().map(
-        |BlobRead {
-             reference,
-             size,
-             parts,
-         }| async move {
-            let bytes: Bytes = loader.load(&reference, size).await?.into();
-            ensure!(bytes.len() == size, "blob returned an unexpected size");
-            if parts.len() == 1 {
-                return anyhow::Ok(vec![(parts[0].0, bytes)]);
-            }
-            Ok(parts
-                .into_iter()
-                .map(|(index, start, size)| (index, bytes.slice(start..start + size)))
-                .collect())
-        },
-    ))
-    .await?
-    .into_iter()
-    .flatten()
-    .collect();
-    blobs.sort_unstable_by_key(|(index, _)| *index);
-    Ok(blobs.into_iter().map(|(_, bytes)| bytes).collect())
+    let loaded = try_join_all(
+        reads
+            .iter()
+            .map(|read| loader.load(&read.reference, read.size)),
+    )
+    .await?;
+    for (read, bytes) in reads.into_iter().zip(loaded) {
+        let bytes = Bytes::from(bytes);
+        for (index, start, size) in read.parts {
+            blobs[index] = bytes.slice(start..start + size);
+        }
+    }
+    Ok(blobs)
 }
 #[derive(Clone)]
 pub struct S3Loader {
@@ -86,21 +76,18 @@ impl S3Loader {
 #[async_trait]
 impl Loader for S3Loader {
     async fn size(&self, reference: &BlobRef) -> Result<usize> {
-        let size = match reference.byte_length {
-            Some(size) => size,
-            None => {
-                let head = self
-                    .s3_client
-                    .head_object()
-                    .bucket(self.bucket)
-                    .key(&reference.object)
-                    .send()
-                    .await
-                    .with_context(|| format!("inspecting blob {}", reference.object))?;
-                u64::try_from(head.content_length().context("blob has no size")?)?
-            }
-        };
-        Ok(usize::try_from(size)?)
+        if let Some(size) = reference.byte_length {
+            return Ok(size as usize);
+        }
+        let head = self
+            .s3_client
+            .head_object()
+            .bucket(self.bucket)
+            .key(&reference.object)
+            .send()
+            .await
+            .with_context(|| format!("inspecting blob {}", reference.object))?;
+        Ok(head.content_length().context("blob has no size")? as usize)
     }
 
     async fn load(&self, reference: &BlobRef, size: usize) -> Result<Vec<u8>> {
@@ -116,27 +103,12 @@ impl Loader for S3Loader {
             .send()
             .await
             .with_context(|| format!("loading blob {}", reference.object))?;
-        if let Some(length) = object.content_length() {
-            ensure!(length == size as i64, "blob returned an unexpected size");
-        }
-        let mut stream = object.body.into_async_read();
+        ensure!(
+            object.content_length() == Some(size as i64),
+            "blob returned an unexpected size"
+        );
         let mut bytes = vec![0; size];
-        let mut offset = 0;
-        while offset < size {
-            let count = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                stream.read(&mut bytes[offset..]),
-            )
-            .await??;
-            ensure!(count > 0, "blob returned an unexpected size");
-            offset += count;
-        }
-        let extra = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            stream.read(&mut [0u8; 1]),
-        )
-        .await??;
-        ensure!(extra == 0, "blob returned an unexpected size");
+        object.body.into_async_read().read_exact(&mut bytes).await?;
         Ok(bytes)
     }
 }

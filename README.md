@@ -32,7 +32,7 @@ Run configuration has three separate sections:
 
 ```json
 {
-  "tensorlane": {"num_workers": 5, "prefetch_factor": 2},
+  "tensorlane": {"num_workers": 5, "prefetch_factor": 32},
   "queries": {
     "training": {
       "sql": "...",

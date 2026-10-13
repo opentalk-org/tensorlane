@@ -2,7 +2,8 @@ use std::{future::Future, time::Duration};
 
 use anyhow::Result;
 use axum::{Router, extract::State, http::StatusCode, routing::get};
-use tokio::{fs, io::AsyncWriteExt};
+use futures::TryFutureExt;
+use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -34,42 +35,29 @@ async fn readiness_status(
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => StatusCode::SERVICE_UNAVAILABLE,
-        result = tokio::time::timeout(READINESS_TIMEOUT, checks) => {
-            if matches!(result, Ok(Ok(()))) && !shutdown.is_cancelled() {
-                StatusCode::OK
-            } else {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
-        }
+        result = tokio::time::timeout(READINESS_TIMEOUT, checks) => match result {
+            Ok(Ok(())) => StatusCode::OK,
+            _ => StatusCode::SERVICE_UNAVAILABLE,
+        },
     }
 }
 
 async fn check_dependencies(runtime: &Runtime) -> Result<()> {
+    let probe = TemporaryFile(runtime.cache.join(format!("{}.probe", Uuid::new_v4())));
     tokio::try_join!(
-        async {
-            runtime.database.query("SELECT 1").fetch_one::<u8>().await?;
-            anyhow::Ok(())
-        },
-        async {
-            runtime
-                .s3
-                .head_bucket()
-                .bucket(runtime.bucket)
-                .send()
-                .await?;
-            anyhow::Ok(())
-        },
-        async {
-            crate::cache_limits::space(&runtime.cache, 0).await?;
-            let probe = TemporaryFile(runtime.cache.join(format!("{}.probe", Uuid::new_v4())));
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&probe.0)
-                .await?;
-            file.write_all(b"ready\n").await?;
-            anyhow::Ok(())
-        },
+        runtime
+            .database
+            .query("SELECT 1")
+            .fetch_one::<u8>()
+            .err_into::<anyhow::Error>(),
+        runtime
+            .s3
+            .head_bucket()
+            .bucket(runtime.bucket)
+            .send()
+            .err_into(),
+        crate::cache_limits::space(&runtime.cache, 0),
+        fs::write(&probe.0, b"ready\n").err_into(),
     )?;
     Ok(())
 }

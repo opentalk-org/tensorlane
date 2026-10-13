@@ -1,14 +1,18 @@
 use crate::{
-    db::stream_samples,
+    db::{SampleRow, stream_samples},
     loader::{Loader, load_blobs},
     runtime::{Batch, LOAD_MEMORY_UNIT, Runtime},
-    sampling::{BatchPlan, plan::QuerySampler},
+    sampling::{BatchPlan, QuerySampler},
     shared_cache::{Lock, write_atomic},
 };
 use anyhow::{Context, Result, ensure};
-use futures::future::try_join_all;
+use futures::{Stream, future::try_join_all};
 use prost::Message;
-use std::sync::Arc;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
 use tensorlane_protocol::DataResponse;
 use tokio::{
     fs,
@@ -30,51 +34,28 @@ impl Runtime {
         fs::create_dir_all(&dir).await?;
         let path = dir.join(format!("{index}.plan"));
         let ready = path.with_extension("ready");
-        let (plan, generation) = loop {
+        if !fs::try_exists(&ready).await? {
             let Some(lock) = Lock::try_acquire(&path.with_extension("lock")).await? else {
                 return Ok(Batch::Pending);
             };
             crate::job::check(&path.with_extension("error")).await?;
-            let generation = match fs::read(&ready).await {
-                Ok(bytes) => Uuid::from_slice(&bytes).ok(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            if let Some(generation) = generation
-                && fs::try_exists(&path).await?
-                && fs::try_exists(path.with_extension("index")).await?
-            {
-                let mut sampler = QuerySampler::open(&path, query.repeat).await?;
-                break (sampler.batch_at(sequence).await?, generation);
+            if !fs::try_exists(&ready).await? {
+                let rows = stream_samples(&self.database, &query.sql, &query.params);
+                self.tasks
+                    .spawn(prepare_plan(name.to_owned(), rows, path.clone(), lock));
             }
-            if generation.is_some() || fs::try_exists(&ready).await? {
-                fs::remove_file(&ready).await?;
-            }
-            let engine = self.clone();
-            let path = path.clone();
-            let query = query.clone();
-            let name = name.to_owned();
-            self.tasks.spawn(async move {
-                let _lock = lock;
-                let result = async {
-                    crate::cache_limits::space(&engine.cache, 0).await?;
-                    let _ = fs::remove_file(path.with_extension("part")).await;
-                    let rows = stream_samples(&engine.database, &query.sql, &query.params);
-                    let mut sampler = QuerySampler::create(&name, rows, &path, query.repeat).await?;
-                    sampler.persist();
-                    write_atomic(&path.with_extension("ready"), Uuid::new_v4().as_bytes()).await?;
-                    anyhow::Ok(())
-                }.await;
-                if let Err(error) = result {
-                    tracing::warn!(run = %id, stream = %name, error = %error, "query plan preparation failed");
-                    crate::job::failed(&path.with_extension("error"), &error).await;
-                }
-            });
             if !crate::job::wait_for_file(&ready).await? {
                 return Ok(Batch::Pending);
             }
-        };
-        let Some(plan) = plan else {
+        }
+        let generation = Uuid::from_slice(&fs::read(&ready).await?)?;
+        fs::File::open(&ready)
+            .await?
+            .into_std()
+            .await
+            .set_modified(SystemTime::now())?;
+        let mut sampler = QuerySampler::open(&path, query.repeat).await?;
+        let Some(plan) = sampler.batch_at(sequence).await? else {
             return Ok(Batch::End);
         };
         let data = self
@@ -93,35 +74,67 @@ impl Runtime {
         };
         let limit = (config.max_load_memory_bytes / config.queries.len()).max(1);
         let memory = self.loading_memory(id, name, limit)?;
-        let engine = self.clone();
-        let result_path = cached.clone();
-        let name = name.to_owned();
-        let preparation = self.tasks.spawn(async move {
-            let _lock = lock;
-            let result = async {
-                let (response, _memory) = load_batch(engine.loader.as_ref(), name.clone(), plan, memory, limit).await?;
-                write_atomic(&cached, &response.encode_to_vec()).await?;
-                anyhow::Ok(())
-            }.await;
-            if let Err(error) = result {
-                tracing::warn!(run = %id, stream = %name, error = %error, "batch preparation failed");
-                crate::job::failed(&cached.with_extension("error"), &error).await;
-            }
-        });
-        let ready = tokio::select! {
-            result = crate::job::wait_for_file(&result_path) => result?,
-            result = preparation => {
-                result?;
-                crate::job::check(&result_path.with_extension("error")).await?;
-                fs::try_exists(&result_path).await?
-            }
-        };
-        if ready {
-            Ok(Batch::Ready(result_path))
+        self.tasks.spawn(prepare_batch(
+            self.clone(),
+            name.to_owned(),
+            plan,
+            memory,
+            limit,
+            cached.clone(),
+            lock,
+        ));
+        if crate::job::wait_for_file(&cached).await? {
+            Ok(Batch::Ready(cached))
         } else {
             Ok(Batch::Pending)
         }
     }
+}
+
+async fn prepare_plan(
+    name: String,
+    rows: impl Stream<Item = Result<SampleRow>> + Send,
+    path: PathBuf,
+    _lock: Lock,
+) {
+    if let Err(error) = QuerySampler::create(&name, rows, &path).await {
+        crate::job::failed(&path.with_extension("error"), &error).await;
+    }
+}
+
+async fn prepare_batch(
+    engine: Runtime,
+    stream: String,
+    plan: BatchPlan,
+    memory: Arc<Semaphore>,
+    limit: usize,
+    path: PathBuf,
+    _lock: Lock,
+) {
+    if let Err(error) = write_batch(&engine, stream, plan, memory, limit, &path).await {
+        crate::job::failed(&path.with_extension("error"), &error).await;
+    }
+}
+
+async fn write_batch(
+    engine: &Runtime,
+    stream: String,
+    plan: BatchPlan,
+    memory: Arc<Semaphore>,
+    limit: usize,
+    path: &Path,
+) -> Result<()> {
+    let (response, _permit) =
+        load_batch(engine.loader.as_ref(), stream, plan, memory, limit).await?;
+    let bytes = response.encode_to_vec();
+    crate::cache_limits::reserve(
+        &engine.cache,
+        engine.cache_bytes,
+        &engine.cache_written,
+        bytes.len() as u64,
+    )
+    .await?;
+    write_atomic(path, &bytes).await
 }
 
 async fn load_batch(
@@ -131,43 +144,40 @@ async fn load_batch(
     memory: Arc<Semaphore>,
     limit: usize,
 ) -> Result<(DataResponse, OwnedSemaphorePermit)> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let mut response = DataResponse {
         stream,
         query_batch_idx: plan.query_batch_idx,
         ..Default::default()
     };
-    let prepared = try_join_all(plan.samples.into_iter().map(|sample| async move {
-        let sizes = try_join_all(sample.blobs.values().map(|blob| loader.size(blob))).await?;
-        anyhow::Ok((sample, sizes))
-    }))
-    .await?;
-    let mut encoded_bound = response.encoded_len() + 64;
-    let mut overhead = 0usize;
-    for (sample, sizes) in &prepared {
-        encoded_bound += sample.sample_id.len() + sample.metadata_json.len() + 32;
+    let references: Vec<_> = plan
+        .samples
+        .iter()
+        .flat_map(|sample| sample.blobs.values().cloned())
+        .collect();
+    let sizes = try_join_all(references.iter().map(|blob| loader.size(blob))).await?;
+    let mut size = sizes.iter();
+    let mut encoded = response.encoded_len() + 64;
+    let mut overhead = 0;
+    for sample in &plan.samples {
+        encoded += sample.sample_id.len() + sample.metadata_json.len() + 32;
         overhead += 256;
-        for ((name, blob), size) in sample.blobs.iter().zip(sizes) {
-            encoded_bound += name.len() + size + 32;
-            // Descriptor/future storage and an allowance for each active S3 stream.
+        for (name, blob) in &sample.blobs {
+            encoded += name.len() + size.next().unwrap() + 32;
             overhead += blob.object.len() + name.len() + 64 * 1024;
         }
     }
-    let required = encoded_bound
-        .checked_mul(2)
-        .and_then(|size| size.checked_add(overhead))
-        .context("batch loading memory size overflow")?;
-    let count = u32::try_from(required.min(limit).div_ceil(LOAD_MEMORY_UNIT))?;
-    let waiting = std::time::Instant::now();
-    let permit = memory.acquire_many_owned(count).await?;
+    let required = encoded * 2 + overhead;
+    let waiting = Instant::now();
+    let permit = memory
+        .acquire_many_owned(required.min(limit).div_ceil(LOAD_MEMORY_UNIT) as u32)
+        .await?;
     response.server_wait_seconds = waiting.elapsed().as_secs_f64();
-    let references = prepared
-        .iter()
-        .flat_map(|(sample, sizes)| sample.blobs.values().cloned().zip(sizes.iter().copied()))
-        .collect();
-    let mut blobs = load_blobs(loader, references).await?.into_iter();
-    for (sample, _) in prepared {
-        let sample = tensorlane_protocol::Sample {
+    let mut blobs = load_blobs(loader, references.into_iter().zip(sizes).collect())
+        .await?
+        .into_iter();
+    for sample in plan.samples {
+        response.batch.push(tensorlane_protocol::Sample {
             sample_id: sample.sample_id,
             metadata_json: sample.metadata_json,
             blobs: sample
@@ -175,8 +185,7 @@ async fn load_batch(
                 .into_keys()
                 .map(|name| (name, blobs.next().unwrap()))
                 .collect(),
-        };
-        response.batch.push(sample);
+        });
     }
     response.load_seconds = started.elapsed().as_secs_f64() - response.server_wait_seconds;
     Ok((response, permit))

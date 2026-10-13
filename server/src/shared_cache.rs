@@ -14,41 +14,28 @@ pub struct Lock {
 impl Lock {
     pub async fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)?;
-            match file.try_lock_exclusive() {
-                Ok(()) => Ok(Some(Self { _file: file })),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await?
+        Ok(tokio::task::spawn_blocking(move || try_lock(&path)).await??)
     }
     pub async fn acquire(path: &Path) -> Result<Self> {
-        let path = path.to_owned();
-        let file = tokio::task::spawn_blocking(move || {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(path)
-        })
-        .await??;
         loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => return Err(e.into()),
+            if let Some(lock) = Self::try_acquire(path).await? {
+                return Ok(lock);
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+}
+fn try_lock(path: &Path) -> std::io::Result<Option<Lock>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Some(Lock { _file: file })),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Err(error) => Err(error),
     }
 }
 pub struct TemporaryFile(pub PathBuf);

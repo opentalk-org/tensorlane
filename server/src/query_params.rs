@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -41,10 +41,7 @@ fn escape(value: &str) -> String {
 }
 
 fn arguments(kind: &str) -> Vec<&str> {
-    let Some(start) = kind.find('(') else {
-        return Vec::new();
-    };
-    let Some(end) = kind.rfind(')') else {
+    let (Some(start), Some(end)) = (kind.find('('), kind.rfind(')')) else {
         return Vec::new();
     };
     let text = &kind[start + 1..end];
@@ -101,11 +98,9 @@ fn render(value: &Value, kind: &str, nested: bool) -> Result<String> {
         Value::Bool(v) => if *v { "1" } else { "0" }.into(),
         Value::Number(v) => v.to_string(),
         Value::String(v) => {
-            let numeric = base.starts_with("Int")
-                || base.starts_with("UInt")
-                || base.starts_with("Float")
-                || base.starts_with("Decimal")
-                || base == "Bool";
+            let numeric = ["Int", "UInt", "Float", "Decimal", "Bool"]
+                .iter()
+                .any(|prefix| base.starts_with(prefix));
             if !nested {
                 escape(v)
             } else if numeric {
@@ -114,40 +109,35 @@ fn render(value: &Value, kind: &str, nested: bool) -> Result<String> {
                 format!("'{}'", escape(v))
             }
         }
+        Value::Array(items) if base == "Tuple" => {
+            ensure!(
+                items.len() == args.len(),
+                "tuple parameter has wrong field count"
+            );
+            let values = items
+                .iter()
+                .zip(&args)
+                .map(|(value, kind)| render(value, kind, true))
+                .collect::<Result<Vec<_>>>()?;
+            format!("({})", values.join(","))
+        }
         Value::Array(items) => {
-            let tuple = base == "Tuple";
-            if tuple {
-                ensure!(
-                    items.len() == args.len(),
-                    "tuple parameter has wrong field count"
-                );
-            }
-            let mut values = Vec::new();
-            for (i, value) in items.iter().enumerate() {
-                let kind = if tuple {
-                    args[i]
-                } else {
-                    args.first().copied().unwrap_or("")
-                };
-                values.push(render(value, kind, true)?);
-            }
-            if tuple {
-                format!("({})", values.join(","))
-            } else {
-                format!("[{}]", values.join(","))
-            }
+            let kind = args.first().copied().unwrap_or("");
+            let values = items
+                .iter()
+                .map(|value| render(value, kind, true))
+                .collect::<Result<Vec<_>>>()?;
+            format!("[{}]", values.join(","))
         }
         Value::Object(items) => {
-            if base != "Map" || args.len() != 2 {
-                bail!("object parameters require Map or {{\"$clickhouse\":\"native text\"}}");
-            }
+            ensure!(
+                base == "Map" && args.len() == 2,
+                "object parameters require Map or {{\"$clickhouse\":\"native text\"}}"
+            );
             let mut values = Vec::new();
             for (key, value) in items {
-                values.push(format!(
-                    "{}:{}",
-                    render(&Value::String(key.clone()), args[0], true)?,
-                    render(value, args[1], true)?
-                ));
+                let key = render(&Value::String(key.clone()), args[0], true)?;
+                values.push(format!("{key}:{}", render(value, args[1], true)?));
             }
             format!("{{{}}}", values.join(","))
         }

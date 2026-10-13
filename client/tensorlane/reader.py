@@ -1,10 +1,14 @@
 from __future__ import annotations
-import errno
-import time
-from pathlib import Path
+
 from collections.abc import Callable, Iterator
+from contextlib import suppress
+import errno
+import math
 from multiprocessing.connection import Listener
+from pathlib import Path
 import socket
+import time
+
 from . import _native
 from . import _ipc
 from .data import Batch
@@ -16,67 +20,56 @@ class BatchReader(Iterator[Batch]):
         self,
         root: Path,
         rank: int,
-        timeout: float,
+        timeout: float | None,
         check: Callable[[], None],
         stream_index: int,
         stream: str,
-        performance: Performance | None = None,
+        performance: Performance | None,
     ) -> None:
-        if rank < 0 or timeout <= 0:
-            raise ValueError("rank must be nonnegative and timeout must be positive")
+        if timeout is not None and timeout <= 0:
+            raise ValueError("timeout must be positive")
         self._check = check
         self._performance = performance
         self._stream = stream
         self._returned = None
-        if performance is not None:
-            performance.open(stream)
         self._closed = False
         self._connection = None
         self._listener = None
-        self._semaphore = None
-        self._memory_semaphore = None
-        deadline = time.monotonic() + timeout
+        if performance is not None:
+            performance.open(stream)
+        deadline = time.monotonic() + (math.inf if timeout is None else timeout)
+        check()
+        self._ranks = int((root / "ranks").read_text())
+        directory = root / "streams" / str(stream_index)
+        self._progress = directory / f"progress-{rank}"
+        self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
+        self._memory_semaphore = _native.Semaphore((directory / "memory").read_text())
         try:
-            self._check()
-            self._ranks = int((root / "ranks").read_text())
-            if rank >= self._ranks:
-                raise RuntimeError("invalid rank")
-            key = (root / "auth").read_bytes()
-            directory = root / "streams" / str(stream_index)
-            self._progress = directory / f"progress-{rank}"
-            self._semaphore = _native.Semaphore((directory / "semaphore").read_text())
-            self._memory_semaphore = _native.Semaphore(
-                (directory / "memory").read_text()
+            self._listener = Listener(
+                str(directory / f"rank-{rank}.sock"),
+                family="AF_UNIX",
+                authkey=(root / "auth").read_bytes(),
             )
-            try:
-                self._listener = Listener(
-                    str(directory / f"rank-{rank}.sock"),
-                    family="AF_UNIX",
-                    authkey=key,
-                )
-            except OSError as error:
-                if error.errno == errno.EADDRINUSE:
-                    raise RuntimeError("rank already connected") from error
+        except OSError as error:
+            if error.errno != errno.EADDRINUSE:
                 raise
+            raise RuntimeError("rank already connected") from error
+        try:
             self._listener._listener._socket.settimeout(0.1)
             while self._connection is None:
-                self._check()
+                check()
                 if time.monotonic() >= deadline:
                     raise TimeoutError("collator did not connect to rank")
-                try:
+                with suppress(socket.timeout):
                     self._connection = self._listener.accept()
-                except socket.timeout:
-                    pass
             while not self._connection.poll(0.1):
-                self._check()
+                check()
                 if time.monotonic() >= deadline:
                     raise TimeoutError("rank handshake timed out")
-            kind, value = self._connection.recv()
-            if kind != "ready":
-                raise RuntimeError(value)
+            self._connection.recv()
         except (EOFError, OSError) as error:
             self.close()
-            self._check()
+            check()
             raise RuntimeError("TensorLane collater disconnected") from error
         except BaseException:
             self.close()
@@ -85,66 +78,48 @@ class BatchReader(Iterator[Batch]):
     def __next__(self) -> Batch:
         if self._closed:
             raise StopIteration
-        connection = self._connection
-        if connection is None:
-            raise RuntimeError("rank reader is not connected")
         started = time.monotonic()
-        self._record_application(started)
+        if self._returned is not None and self._performance is not None:
+            self._performance.application(self._stream, started - self._returned)
+        self._returned = None
         try:
-            connection.send(("next", None))
-            while not connection.poll(0.1):
+            self._connection.send(("next", None))
+            while not self._connection.poll(0.1):
                 self._check()
-            kind, value = _ipc.recv(connection)
-            if kind == "end":
-                self.close()
-                raise StopIteration
-            if kind == "error":
-                raise RuntimeError(value)
-            if kind != "batch":
-                raise RuntimeError(f"unexpected rank message: {kind}")
-            batch = value
-            temporary = self._progress.with_suffix(".tmp")
-            temporary.write_text(str(batch.batch_id + self._ranks))
-            temporary.replace(self._progress)
-            self._memory_semaphore.post(batch._memory_units)
-            self._semaphore.post()
-            self._returned = time.monotonic()
-            if self._performance is not None:
-                self._performance.batch(batch, self._returned - started)
-            return batch
-        except (EOFError, OSError) as error:
+            kind, batch = _ipc.recv(self._connection)
+        except Exception as error:
             if self._performance is not None:
                 self._performance.error(self._stream)
+            if not isinstance(error, (EOFError, OSError)):
+                raise
             self._check()
             raise RuntimeError("TensorLane collater disconnected") from error
-        except StopIteration:
-            raise
-        except Exception:
-            if self._performance is not None:
-                self._performance.error(self._stream)
-            raise
-
-    def _record_application(self, now):
-        if self._returned is not None and self._performance is not None:
-            self._performance.application(self._stream, now - self._returned)
-        self._returned = None
+        if kind == "end":
+            self.close()
+            raise StopIteration
+        temporary = self._progress.with_suffix(".tmp")
+        temporary.write_text(str(batch.batch_id + self._ranks))
+        temporary.replace(self._progress)
+        self._memory_semaphore.post(batch._memory_units)
+        self._semaphore.post()
+        self._returned = time.monotonic()
+        if self._performance is not None:
+            self._performance.batch(batch, self._returned - started)
+        return batch
 
     def close(self) -> None:
         if self._closed:
             return
-        self._record_application(time.monotonic())
+        self._closed = True
+        if self._returned is not None and self._performance is not None:
+            self._performance.application(
+                self._stream, time.monotonic() - self._returned
+            )
         if self._connection is not None:
             self._connection.close()
-            self._connection = None
         if self._listener is not None:
-            try:
+            with suppress(FileNotFoundError):
                 self._listener.close()
-            except FileNotFoundError:
-                pass
-            self._listener = None
-        self._semaphore = None
-        self._memory_semaphore = None
-        self._closed = True
 
     def __enter__(self) -> BatchReader:
         return self

@@ -1,22 +1,39 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use axum::extract::Multipart;
+use serde::Serialize;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use tensorlane_protocol::{UploadMetadata, UploadSpec, UploadStatus};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::runtime::Runtime;
+
+#[derive(clickhouse::Row, Serialize)]
+struct ArtifactRecord {
+    #[serde(with = "clickhouse::serde::uuid")]
+    id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    run_id: Uuid,
+    step: u64,
+    #[serde(with = "clickhouse::serde::time::datetime64::nanos")]
+    timestamp: OffsetDateTime,
+    name: String,
+    path: String,
+    content_type: String,
+    size_bytes: u64,
+}
 
 pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Result<UploadStatus> {
     let field = multipart
         .next_field()
         .await?
-        .ok_or_else(|| anyhow::anyhow!("upload must start with its spec"))?;
+        .context("upload must start with its spec")?;
     ensure!(
         field.name() == Some("spec"),
         "upload must start with its spec"
     );
-    let bytes = field.bytes().await?;
-    let mut spec: UploadSpec = serde_json::from_slice(&bytes)?;
+    let mut spec: UploadSpec = serde_json::from_slice(&field.bytes().await?)?;
     ensure!(!id.is_nil(), "upload ID must not be nil");
     ensure!(
         spec.sha256.len() == 64 && spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -31,12 +48,11 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
             );
             ensure!(!metadata.name.is_empty(), "asset name must not be empty");
             crate::asset_repo::kind_value(&metadata.kind)?;
-            let _: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&metadata.metadata_json)?;
+            serde_json::from_str::<Map<String, Value>>(&metadata.metadata_json)?;
             (
                 metadata.run_id.parse()?,
                 engine.asset_key(id),
-                metadata.content_type.as_str(),
+                &metadata.content_type,
             )
         }
         UploadMetadata::Artifact { run_id, metadata } => {
@@ -45,13 +61,13 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
                 metadata.size_bytes == spec.size,
                 "artifact size does not match upload size"
             );
-            time::OffsetDateTime::from_unix_timestamp_nanos(
+            OffsetDateTime::from_unix_timestamp_nanos(
                 i128::from(metadata.timestamp_unix_ms) * 1_000_000,
             )?;
             (
                 run_id.parse()?,
                 format!("{}/{id}", engine.metrics_prefix),
-                metadata.content_type.as_str(),
+                &metadata.content_type,
             )
         }
     };
@@ -72,12 +88,31 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
         &mut multipart,
     )
     .await?;
-    match spec.metadata {
+    match &spec.metadata {
         UploadMetadata::Asset { metadata } => {
-            crate::asset_commit::save(engine, id, &metadata, &spec.sha256, spec.size).await?;
+            crate::asset_commit::save(engine, id, metadata, &spec.sha256, spec.size).await?;
         }
         UploadMetadata::Artifact { metadata, .. } => {
-            engine.save_artifact(id, run, &metadata).await?;
+            let client = engine
+                .database
+                .clone()
+                .with_setting("insert_deduplication_token", id.to_string());
+            let mut insert = client.insert::<ArtifactRecord>("artifacts").await?;
+            insert
+                .write(&ArtifactRecord {
+                    id,
+                    run_id: run,
+                    step: metadata.step,
+                    timestamp: OffsetDateTime::from_unix_timestamp_nanos(
+                        i128::from(metadata.timestamp_unix_ms) * 1_000_000,
+                    )?,
+                    name: metadata.name.clone(),
+                    path: key,
+                    content_type: metadata.content_type.clone(),
+                    size_bytes: metadata.size_bytes,
+                })
+                .await?;
+            insert.end().await?;
         }
     }
     Ok(UploadStatus { committed: true })

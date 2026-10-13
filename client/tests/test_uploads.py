@@ -89,8 +89,11 @@ class PipelineTests(PipelineCase):
         self.daemon.metric(1, "loss", 0.5)
         time.sleep(1.5)
         self.service.fail_metrics = False
+        with self.assertRaisesRegex(RuntimeError, "fixture metrics failure"):
+            self.daemon.flush()
+        self.daemon.metric(2, "loss", 0.25)
         self.daemon.flush()
-        self.assertEqual([metric.name for _, metric in self.service.metrics], ["loss"])
+        self.assertEqual([metric.step for _, metric in self.service.metrics], [2])
 
     def test_file_artifacts_are_raw_and_directory_artifacts_are_tar(self):
         self.start()
@@ -106,8 +109,10 @@ class PipelineTests(PipelineCase):
         (directory / "config.json").write_text("{}")
         self.daemon.metric_artifact(0, directory, "reports", "application/json")
         self.daemon.flush()
-        for artifact, saved, (_, body, content_type) in zip(
-            self.service.artifacts,
+        artifacts = {
+            metadata.name: (metadata, body) for metadata, body in self.service.artifacts
+        }
+        for saved, (filename, body, content_type) in zip(
             self.service.saved,
             [
                 ("payload.bin", b"opaque bytes", "application/octet-stream"),
@@ -115,11 +120,12 @@ class PipelineTests(PipelineCase):
                 ("weights.pt", b"plain tensor bytes", "application/octet-stream"),
             ],
         ):
-            self.assertEqual(artifact[1], body)
+            metadata, uploaded = artifacts[filename]
+            self.assertEqual(uploaded, body)
             self.assertEqual(saved[2], body)
-            self.assertEqual(artifact[0].content_type, content_type)
+            self.assertEqual(metadata.content_type, content_type)
             self.assertEqual(saved[0].content_type, content_type)
-        metadata, body = self.service.artifacts[-1]
+        metadata, body = artifacts["reports"]
         self.assertEqual(metadata.content_type, "application/x-tar")
         self.assertEqual(self.archive_contents(body), {"reports/config.json": b"{}"})
 

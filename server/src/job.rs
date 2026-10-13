@@ -1,13 +1,12 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
-use tokio::fs;
+use std::{path::Path, time::Duration};
+use tokio::{fs, time::Instant};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Failure {
     pub message: String,
     pub retryable: bool,
-    pub timestamp: u64,
 }
 impl std::fmt::Display for Failure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -16,18 +15,13 @@ impl std::fmt::Display for Failure {
 }
 impl std::error::Error for Failure {}
 
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 pub async fn failed(path: &Path, error: &anyhow::Error) {
+    tracing::warn!(path = %path.display(), error = %error, "background job failed");
     let retryable = match error.downcast_ref::<clickhouse::error::Error>() {
         Some(clickhouse::error::Error::BadResponse(message)) => ![
             "SYNTAX_ERROR",
             "UNKNOWN_IDENTIFIER",
+            "TIMEOUT_EXCEEDED",
             "UNKNOWN_FUNCTION",
             "UNKNOWN_TABLE",
             "UNKNOWN_DATABASE",
@@ -62,11 +56,8 @@ pub async fn failed(path: &Path, error: &anyhow::Error) {
     let failure = Failure {
         message: format!("{error:#}"),
         retryable,
-        timestamp: now(),
     };
-    if let Ok(bytes) = serde_json::to_vec(&failure) {
-        let _ = crate::shared_cache::write_atomic(path, &bytes).await;
-    }
+    let _ = crate::shared_cache::write_atomic(path, &serde_json::to_vec(&failure).unwrap()).await;
 }
 
 pub async fn check(path: &Path) -> Result<()> {
@@ -76,7 +67,14 @@ pub async fn check(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let failure: Failure = serde_json::from_slice(&bytes)?;
-    if failure.retryable && now().saturating_sub(failure.timestamp) >= 2 {
+    if failure.retryable
+        && fs::metadata(path)
+            .await?
+            .modified()?
+            .elapsed()
+            .unwrap_or_default()
+            >= Duration::from_secs(2)
+    {
         fs::remove_file(path).await?;
         return Ok(());
     }
@@ -84,16 +82,16 @@ pub async fn check(path: &Path) -> Result<()> {
 }
 
 pub async fn wait_for_file(path: &Path) -> Result<bool> {
-    let started = tokio::time::Instant::now();
+    let started = Instant::now();
     loop {
         if fs::try_exists(path).await? {
             return Ok(true);
         }
         check(&path.with_extension("error")).await?;
-        if started.elapsed() >= std::time::Duration::from_secs(2) {
+        if started.elapsed() >= Duration::from_secs(2) {
             return Ok(false);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

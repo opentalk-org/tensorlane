@@ -1,4 +1,8 @@
-use std::{io, path::PathBuf};
+use std::{
+    io,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use aws_config::{BehaviorVersion, retry::RetryConfig};
@@ -11,9 +15,12 @@ use clap::{
     },
 };
 use clap_complete::{Shell, generate};
-use tokio::fs;
+use tokio::{
+    fs,
+    signal::unix::{Signal, SignalKind, signal},
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod asset_commit;
@@ -37,7 +44,6 @@ mod s3_upload;
 mod sampling;
 mod shared_cache;
 mod upload_http;
-mod uploads;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Green.on_default().effects(Effects::BOLD))
@@ -136,10 +142,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let matches = Args::command().get_matches();
-    if let Some(("completions", completion_matches)) = matches.subcommand() {
-        let shell = completion_matches
+    if let Some(("completions", completion)) = matches.subcommand() {
+        let shell = *completion
             .get_one::<Shell>("shell")
-            .copied()
             .context("shell is required by clap")?;
         generate(shell, &mut Args::command(), "tensorlane", &mut io::stdout());
         return Ok(());
@@ -151,20 +156,16 @@ async fn main() -> anyhow::Result<()> {
         .with_url(&args.clickhouse_url)
         .with_user(&args.clickhouse_user)
         .with_password(&args.clickhouse_password)
-        .with_setting("max_execution_time", "300")
         .with_setting("allow_experimental_json_type", "1")
         .with_setting("input_format_binary_read_json_as_string", "1")
         .with_setting("output_format_binary_write_json_as_string", "1");
-
     let s3_config = aws_config::defaults(BehaviorVersion::latest())
         .endpoint_url(&args.s3_endpoint)
         .retry_config(RetryConfig::standard().with_max_attempts(5))
         .timeout_config(
             TimeoutConfig::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(30))
-                .operation_attempt_timeout(std::time::Duration::from_secs(120))
-                .operation_timeout(std::time::Duration::from_secs(600))
+                .connect_timeout(Duration::from_secs(10))
+                .operation_attempt_timeout(Duration::from_secs(600))
                 .build(),
         )
         .credentials_provider(Credentials::new(
@@ -184,59 +185,61 @@ async fn main() -> anyhow::Result<()> {
     );
 
     fs::create_dir_all(&args.cache_dir).await?;
-    let bucket = args.bucket.leak();
     let shutdown = CancellationToken::new();
-    tokio::spawn(watch_shutdown_signals(shutdown.clone()));
+    tokio::spawn(shutdown_on_signals(
+        shutdown.clone(),
+        signal(SignalKind::interrupt())?,
+        signal(SignalKind::terminate())?,
+    ));
     let runtime = runtime::Runtime::new(
         database,
         s3_client,
-        bucket,
+        args.bucket.leak(),
         args.cache_dir,
+        args.cache_bytes,
         shutdown.clone(),
         args.checkpoint_prefix.leak(),
         args.metrics_prefix.leak(),
     )?;
-    let cache_root = runtime.cache.clone();
-    let cache_shutdown = shutdown.clone();
-    let silent_runs = runtime.clone();
-    runtime.tasks.spawn(async move {
-        loop {
-            if let Err(error) = cache_limits::prune(&cache_root, args.cache_bytes).await {
-                tracing::warn!(error=%error, "cache cleanup failed");
-            }
-            if let Err(error) = silent_runs.repo.fail_silent_runs().await {
-                tracing::warn!(error=%error, "failing silent runs failed");
-            }
-            tokio::select! {
-                _ = cache_shutdown.cancelled() => break,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {},
-            }
-        }
-    });
-    let serving = http::serve(args.http_port, auth, shutdown.clone(), runtime.clone());
+    runtime.tasks.spawn(maintain(runtime.clone()));
+    let serving = http::serve(args.http_port, auth, runtime.clone());
     tokio::pin!(serving);
     tokio::select! {
         result = &mut serving => result?,
         _ = shutdown.cancelled() => {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(30), &mut serving).await;
+            let _ = tokio::time::timeout(Duration::from_secs(30), &mut serving).await;
         }
     }
     runtime.tasks.close();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), runtime.tasks.wait()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.tasks.wait()).await;
     Ok(())
 }
 
-async fn watch_shutdown_signals(shutdown: CancellationToken) {
-    if let Err(err) = receive_shutdown_signals(shutdown).await {
-        error!(error = format!("{err:#}"), "shutdown signal handler failed");
+async fn maintain(runtime: runtime::Runtime) {
+    let started = Instant::now();
+    loop {
+        if let Err(error) =
+            cache_limits::prune(&runtime.cache, runtime.cache_bytes, &runtime.cache_written).await
+        {
+            warn!(error = %error, "cache cleanup failed");
+        }
+        if started.elapsed() >= Duration::from_secs(120)
+            && let Err(error) = runtime.repo.fail_silent_runs().await
+        {
+            warn!(error = %error, "failing silent runs failed");
+        }
+        tokio::select! {
+            _ = runtime.shutdown.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+        }
     }
 }
 
-async fn receive_shutdown_signals(shutdown: CancellationToken) -> anyhow::Result<()> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut interrupt = signal(SignalKind::interrupt())?;
-    let mut terminate = signal(SignalKind::terminate())?;
+async fn shutdown_on_signals(
+    shutdown: CancellationToken,
+    mut interrupt: Signal,
+    mut terminate: Signal,
+) {
     for received in 1.. {
         tokio::select! {
             _ = interrupt.recv() => {}
@@ -254,5 +257,4 @@ async fn receive_shutdown_signals(shutdown: CancellationToken) -> anyhow::Result
             }
         }
     }
-    Ok(())
 }

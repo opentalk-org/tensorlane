@@ -371,7 +371,9 @@ class PipelineCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tlt-", dir="/tmp")
         self.cache = Path(self.temp.name) / "asset-cache"
-        environment = mock.patch.dict(os.environ, {"TENSORLANE_ASSET_CACHE": str(self.cache)})
+        environment = mock.patch.dict(
+            os.environ, {"TENSORLANE_ASSET_CACHE": str(self.cache)}
+        )
         environment.start()
         self.addCleanup(environment.stop)
         self.run_id = str(uuid.uuid4())

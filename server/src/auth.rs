@@ -34,11 +34,8 @@ impl Auth {
         let Some((scheme, key)) = authorization.and_then(|value| value.split_once(' ')) else {
             return false;
         };
-        if !scheme.eq_ignore_ascii_case("Bearer") || key.is_empty() {
-            return false;
-        }
         let received: [u8; 32] = Sha256::digest(key.as_bytes()).into();
-        bool::from(expected.ct_eq(&received))
+        scheme.eq_ignore_ascii_case("Bearer") && bool::from(expected.ct_eq(&received))
     }
 }
 

@@ -1,7 +1,10 @@
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::{NonZeroU64, NonZeroUsize},
+};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -11,6 +14,7 @@ pub struct Config {
     pub asset_type: Option<String>,
     pub max_load_memory_bytes: usize,
 }
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryConfig {
@@ -20,6 +24,7 @@ pub struct QueryConfig {
     #[serde(default)]
     pub repeat: bool,
 }
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AssetConfig {
@@ -33,7 +38,7 @@ pub struct AssetConfig {
 struct Document {
     #[serde(default)]
     tensorlane: TensorlaneConfig,
-    queries: Queries,
+    queries: BTreeMap<String, QueryConfig>,
     #[serde(default, rename = "app")]
     _app: Map<String, Value>,
 }
@@ -41,95 +46,48 @@ struct Document {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TensorlaneConfig {
-    ranks: Option<u64>,
-    num_workers: Option<u64>,
-    prefetch_factor: Option<u64>,
-    max_load_memory_bytes: Option<usize>,
-    max_prefetch_memory_bytes: Option<u64>,
+    #[serde(rename = "ranks")]
+    _ranks: Option<NonZeroU64>,
+    #[serde(rename = "num_workers")]
+    _num_workers: Option<NonZeroU64>,
+    #[serde(rename = "prefetch_factor")]
+    _prefetch_factor: Option<NonZeroU64>,
+    #[serde(rename = "max_prefetch_memory_bytes")]
+    _max_prefetch_memory_bytes: Option<NonZeroU64>,
+    max_load_memory_bytes: Option<NonZeroUsize>,
     #[serde(default)]
     assets: HashMap<String, AssetConfig>,
     asset_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeyedQuery {
-    key: String,
-    sql: String,
-    #[serde(default)]
-    params: BTreeMap<String, Value>,
-    #[serde(default)]
-    repeat: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Queries {
-    Named(BTreeMap<String, QueryConfig>),
-    Legacy(Vec<KeyedQuery>),
 }
 
 impl Config {
     pub fn parse(document: &Map<String, Value>) -> Result<Self> {
         let document: Document = serde_json::from_value(Value::Object(document.clone()))
             .map_err(|error| anyhow!("invalid run config: {error}"))?;
-        let queries = match document.queries {
-            Queries::Named(queries) => queries.into_iter().collect::<Vec<_>>(),
-            Queries::Legacy(queries) => queries
-                .into_iter()
-                .map(|q| {
-                    (
-                        q.key,
-                        QueryConfig {
-                            sql: q.sql,
-                            params: q.params,
-                            repeat: q.repeat,
-                        },
-                    )
-                })
-                .collect(),
-        };
-        ensure!(!queries.is_empty(), "config.queries must not be empty");
-        let settings = document.tensorlane;
-        let max_load_memory_bytes = settings.max_load_memory_bytes.unwrap_or(256 * 1024 * 1024);
         ensure!(
-            max_load_memory_bytes > 0
-                && max_load_memory_bytes <= tokio::sync::Semaphore::MAX_PERMITS,
+            !document.queries.is_empty(),
+            "config.queries must not be empty"
+        );
+        let settings = document.tensorlane;
+        let max_load_memory_bytes = settings
+            .max_load_memory_bytes
+            .map_or(256 * 1024 * 1024, NonZeroUsize::get);
+        ensure!(
+            max_load_memory_bytes <= tokio::sync::Semaphore::MAX_PERMITS,
             "config.tensorlane.max_load_memory_bytes must be a positive supported byte count"
         );
-        for (name, count) in [
-            ("ranks", settings.ranks),
-            ("num_workers", settings.num_workers),
-            ("prefetch_factor", settings.prefetch_factor),
-            (
-                "max_prefetch_memory_bytes",
-                settings.max_prefetch_memory_bytes,
-            ),
-        ] {
-            ensure!(
-                count.is_none_or(|count| count > 0),
-                "config.tensorlane.{name} must be a positive integer"
-            );
-        }
-        let mut compiled = BTreeMap::new();
-        for (key, query) in queries {
+        for (key, query) in &document.queries {
             ensure!(!key.trim().is_empty(), "query key must not be empty");
-            ensure!(
-                !matches!(key.as_str(), "." | ".."),
-                "query key must not be . or .."
-            );
-            ensure!(!compiled.contains_key(&key), "duplicate query key: {}", key);
+            ensure!(key != "." && key != "..", "query key must not be . or ..");
             ensure!(
                 !query.sql.trim().is_empty(),
-                "query {} SQL must not be empty",
-                key
+                "query {key} SQL must not be empty"
             );
-            compiled.insert(key, query);
         }
         for (name, asset) in &settings.assets {
             ensure!(!name.is_empty(), "asset name must not be empty");
             ensure!(
-                !matches!(name.as_str(), "." | ".."),
+                name != "." && name != "..",
                 "asset name must not be . or .."
             );
             ensure!(
@@ -146,13 +104,14 @@ impl Config {
             );
         }
         Ok(Self {
-            queries: compiled,
+            queries: document.queries,
             assets: settings.assets,
             asset_type: settings.asset_type,
             max_load_memory_bytes,
         })
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,13 +147,12 @@ mod tests {
             json!({"queries": {"training": "SELECT 1"}}),
             json!({"queries": []}),
             json!({"queries": [{"sql": "SELECT 1"}]}),
-            json!({"queries": [{"key": " ", "sql": "SELECT 1"}]}),
-            json!({"queries": [{"key": "x", "sql": " "}]}),
-            json!({"queries": [{"key": "x", "sql": "SELECT 1"}, {"key": "x", "sql": "SELECT 2"}]}),
-            json!({"queries": [{"key": "x", "sql": "SELECT 1", "params": []}]}),
-            json!({"queries": [{"key": "x", "sql": "SELECT 1", "repeat": "true"}]}),
-            json!({"queries": [{"key": "x", "sql": "SELECT 1", "expected_batches": 1}]}),
-            json!({"queries": [{"key": "x", "sql": "SELECT 1", "batch_size": 32}]}),
+            json!({"queries": {" ": {"sql": "SELECT 1"}}}),
+            json!({"queries": {"x": {"sql": " "}}}),
+            json!({"queries": {"x": {"sql": "SELECT 1", "params": []}}}),
+            json!({"queries": {"x": {"sql": "SELECT 1", "repeat": "true"}}}),
+            json!({"queries": {"x": {"sql": "SELECT 1", "expected_batches": 1}}}),
+            json!({"queries": {"x": {"sql": "SELECT 1", "batch_size": 32}}}),
         ] {
             assert!(parse(value.clone()).is_err(), "accepted {value}");
         }
@@ -205,7 +163,6 @@ mod tests {
         for name in [".", ".."] {
             for document in [
                 json!({"queries": {name: {"sql": "SELECT 1"}}}),
-                json!({"queries": [{"key": name, "sql": "SELECT 1"}]}),
                 json!({"queries": {"training": {"sql": "SELECT 1"}},
                     "tensorlane": {"assets": {name: {"object": "model"}}}}),
             ] {
@@ -223,7 +180,7 @@ mod tests {
     #[test]
     fn validates_namespaces_and_runtime_counts() {
         for name in ["ranks", "num_workers", "prefetch_factor"] {
-            let mut value = json!({"tensorlane": {}, "queries": [{"key": "x", "sql": "SELECT 1"}]});
+            let mut value = json!({"tensorlane": {}, "queries": {"x": {"sql": "SELECT 1"}}});
             value["tensorlane"][name] = json!(2);
             assert!(parse(value.clone()).is_ok());
             for invalid in [json!(0), json!(-1), json!(true), json!(1.5)] {
@@ -239,7 +196,7 @@ mod tests {
             ("tensorlane", json!([])),
             ("app", json!([])),
         ] {
-            let mut document = json!({"queries": [{"key": "x", "sql": "SELECT 1"}]});
+            let mut document = json!({"queries": {"x": {"sql": "SELECT 1"}}});
             document[name] = value;
             assert!(parse(document).is_err());
         }
@@ -249,7 +206,7 @@ mod tests {
     fn assets_belong_to_tensorlane() {
         let id = Uuid::new_v4();
         let mut value = json!({"tensorlane": {"asset_type": "model", "assets": {"model": {"asset_id": id}}},
-            "queries": [{"key": "x", "sql": "SELECT 1"}]});
+            "queries": {"x": {"sql": "SELECT 1"}}});
         let cfg = parse(value.clone()).unwrap();
         assert_eq!(cfg.assets["model"].asset_id, Some(id));
         assert_eq!(cfg.asset_type.as_deref(), Some("model"));
