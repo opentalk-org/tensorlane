@@ -46,8 +46,11 @@ pub(super) async fn supervise(
                 .any(|name| matches!(name.as_str(), "." | "..")),
             "stream name must not be . or .."
         );
-        let (assets, asset_metadata) =
-            crate::assets::prefetch(&http, &initialized, &options.root).await?;
+        let crate::assets::Prefetched {
+            paths: assets,
+            metadata: asset_metadata,
+            leases,
+        } = crate::assets::prefetch(&http, &initialized, settings.memory_bytes).await?;
         let next_batches: HashMap<String, u64> = match &initialized.checkpoint {
             Some(checkpoint) => {
                 let metadata: serde_json::Value =
@@ -102,7 +105,7 @@ pub(super) async fn supervise(
         for _ in 0..settings.num_workers {
             work.push(Sender::<Work, _>::new(work_listener.accept().await?.0));
         }
-        anyhow::Ok((http, initialized, work, next_batches))
+        anyhow::Ok((http, initialized, work, next_batches, leases))
     };
     let started = tokio::select! {
         result = startup => result.map(Some),
@@ -114,7 +117,7 @@ pub(super) async fn supervise(
             }
         } => Err(anyhow!("TensorLane startup timed out")),
     };
-    let (http, initialized, work, next_batches) = match started {
+    let (http, initialized, work, next_batches, _leases) = match started {
         Ok(Some(started)) => started,
         result => {
             let ended = match remote {
@@ -137,6 +140,25 @@ pub(super) async fn supervise(
         initialized.run_id.clone(),
         uploads_stopping.clone(),
     ));
+    let beating = (http.clone(), initialized.run_id.clone());
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            let beat = beating
+                .0
+                .request(
+                    reqwest::Method::POST,
+                    &["runs", &beating.1, "heartbeat"],
+                    None,
+                    &[],
+                )
+                .await;
+            if let Err(error) = beat {
+                eprintln!("TensorLane heartbeat failed: {error:#}");
+            }
+        }
+    });
     let mut uploads_complete = false;
     let (send_work, mut receive_work) = mpsc::unbounded_channel::<Work>();
     let mut sender = tokio::spawn(async move {
@@ -258,6 +280,7 @@ pub(super) async fn supervise(
     } else {
         result
     };
+    heartbeat.abort();
     let failed = result.is_err() || options.root.join("failed").exists();
     let ended = http
         .end(&initialized.run_id, failed)

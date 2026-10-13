@@ -25,6 +25,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const CONCURRENT_ARTIFACTS: usize = 16;
+const ARTIFACT_BACKLOG_WARNING: usize = 64;
 
 pub async fn serve(
     listener: UnixListener,
@@ -92,10 +93,10 @@ async fn receive(
     let mut automatic = false;
     let processing = async {
         let mut metrics = Metrics::new(http.clone(), run_id.clone());
-        // Artifacts upload concurrently on their own tasks so scalars never wait for them.
         let permits = Arc::new(Semaphore::new(CONCURRENT_ARTIFACTS));
         let mut artifacts = JoinSet::new();
         let mut tick = interval(Duration::from_secs(1));
+        let mut tick_failed = false;
         loop {
             let job = tokio::select! {
                 job = queue.recv() => match job {
@@ -107,7 +108,11 @@ async fn receive(
                     continue;
                 }
                 _ = tick.tick() => {
-                    metrics.flush().await?;
+                    let flushed = metrics.flush().await;
+                    if let Err(error) = &flushed && !tick_failed {
+                        eprintln!("TensorLane metric upload failed, retrying: {error:#}");
+                    }
+                    tick_failed = flushed.is_err();
                     continue;
                 }
             };
@@ -187,6 +192,12 @@ async fn receive(
                         )
                         .await
                     });
+                    if artifacts.len() % ARTIFACT_BACKLOG_WARNING == 0 {
+                        eprintln!(
+                            "TensorLane artifact upload backlog: {} uploads pending; artifacts are logged faster than they upload",
+                            artifacts.len()
+                        );
+                    }
                 }
             }
         }
@@ -220,6 +231,7 @@ struct Metrics {
     client: crate::transport::HttpClient,
     run_id: String,
     batch: MetricBatch,
+    pending: Option<(String, MetricBatch)>,
 }
 
 impl Metrics {
@@ -228,6 +240,7 @@ impl Metrics {
             client,
             run_id,
             batch: MetricBatch::default(),
+            pending: None,
         }
     }
 
@@ -240,19 +253,26 @@ impl Metrics {
     }
 
     async fn flush(&mut self) -> anyhow::Result<()> {
-        if self.batch.scalars.is_empty() && self.batch.arrays.is_empty() {
+        self.send_pending().await?;
+        let batch = std::mem::take(&mut self.batch);
+        let filled = !batch.scalars.is_empty() || !batch.arrays.is_empty();
+        self.pending = filled.then(|| (uuid::Uuid::new_v4().to_string(), batch));
+        self.send_pending().await
+    }
+
+    async fn send_pending(&mut self) -> anyhow::Result<()> {
+        let Some((request, batch)) = &self.pending else {
             return Ok(());
-        }
-        let request = uuid::Uuid::new_v4().to_string();
+        };
         self.client
             .request(
                 Method::PUT,
-                &["runs", &self.run_id, "metrics", &request],
-                Some(serde_json::to_vec(&self.batch)?),
+                &["runs", &self.run_id, "metrics", request],
+                Some(serde_json::to_vec(batch)?),
                 &[("content-type", "application/json".into())],
             )
             .await?;
-        self.batch = MetricBatch::default();
+        self.pending = None;
         Ok(())
     }
 }
@@ -272,7 +292,8 @@ async fn artifact(
         run_id,
         metadata: metric,
     };
-    transfer(&client, &uuid::Uuid::new_v4().to_string(), metadata, file).await
+    transfer(&client, &uuid::Uuid::new_v4().to_string(), metadata, file).await?;
+    Ok(())
 }
 
 async fn save_asset(
@@ -285,7 +306,14 @@ async fn save_asset(
     if directory {
         metadata.content_type = "application/x-tar".into();
     }
-    transfer(&client, &id, UploadMetadata::Asset { metadata }, file).await
+    let (file, sha256) = transfer(&client, &id, UploadMetadata::Asset { metadata }, file).await?;
+    let file = file.into_std().await;
+    let stored =
+        tokio::task::spawn_blocking(move || crate::assets::store(&id, &sha256, file)).await?;
+    if let Err(error) = stored {
+        eprintln!("TensorLane could not cache uploaded asset: {error:#}");
+    }
+    Ok(())
 }
 
 async fn transfer(
@@ -293,7 +321,7 @@ async fn transfer(
     id: &str,
     metadata: UploadMetadata,
     mut file: File,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(File, String)> {
     let size = file.metadata().await?.len();
     let mut hash = Sha256::new();
     let mut buffer = vec![0; 256 * 1024];
@@ -312,7 +340,7 @@ async fn transfer(
     };
     let status = client.upload(id, &spec, &file).await?;
     ensure!(status.committed, "upload was not committed");
-    Ok(())
+    Ok((file, spec.sha256))
 }
 
 async fn upload_source(path: PathBuf) -> anyhow::Result<(File, bool)> {

@@ -83,6 +83,15 @@ class PipelineTests(PipelineCase):
         self.assertEqual(self.service.metrics[0][1].name, "loss")
         self.assertEqual(self.service.artifacts[0][1], b"{}")
 
+    def test_background_metric_flush_failure_keeps_uploads_running(self):
+        self.start()
+        self.service.fail_metrics = True
+        self.daemon.metric(1, "loss", 0.5)
+        time.sleep(1.5)
+        self.service.fail_metrics = False
+        self.daemon.flush()
+        self.assertEqual([metric.name for _, metric in self.service.metrics], ["loss"])
+
     def test_file_artifacts_are_raw_and_directory_artifacts_are_tar(self):
         self.start()
         for filename, body, content_type in [

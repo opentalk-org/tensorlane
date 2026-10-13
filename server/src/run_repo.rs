@@ -180,6 +180,27 @@ impl RunRepo {
         .collect()
     }
 
+    pub async fn fail_silent_runs(&self) -> Result<()> {
+        db::request(self.client
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT now64(9), run_id, ? FROM run_status GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ? AND max(timestamp) < now64(9) - INTERVAL 10 MINUTE")
+            .bind(RunStatus::Failed as i8)
+            .bind(RunStatus::Running as i8)
+            .execute())
+            .await
+            .context("failed to fail silent runs")
+    }
+
+    pub async fn refresh_running(&self, run_id: Uuid) -> Result<()> {
+        db::request(self.client
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), run_id, ? FROM run_status WHERE run_id = ? GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ?")
+            .bind(RunStatus::Running as i8)
+            .bind(run_id)
+            .bind(RunStatus::Running as i8)
+            .execute())
+            .await
+            .context("failed to refresh a running run")
+    }
+
     pub async fn append_status(&self, run_id: Uuid, status: RunStatus) -> Result<()> {
         db::request(self.client
             .query("INSERT INTO run_status (timestamp, run_id, status) SELECT greatest(now64(9), max(timestamp) + INTERVAL 1 NANOSECOND), ?, ? FROM run_status WHERE run_id = ?")

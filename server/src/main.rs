@@ -198,10 +198,14 @@ async fn main() -> anyhow::Result<()> {
     )?;
     let cache_root = runtime.cache.clone();
     let cache_shutdown = shutdown.clone();
+    let silent_runs = runtime.clone();
     runtime.tasks.spawn(async move {
         loop {
             if let Err(error) = cache_limits::prune(&cache_root, args.cache_bytes).await {
                 tracing::warn!(error=%error, "cache cleanup failed");
+            }
+            if let Err(error) = silent_runs.repo.fail_silent_runs().await {
+                tracing::warn!(error=%error, "failing silent runs failed");
             }
             tokio::select! {
                 _ = cache_shutdown.cancelled() => break,

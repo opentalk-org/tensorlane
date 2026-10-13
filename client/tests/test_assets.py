@@ -2,6 +2,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import json
+import os
 from pathlib import Path
 import time
 import uuid
@@ -34,6 +35,41 @@ class PipelineTests(PipelineCase):
             self.assertEqual(follower.asset("model").read_bytes(), b"weights")
             self.assertEqual(follower.asset_metadata["model"]["asset_id"], asset_id)
         self.assertEqual(len(self.service.asset_requests), 2)
+
+    def test_assets_are_shared_from_cache_and_least_recently_used_are_evicted(self):
+        os.environ["TENSORLANE_ASSET_CACHE_MAX_BYTES"] = str(3 * 1024 * 1024)
+        self.service.assets = {"model": (str(uuid.uuid4()), b"a" * 2 * 1024 * 1024)}
+        self.start()
+        first = self.daemon.asset("model")
+        self.assertTrue(first.is_relative_to(self.cache.resolve()))
+        self.assertFalse(first.is_symlink())
+        self.daemon.close()
+        self.service.assets = {"model": (str(uuid.uuid4()), b"b" * 2 * 1024 * 1024)}
+        self.run_id = str(uuid.uuid4())
+        self.start()
+        self.assertEqual(self.daemon.asset("model").read_bytes(), b"b" * 2 * 1024 * 1024)
+        self.assertFalse(first.exists())
+
+    def test_saved_assets_are_cached_without_redownload(self):
+        self.start()
+        asset_id = self.daemon.save_asset("model", self.file("weights.bin", b"weights"))
+        self.daemon.flush()
+        self.daemon.close()
+        self.service.assets = {"model": (asset_id, b"weights")}
+        self.service.fail_asset = True
+        self.run_id = str(uuid.uuid4())
+        self.start()
+        self.assertEqual(self.daemon.asset("model").read_bytes(), b"weights")
+
+    def test_assets_in_use_are_not_evicted(self):
+        os.environ["TENSORLANE_ASSET_CACHE_MAX_BYTES"] = "1"
+        self.service.assets = {
+            "model": (str(uuid.uuid4()), b"a" * 1024),
+            "other": (str(uuid.uuid4()), b"b" * 1024),
+        }
+        self.start()
+        self.assertEqual(self.daemon.asset("model").read_bytes(), b"a" * 1024)
+        self.assertEqual(self.daemon.asset("other").read_bytes(), b"b" * 1024)
 
     def test_async_init_waits_for_assets_without_blocking_event_loop(self):
         self.service.assets = {"model": (str(uuid.uuid4()), b"weights")}

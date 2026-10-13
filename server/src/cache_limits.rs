@@ -1,5 +1,5 @@
 use crate::shared_cache::Lock;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use std::{
     path::{Path, PathBuf},
     time::SystemTime,
@@ -67,15 +67,7 @@ pub async fn prune(root: &Path, limit: u64) -> Result<()> {
         if used <= limit {
             break;
         }
-        let lock_path = if entry.path.extension().is_some_and(|ext| ext == "batch") {
-            entry.path.with_extension("lock")
-        } else {
-            entry
-                .path
-                .parent()
-                .context("asset range has no directory")?
-                .join("asset.lock")
-        };
+        let lock_path = entry.path.with_extension("lock");
         let Some(_lock) = Lock::try_acquire(&lock_path).await? else {
             continue;
         };
@@ -109,7 +101,7 @@ mod tests {
         fs::write(plans.join("0.ready"), b"ready").await?;
         fs::write(plans.join("0.error"), b"error").await?;
         fs::write(run.join("receipt.json"), b"receipt").await?;
-        let lock = Lock::acquire(&dir.join("asset.lock")).await?;
+        let lock = Lock::acquire(&dir.join("0-3.lock")).await?;
         let plan_lock = Lock::acquire(&plans.join("0.lock")).await?;
         prune(temp.path(), 0).await?;
         assert!(dir.join("0-3").exists());

@@ -37,6 +37,7 @@ async fn save_metrics(
     crate::metric_http::save(&engine, run, request, batch)
         .await
         .map_err(runtime_error)?;
+    engine.alive(run).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -72,9 +73,9 @@ fn runtime_error(error: anyhow::Error) -> AppError {
             StatusCode::NOT_FOUND
         }
         "run is not running" => StatusCode::CONFLICT,
-        "server is shutting down"
-        | "asset download capacity reached"
-        | "shared cache has insufficient free space" => StatusCode::SERVICE_UNAVAILABLE,
+        "server is shutting down" | "shared cache has insufficient free space" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         "conflicting retry of upload ID"
         | "conflicting retry of upload chunk"
         | "conflicting retry of metric request ID"
@@ -112,6 +113,7 @@ async fn heartbeat(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     engine.active(id).await.map_err(runtime_error)?;
+    engine.alive(id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -132,6 +134,7 @@ async fn batch(
     Path((id, stream, sequence)): Path<(Uuid, String, u64)>,
 ) -> Result<Response, AppError> {
     use prost::Message;
+    engine.alive(id).await;
     match engine
         .batch(id, &stream, sequence)
         .await

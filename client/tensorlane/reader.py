@@ -91,6 +91,7 @@ class BatchReader(Iterator[Batch]):
         started = time.monotonic()
         self._record_application(started)
         try:
+            connection.send(("next", None))
             while not connection.poll(0.1):
                 self._check()
             kind, value = _ipc.recv(connection)

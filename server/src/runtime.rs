@@ -34,6 +34,7 @@ pub struct Runtime {
     pub upload_slots: Arc<Semaphore>,
     pub(super) loader: Arc<dyn Loader>,
     load_memory: Arc<Mutex<LoadingPools>>,
+    alive: Arc<Mutex<HashMap<Uuid, std::time::Instant>>>,
 }
 
 pub enum Batch {
@@ -67,9 +68,10 @@ impl Runtime {
             tasks: TaskTracker::new(),
             checkpoint_prefix,
             metrics_prefix,
-            asset_slots: Arc::new(Semaphore::new(8)),
+            asset_slots: Arc::new(Semaphore::new(128)),
             upload_slots: Arc::new(Semaphore::new(2)),
             load_memory: Arc::new(Mutex::new(HashMap::new())),
+            alive: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -155,6 +157,20 @@ impl Runtime {
         self.repo.append_status(id, status).await
     }
 
+    pub async fn alive(&self, id: Uuid) {
+        let now = std::time::Instant::now();
+        let stale = self.alive.lock().map(|mut alive| {
+            alive.retain(|_, seen| now.duration_since(*seen) < std::time::Duration::from_secs(600));
+            let seen = alive.insert(id, now);
+            seen.is_none_or(|seen| now.duration_since(seen) >= std::time::Duration::from_secs(60))
+        });
+        if stale.unwrap_or(false)
+            && let Err(error) = self.repo.refresh_running(id).await
+        {
+            tracing::warn!(run=%id, error=%error, "run liveness refresh failed");
+        }
+    }
+
     pub async fn asset(&self, id: Uuid, name: &str) -> Result<AssetSource> {
         let config = self.active(id).await?;
         use sha2::{Digest, Sha256};
@@ -163,6 +179,9 @@ impl Runtime {
         let path = dir
             .join(hex::encode(Sha256::digest(name.as_bytes())))
             .with_extension("json");
+        if let Ok(bytes) = fs::read(&path).await {
+            return Ok(serde_json::from_slice(&bytes)?);
+        }
         let _lock = Lock::acquire(&path.with_extension("lock")).await?;
         if fs::try_exists(&path).await? {
             return Ok(serde_json::from_slice(&fs::read(&path).await?)?);

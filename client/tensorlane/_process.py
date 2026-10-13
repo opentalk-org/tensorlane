@@ -130,31 +130,46 @@ def collate_worker(
     activated = set()
     activation = threading.Lock()
 
+    def activate(stream: str, stream_index: int) -> None:
+        with activation:
+            if stream not in activated:
+                directory = root / "streams" / str(stream_index)
+                _native.Semaphore((directory / "semaphore").read_text()).post(
+                    ranks * prefetch_factor
+                )
+                activated.add(stream)
+
+    def take(stream: str, rank: int):
+        while not stopped.is_set():
+            try:
+                return outputs[stream][rank].get(timeout=0.1)
+            except queue.Empty:
+                pass
+        return None
+
     def deliver(rank: int, stream: str, stream_index: int) -> None:
+        path = root / "streams" / str(stream_index) / f"rank-{rank}.sock"
         connection = None
+        message = None
         try:
-            connection = _connect(
-                root / "streams" / str(stream_index) / f"rank-{rank}.sock", key, stopped
-            )
-            connection.send(("ready", None))
-            with activation:
-                if stream not in activated:
-                    directory = root / "streams" / str(stream_index)
-                    _native.Semaphore((directory / "semaphore").read_text()).post(
-                        ranks * prefetch_factor
-                    )
-                    activated.add(stream)
             while not stopped.is_set():
+                if connection is None:
+                    connection = _connect(path, key, stopped)
+                    connection.send(("ready", None))
+                    activate(stream, stream_index)
                 try:
-                    message = outputs[stream][rank].get(timeout=0.1)
-                except queue.Empty:
-                    if connection.poll():
-                        raise RuntimeError(f"rank {rank} disconnected")
+                    if not connection.poll(0.1):
+                        continue
+                    connection.recv()
+                    message = message or take(stream, rank)
+                    _ipc.send(connection, message)
+                except (OSError, EOFError):
+                    connection.close()
+                    connection = None
                     continue
-                _ipc.send(connection, message)
-                if message[0] == "end":
+                if message is None or message[0] == "end":
                     return
-                del message
+                message = None
         except Exception:
             if not stopped.is_set():
                 errors.put(traceback.format_exc())

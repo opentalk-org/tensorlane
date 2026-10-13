@@ -6,6 +6,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
@@ -13,6 +14,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 from urllib.parse import unquote, urlsplit
 import uuid
 
@@ -368,6 +370,10 @@ class Fixture:
 class PipelineCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="tlt-", dir="/tmp")
+        self.cache = Path(self.temp.name) / "asset-cache"
+        environment = mock.patch.dict(os.environ, {"TENSORLANE_ASSET_CACHE": str(self.cache)})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.run_id = str(uuid.uuid4())
         self.service = Fixture()
         self.daemon = None

@@ -20,6 +20,18 @@ class PipelineTests(PipelineCase):
                 self.daemon.batches("training")
         self.assertFalse(list(self.daemon._root.rglob("rank-0.sock")))
 
+    def test_reader_closed_early_can_reopen_without_failing_run(self):
+        self.start()
+        for _ in range(3):
+            with self.daemon.batches("training") as reader:
+                next(reader)
+                time.sleep(0.3)
+        with self.daemon.batches("training") as reader:
+            remaining = list(reader)
+        self.assertEqual(len(remaining), 2)
+        self.daemon.close()
+        self.assertFalse(self.service.end_requests[-1].failed)
+
     def test_duplicate_daemon_is_rejected(self):
         self.start()
         with self.assertRaisesRegex(RuntimeError, "already active"):
