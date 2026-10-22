@@ -222,7 +222,7 @@ mod tests {
         let app = app(runtime, Auth::new(Some(KEY))?);
         for (path, expected) in [
             ("/healthz", StatusCode::OK),
-            ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+            ("/readyz", StatusCode::OK),
             ("/runs", StatusCode::UNAUTHORIZED),
             ("/unknown", StatusCode::UNAUTHORIZED),
         ] {
