@@ -217,14 +217,18 @@ async fn main() -> anyhow::Result<()> {
 
 async fn maintain(runtime: runtime::Runtime) {
     let started = Instant::now();
+    let mut swept: Option<Instant> = None;
     loop {
         if let Err(error) = runtime.budget.prune(0).await {
             warn!(error = %error, "cache cleanup failed");
         }
         if started.elapsed() >= Duration::from_secs(120)
-            && let Err(error) = runtime.repo.fail_silent_runs().await
+            && swept.is_none_or(|swept| swept.elapsed() >= Duration::from_secs(300))
         {
-            warn!(error = %error, "failing silent runs failed");
+            swept = Some(Instant::now());
+            if let Err(error) = runtime.repo.fail_silent_runs().await {
+                warn!(error = %error, "failing silent runs failed");
+            }
         }
         tokio::select! {
             _ = runtime.shutdown.cancelled() => break,

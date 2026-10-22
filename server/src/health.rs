@@ -45,19 +45,8 @@ async fn readiness_status(
 async fn check_dependencies(runtime: &Runtime) -> Result<()> {
     let probe = TemporaryFile(runtime.cache.join(format!("{}.probe", Uuid::new_v4())));
     tokio::try_join!(
-        runtime
-            .database
-            .query("SELECT 1")
-            .fetch_one::<u8>()
-            .err_into::<anyhow::Error>(),
-        runtime
-            .s3
-            .head_bucket()
-            .bucket(runtime.bucket)
-            .send()
-            .err_into(),
         crate::cache_limits::space(&runtime.cache, 0),
-        fs::write(&probe.0, b"ready\n").err_into(),
+        fs::write(&probe.0, b"ready\n").err_into::<anyhow::Error>(),
     )?;
     Ok(())
 }

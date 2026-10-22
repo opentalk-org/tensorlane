@@ -80,8 +80,9 @@ A lost connection does not fail a run. Server startup and shutdown leave run
 status intact. Cached query results can be regenerated. Explicit run completion
 changes a run to succeeded or failed; initialization reopens it. Clients send a
 heartbeat every 30 seconds, which keeps the run
-alive. A run silent for 2 minutes (the client crashed, was OOM-killed or lost its node) is marked failed; if its client comes back,
-its next heartbeat returns it to running.
+alive. A run silent for 2 minutes (the client crashed, was OOM-killed or lost its node) is marked failed by the next sweep, at
+most 5 minutes later; if its client comes back, its next heartbeat returns it to running. Each server serves an active run's
+config from memory for 30 seconds, so a cancellation written by another replica takes effect within 30 seconds.
 
 Server batch-loading admission uses `config.tensorlane.max_load_memory_bytes`
 (default 256 MiB per run per server process), divided into independent stream
@@ -103,9 +104,9 @@ Remaining timeouts, each kept for a concrete reason:
 | Client TCP keepalive / `tcp_user_timeout` (reqwest defaults) | Detects dead peers and half-open connections; the request is retried. |
 | Server incoming upload chunk idle 30 s | Frees one of two upload slots from a dead uploader; the client retries. |
 | S3 connect 10 s, 600 s per attempt, 5 attempts, SDK stalled-stream protection | The S3 SDK has no TCP keepalive; these are the only dead-peer detection for S3. Failures are retried by the client. |
-| `/readyz` 2 s | A probe must answer. Never affects a run. |
+| `/readyz` 2 s | A probe must answer; it checks only the local cache (free space and writability), not ClickHouse or S3. Never affects a run. |
 | Server shutdown drain 30 s + 30 s | Lets in-flight requests finish; clients retry against the restarted server. |
-| Silent-run sweep 2 min (after 2 min of server uptime) | Marks crashed or killed clients failed; a returning client is revived. |
+| Silent-run sweep every 5 min, 2 min of silence (after 2 min of server uptime) | Marks crashed or killed clients failed, reading only runs with status in the last day; a returning client is revived. |
 | Two uploads and 128 asset ranges per server | Concurrency limits, not deadlines; waiters queue. |
 
 ClickHouse plan queries run with `max_execution_time=0`; other ClickHouse

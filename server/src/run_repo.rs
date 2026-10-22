@@ -178,7 +178,7 @@ impl RunRepo {
 
     pub async fn fail_silent_runs(&self) -> Result<()> {
         self.client
-            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT now64(9), run_id, ? FROM run_status GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ? AND max(timestamp) < now64(9) - INTERVAL 2 MINUTE")
+            .query("INSERT INTO run_status (timestamp, run_id, status) SELECT now64(9), run_id, ? FROM run_status WHERE run_id IN (SELECT run_id FROM run_status WHERE timestamp > now64(9) - INTERVAL 1 DAY) GROUP BY run_id HAVING toInt8(argMax(status, timestamp)) = ? AND max(timestamp) < now64(9) - INTERVAL 2 MINUTE")
             .bind(RunStatus::Failed as i8)
             .bind(RunStatus::Running as i8)
             .execute()
