@@ -105,6 +105,7 @@ impl HttpClient {
         loop {
             let result = if resync {
                 match self.tus(Method::HEAD, &["uploads", id], &[], None).await {
+                    Ok(stored) if stored == spec.size => return Ok(()),
                     Ok(stored) => {
                         offset = Some(stored);
                         resync = false;

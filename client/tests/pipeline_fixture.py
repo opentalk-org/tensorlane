@@ -285,7 +285,8 @@ class Fixture:
             case ["uploads"] if handler.command == "POST":
                 self.tus_requests.append(("POST", None, len(content)))
                 metadata = dict(
-                    pair.split(" ") for pair in handler.headers["Upload-Metadata"].split(",")
+                    pair.split(" ")
+                    for pair in handler.headers["Upload-Metadata"].split(",")
                 )
                 upload = base64.b64decode(metadata["id"]).decode()
                 spec = json.loads(base64.b64decode(metadata["spec"]))
@@ -303,7 +304,11 @@ class Fixture:
                 self.append(handler, upload, 201)
             case ["uploads", upload] if handler.command in {"PATCH", "HEAD"}:
                 self.tus_requests.append(
-                    (handler.command, handler.headers.get("Upload-Offset"), len(content))
+                    (
+                        handler.command,
+                        handler.headers.get("Upload-Offset"),
+                        len(content),
+                    )
                 )
                 state = self.resumable.get(upload)
                 if state is None:
@@ -392,9 +397,9 @@ class Fixture:
         elif hashlib.sha256(data).hexdigest() != spec["sha256"]:
             self.reply(handler, 400, {"message": "upload SHA256 does not match"})
         else:
-            self.save(handler, upload, spec, bytes(data), status, headers)
+            self.save(handler, upload, spec, bytes(data))
 
-    def save(self, handler, upload, spec, body, status=200, headers=None):
+    def save(self, handler, upload, spec, body):
         self.upload_started.set()
         self.upload_gate.wait(20)
         metadata = spec["metadata"]["metadata"]
@@ -425,9 +430,11 @@ class Fixture:
         if drop_reply:
             handler.close_connection = True
             return
-        if status == 200:
+        if handler.command == "PUT":
             self.reply(handler, 200, {"committed": True})
         else:
+            status = 201 if handler.command == "POST" else 204
+            headers = {"Tus-Resumable": "1.0.0", "Upload-Offset": str(len(body))}
             self.reply(handler, status, b"", headers)
 
     def close(self):

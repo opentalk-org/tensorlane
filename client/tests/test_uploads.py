@@ -94,10 +94,17 @@ class PipelineTests(PipelineCase):
         self.assertEqual(requests[0], ("POST", None, chunk))
         # The rejected chunk is resent after reading the offset. The next chunk's
         # reply is lost; reading the offset shows it was stored, so it is not resent.
-        patches = [(offset, size) for method, offset, size in requests if method == "PATCH"]
+        patches = [
+            (offset, size) for method, offset, size in requests if method == "PATCH"
+        ]
         self.assertEqual(
             patches,
-            [(str(chunk), chunk), (str(chunk), chunk), (str(2 * chunk), chunk), (str(3 * chunk), 5)],
+            [
+                (str(chunk), chunk),
+                (str(chunk), chunk),
+                (str(2 * chunk), chunk),
+                (str(3 * chunk), 5),
+            ],
         )
         self.assertEqual([method for method, _, _ in requests].count("HEAD"), 2)
 

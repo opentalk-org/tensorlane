@@ -27,4 +27,5 @@ def main():
             lane.flush()
 
 
-main()
+if __name__ == "__main__":
+    main()
