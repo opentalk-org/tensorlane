@@ -23,6 +23,27 @@ impl Runtime {
         }
     }
 
+    /// The keys (relative to the state prefix) of the state objects under `prefix`.
+    pub async fn list_state(&self, prefix: &str) -> Result<Vec<String>> {
+        let base = format!("{}/.tensorlane/", self.checkpoint_prefix);
+        let mut pages = self
+            .s3
+            .list_objects_v2()
+            .bucket(self.bucket)
+            .prefix(format!("{base}{prefix}"))
+            .into_paginator()
+            .send();
+        let mut keys = Vec::new();
+        while let Some(page) = pages.next().await {
+            for object in page?.contents() {
+                if let Some(key) = object.key().and_then(|key| key.strip_prefix(&base)) {
+                    keys.push(key.to_owned());
+                }
+            }
+        }
+        Ok(keys)
+    }
+
     pub async fn create_state<T: Serialize + DeserializeOwned + Clone>(
         &self,
         key: &str,

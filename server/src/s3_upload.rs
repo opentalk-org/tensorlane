@@ -173,7 +173,7 @@ async fn part(
         .build())
 }
 
-async fn existing(
+pub async fn existing(
     client: &Client,
     bucket: &str,
     key: &str,

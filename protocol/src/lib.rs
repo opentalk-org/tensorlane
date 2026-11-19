@@ -3,6 +3,25 @@ use std::collections::HashMap;
 
 pub const TRANSFER_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
+/// The tus protocol version of resumable uploads (`POST /uploads`).
+pub const TUS_VERSION: &str = "1.0.0";
+
+const MIB: u64 = 1024 * 1024;
+
+/// The S3 part size of a resumable upload of `size` bytes: 16 MiB, or more (in whole
+/// MiB) for files that would exceed the storage provider's 10,000 parts. Every part
+/// but the last has exactly this size.
+pub fn upload_part_bytes(size: u64) -> u64 {
+    (16 * MIB).max(size.div_ceil(10_000).div_ceil(MIB) * MIB)
+}
+
+/// The bytes the client sends per resumable-upload request: whole parts, about
+/// 64 MiB, so each request is short and a failure resends at most one chunk.
+pub fn upload_chunk_bytes(size: u64) -> u64 {
+    let part = upload_part_bytes(size);
+    part * (64 * MIB / part).max(1)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InitResponse {
     pub run_id: String,

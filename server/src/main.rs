@@ -43,6 +43,7 @@ mod runtime;
 mod s3_upload;
 mod sampling;
 mod shared_cache;
+mod tus_upload;
 mod upload_http;
 
 const STYLES: Styles = Styles::styled()

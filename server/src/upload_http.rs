@@ -34,6 +34,40 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
         "upload must start with its spec"
     );
     let mut spec: UploadSpec = serde_json::from_slice(&field.bytes().await?)?;
+    let (run, key, content_type) = validate(engine, id, &mut spec)?;
+    engine.active(run).await?;
+    let fingerprint = fingerprint(&spec)?;
+    let existing = engine
+        .create_state(&format!("uploads/{id}"), &fingerprint)
+        .await?;
+    ensure!(existing == fingerprint, "conflicting retry of upload ID");
+    let _slot = engine.upload_slots.acquire().await?;
+    crate::s3_upload::upload(
+        &engine.s3,
+        engine.bucket,
+        &key,
+        &content_type,
+        &spec,
+        &fingerprint,
+        &mut multipart,
+    )
+    .await?;
+    commit(engine, id, &spec, run, key).await?;
+    Ok(UploadStatus { committed: true })
+}
+
+/// The upload's fingerprint, stored with its R2 object and its retry record.
+pub fn fingerprint(spec: &UploadSpec) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(spec)?)))
+}
+
+/// Checks an upload's spec (lowercasing its SHA-256) and returns its run, R2 key
+/// and content type.
+pub fn validate(
+    engine: &Runtime,
+    id: Uuid,
+    spec: &mut UploadSpec,
+) -> Result<(Uuid, String, String)> {
     ensure!(!id.is_nil(), "upload ID must not be nil");
     ensure!(
         spec.sha256.len() == 64 && spec.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -71,23 +105,17 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
             )
         }
     };
-    engine.active(run).await?;
-    let fingerprint = hex::encode(Sha256::digest(serde_json::to_vec(&spec)?));
-    let existing = engine
-        .create_state(&format!("uploads/{id}"), &fingerprint)
-        .await?;
-    ensure!(existing == fingerprint, "conflicting retry of upload ID");
-    let _slot = engine.upload_slots.acquire().await?;
-    crate::s3_upload::upload(
-        &engine.s3,
-        engine.bucket,
-        &key,
-        content_type,
-        &spec,
-        &fingerprint,
-        &mut multipart,
-    )
-    .await?;
+    Ok((run, key, content_type.clone()))
+}
+
+/// Publishes an uploaded R2 object as its asset or artifact row.
+pub async fn commit(
+    engine: &Runtime,
+    id: Uuid,
+    spec: &UploadSpec,
+    run: Uuid,
+    key: String,
+) -> Result<()> {
     match &spec.metadata {
         UploadMetadata::Asset { metadata } => {
             crate::asset_commit::save(engine, id, metadata, &spec.sha256, spec.size).await?;
@@ -115,5 +143,5 @@ pub async fn save(engine: &Runtime, id: Uuid, mut multipart: Multipart) -> Resul
             insert.end().await?;
         }
     }
-    Ok(UploadStatus { committed: true })
+    Ok(())
 }
