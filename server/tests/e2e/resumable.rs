@@ -1,4 +1,4 @@
-use super::setup::{TestEnv, config};
+use super::setup::{KEY, TestEnv, config};
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Method, Response, StatusCode};
@@ -255,5 +255,41 @@ async fn check_replicas(env: &mut TestEnv, replica: &str) -> Result<()> {
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     let longer = append(env, replica, corrupt, 2 * part, &[0; 1000]).await?;
     assert_eq!(longer.status(), StatusCode::BAD_REQUEST);
+    python_client(env, &run).await
+}
+
+/// The Python client's uploads of a small and a multi-chunk file.
+async fn python_client(env: &TestEnv, run: &str) -> Result<()> {
+    let Some(python) = std::env::var_os("TENSORLANE_TEST_PYTHON") else {
+        return Ok(());
+    };
+    let size = 2 * tensorlane_protocol::upload_chunk_bytes(1 << 30) + 77;
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../client/tests/server_upload.py");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(python)
+            .arg(script)
+            .args([&env.url, run, &size.to_string()])
+            .env("TENSORLANE_API_KEY", KEY)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await??;
+    anyhow::ensure!(
+        output.status.success(),
+        "Python upload failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let ids: Vec<Uuid> = stdout.lines().map(str::parse).collect::<Result<_, _>>()?;
+    assert_eq!(ids.len(), 2);
+    assert_eq!(object(env, ids[0]).await?, b"small checkpoint");
+    let large = object(env, ids[1]).await?;
+    assert_eq!(large.len() as u64, size);
+    assert!(large.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
+    for id in ids {
+        assert_eq!(asset_rows(env, id).await?, 1);
+    }
     Ok(())
 }

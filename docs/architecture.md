@@ -146,7 +146,7 @@ Repeated parts (ranks, workers, streams) are drawn twice as examples; real count
 | (12) | Batch reader → prefetcher | Prefetch credit and memory released (POSIX semaphores), so the prefetcher can fetch another batch |
 | (13) | Uploader → metric writer | `PUT /runs/{id}/metrics/{request_id}` |
 | (14) | Metric writer → ClickHouse | Insert into `metrics` |
-| (15) | Uploader → upload handler | `PUT /uploads/{id}`: file stream + size + sha256 + metadata |
+| (15) | Uploader → upload handler | tus `POST /uploads` (size + sha256 + metadata + first chunk), then `PATCH /uploads/{id}` per chunk, `HEAD` to resume |
 | (16) | Upload handler → R2 + ClickHouse | Object in R2, then an `assets` or `artifacts` row |
 | (17) | Uploader → asset cache | Uploaded checkpoint copied into the cache, so it is never downloaded again |
 | (18) | Asset cache → training loops | `lane.asset("model")` returns a local path |

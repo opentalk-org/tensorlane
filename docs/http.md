@@ -21,7 +21,11 @@ Resume with `tensorlane.init()` using the same run ID. Initialization selects th
 | `GET /runs/{id}/inputs/{name}` | Size, ETag, optional SHA-256, and asset metadata |
 | `GET /runs/{id}/inputs/{name}/bytes` | 206 for an explicit byte range |
 | `PUT /runs/{id}/metrics/{request_id}` | 204; repeated IDs are deduplicated |
-| `PUT /uploads/{id}` | Streams multipart `spec` JSON followed by `file` directly into the final R2 object; 200 after publication |
+| `POST /uploads` (tus) | Creates a resumable upload from `Upload-Length` and `Upload-Metadata` (`id`, `spec`), storing any first bytes; 201 with `Upload-Offset` |
+| `PATCH /uploads/{id}` (tus) | Appends at `Upload-Offset`; 204 with the stored offset; the last byte completes and publishes the upload |
+| `HEAD /uploads/{id}` (tus) | 200 with the stored `Upload-Offset` and `Upload-Length`; completes and publishes a fully stored upload |
+| `OPTIONS /uploads` (tus) | 204 with `Tus-Version` and `Tus-Extension` |
+| `PUT /uploads/{id}` | Streams multipart `spec` JSON followed by `file` directly into the final R2 object in one request; 200 after publication. Kept for older clients |
 
 A new stream starts at zero; a resumed stream starts at its checkpoint cursor.
 Retrying a sequence uses the cached query result.
@@ -54,9 +58,33 @@ Uploads stream into standard S3 multipart parts on the final object key. Parts
 start at 16 MiB and grow for large files to fit the storage provider's 10,000-part
 maximum. The server buffers one part at a time. The server validates length and SHA-256 before completing
 the object, then publishes its asset or artifact row in ClickHouse. There are no
-local upload files or intermediate payload objects. A failed request aborts its
-multipart upload; an HTTP retry sends the whole file and can reach any replica.
-Existing final objects are checked against the upload's content and metadata.
+local upload files or intermediate payload objects. Existing final objects are
+checked against the upload's content and metadata.
+
+The client uploads with the [tus 1.0.0](https://tus.io/protocols/resumable-upload)
+resumable-upload protocol (core, `creation` and `creation-with-upload`), so no
+request lasts longer than one chunk however large the file is (a proxy limit on
+request duration, such as a Traefik `readTimeout`, no longer cuts large
+checkpoints). `POST /uploads` declares the upload: `Upload-Metadata` carries the
+client-chosen upload `id` and its JSON `spec` (size, SHA-256 and asset or artifact
+metadata), both base64, and the body carries the first chunk. A file up to one
+chunk is therefore a single request, as before. `PATCH /uploads/{id}` sends each
+further chunk at `Upload-Offset`. Chunks are whole parts of about 64 MiB
+(`upload_chunk_bytes`); the server stores whole parts (`upload_part_bytes`), so a
+request cut inside a part stores nothing of that part. After any failure the
+client reads the stored offset with `HEAD /uploads/{id}` and continues from there;
+a failure resends at most one chunk. A `409` at an offset that is still the stored
+one (for example a cancelled run) fails the upload, as do other 4xx responses.
+
+Any replica can serve any request. The S3 multipart upload ID and, for each stored
+part, the SHA-256 state after it are immutable R2 state records (`tus/{id}` and
+`tus/{id}/parts/{n}`), so the server still checks the whole file's SHA-256 before
+storing its last part. Storing the last byte completes the object and publishes
+its row; a `HEAD` or `PATCH` of a fully stored upload publishes again, so a lost
+completion is finished by the client's next request. A resumable upload is not
+aborted when a request fails; uploads abandoned by a crashed client stay as
+incomplete S3 multipart uploads, so the bucket needs a lifecycle rule that aborts
+incomplete multipart uploads after a few days.
 
 Small immutable R2 records hold upload fingerprints, checkpoint
 lineage, and metric retry receipts. They contain control metadata, never staged
@@ -66,8 +94,8 @@ how long a client keeps retrying.
 
 ## Recovery and limits
 
-Requests retry network failures, incomplete bodies, 408, 429, and server errors
-forever, with jittered backoff up to 10 seconds. The daemon logs a failing
+Requests retry network failures, incomplete bodies, 408, 429, 499 (a proxy that
+dropped the request), and server errors forever, with jittered backoff up to 10 seconds. The daemon logs a failing
 request once a minute and logs when it recovers. 202 (plan or batch still being
 prepared) is polled with backoff up to 2 seconds. Other 4xx responses fail
 immediately. There is no per-request or total deadline; dead connections are
@@ -101,7 +129,7 @@ Remaining timeouts, each kept for a concrete reason:
 | --- | --- |
 | Client connect 10 s | A blackholed host otherwise blocks each attempt for about 2 minutes; the attempt is retried. |
 | Client TCP keepalive / `tcp_user_timeout` (reqwest defaults) | Detects dead peers and half-open connections; the request is retried. |
-| Server incoming upload chunk idle 30 s | Frees one of two upload slots from a dead uploader; the client retries. |
+| Server incoming upload chunk idle 30 s | Frees one of two upload slots from a dead uploader; the client resumes from the stored offset. |
 | S3 connect 10 s, 600 s per attempt, 5 attempts, SDK stalled-stream protection | The S3 SDK has no TCP keepalive; these are the only dead-peer detection for S3. Failures are retried by the client. |
 | `/readyz` 2 s | A probe must answer. Never affects a run. |
 | Server shutdown drain 30 s + 30 s | Lets in-flight requests finish; clients retry against the restarted server. |

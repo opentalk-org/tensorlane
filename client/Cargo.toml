@@ -28,6 +28,7 @@ tokio-stream = "0.1.17"
 tensorlane-protocol = { path = "../protocol" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 sha2 = "0.10.9"
+base64 = "0.22"
 hex = "0.4.3"
 
 [build-dependencies]

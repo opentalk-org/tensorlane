@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import io
 import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 import time
@@ -72,6 +73,33 @@ class PipelineTests(PipelineCase):
         with self.assertRaisesRegex(RuntimeError, "fixture save failure"):
             self.daemon.save_asset("model", {"weight": torch.ones(2)})
         self.assertFalse(list(self.daemon._root.glob("*.pt")))
+
+    def test_small_upload_is_one_request(self):
+        self.start(workers=1, performance_metrics=False)
+        self.daemon.save_asset("model", self.file(content=b"small checkpoint"))
+        self.daemon.flush()
+        self.assertEqual(self.service.tus_requests, [("POST", None, 16)])
+        self.assertEqual(self.service.saved[0][2], b"small checkpoint")
+
+    def test_large_upload_resumes_after_lost_and_rejected_chunks(self):
+        chunk = 64 * 1024 * 1024
+        body = os.urandom(3 * chunk + 5)
+        self.service.drop_chunk_reply = True
+        self.service.proxy_rejects_chunk = True
+        self.start(workers=1, performance_metrics=False)
+        self.daemon.save_asset("model", self.file(content=body))
+        self.daemon.flush(timeout=120)
+        self.assertEqual(self.service.saved[0][2], body)
+        requests = self.service.tus_requests
+        self.assertEqual(requests[0], ("POST", None, chunk))
+        # The rejected chunk is resent after reading the offset. The next chunk's
+        # reply is lost; reading the offset shows it was stored, so it is not resent.
+        patches = [(offset, size) for method, offset, size in requests if method == "PATCH"]
+        self.assertEqual(
+            patches,
+            [(str(chunk), chunk), (str(chunk), chunk), (str(2 * chunk), chunk), (str(3 * chunk), 5)],
+        )
+        self.assertEqual([method for method, _, _ in requests].count("HEAD"), 2)
 
     def test_metrics_and_artifacts_still_work(self):
         self.start()

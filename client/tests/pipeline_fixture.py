@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 from email.parser import BytesParser
 from functools import partial
@@ -71,6 +72,8 @@ class Handler(BaseHTTPRequestHandler):
 
     do_POST = do_GET
     do_PUT = do_GET
+    do_PATCH = do_GET
+    do_HEAD = do_GET
 
     def log_message(self, *args):
         pass
@@ -94,6 +97,10 @@ class Fixture:
         self.saved = []
         self.heads = {}
         self.uploads = {}
+        self.resumable = {}
+        self.tus_requests = []
+        self.drop_chunk_reply = False
+        self.proxy_rejects_chunk = False
         self.transient_batches = 0
         self.truncate_asset_once = False
         self.drop_metric_reply = False
@@ -152,7 +159,11 @@ class Fixture:
             if handler.headers.get("Content-Type") == "application/json"
             else None
         )
-        action = parts[-1] if parts[-1] in {"init", "heartbeat", "end"} else parts[-2]
+        action = (
+            parts[-1]
+            if parts[-1] in {"init", "heartbeat", "end"} or len(parts) == 1
+            else parts[-2]
+        )
         if self.authorization:
             self.authorization.methods.add(action)
         match parts:
@@ -271,6 +282,51 @@ class Fixture:
                     handler.close_connection = True
                     return
                 self.reply(handler, 204)
+            case ["uploads"] if handler.command == "POST":
+                self.tus_requests.append(("POST", None, len(content)))
+                metadata = dict(
+                    pair.split(" ") for pair in handler.headers["Upload-Metadata"].split(",")
+                )
+                upload = base64.b64decode(metadata["id"]).decode()
+                spec = json.loads(base64.b64decode(metadata["spec"]))
+                with self.lock:
+                    state = self.resumable.setdefault(upload, (spec, bytearray()))
+                if state[0] != spec:
+                    self.reply(
+                        handler, 409, {"message": "conflicting retry of upload ID"}
+                    )
+                    return
+                if not state[1] and handler.headers.get("Content-Type") == (
+                    "application/offset+octet-stream"
+                ):
+                    state[1].extend(content)
+                self.append(handler, upload, 201)
+            case ["uploads", upload] if handler.command in {"PATCH", "HEAD"}:
+                self.tus_requests.append(
+                    (handler.command, handler.headers.get("Upload-Offset"), len(content))
+                )
+                state = self.resumable.get(upload)
+                if state is None:
+                    self.reply(handler, 404, {"message": "upload not found"})
+                    return
+                if handler.command == "PATCH":
+                    if int(handler.headers["Upload-Offset"]) != len(state[1]):
+                        self.reply(
+                            handler, 409, {"message": "upload offset does not match"}
+                        )
+                        return
+                    if self.proxy_rejects_chunk:
+                        self.proxy_rejects_chunk = False
+                        self.reply(handler, 499, b"Client Closed Request")
+                        return
+                    state[1].extend(content)
+                    if self.drop_chunk_reply and len(state[1]) < state[0]["size"]:
+                        self.drop_chunk_reply = False
+                        handler.close_connection = True
+                        return
+                    self.append(handler, upload, 204)
+                    return
+                self.reply(handler, 200, b"", {"Upload-Offset": str(len(state[1]))})
             case ["uploads", upload]:
                 message = BytesParser().parsebytes(
                     f"Content-Type: {handler.headers['Content-Type']}\r\n\r\n".encode()
@@ -325,7 +381,20 @@ class Fixture:
             samples.append(sample)
         self.reply(handler, 200, batch_bytes(stream, index, samples))
 
-    def save(self, handler, upload, spec, body):
+    def append(self, handler, upload, status):
+        """Replies to a resumable-upload request; the last byte saves the upload."""
+        spec, data = self.resumable[upload]
+        headers = {"Tus-Resumable": "1.0.0", "Upload-Offset": str(len(data))}
+        if len(data) > spec["size"]:
+            self.reply(handler, 400, {"message": "upload exceeds its length"})
+        elif len(data) < spec["size"]:
+            self.reply(handler, status, b"", headers)
+        elif hashlib.sha256(data).hexdigest() != spec["sha256"]:
+            self.reply(handler, 400, {"message": "upload SHA256 does not match"})
+        else:
+            self.save(handler, upload, spec, bytes(data), status, headers)
+
+    def save(self, handler, upload, spec, body, status=200, headers=None):
         self.upload_started.set()
         self.upload_gate.wait(20)
         metadata = spec["metadata"]["metadata"]
@@ -356,7 +425,10 @@ class Fixture:
         if drop_reply:
             handler.close_connection = True
             return
-        self.reply(handler, 200, {"committed": True})
+        if status == 200:
+            self.reply(handler, 200, {"committed": True})
+        else:
+            self.reply(handler, status, b"", headers)
 
     def close(self):
         self.upload_gate.set()

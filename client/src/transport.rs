@@ -1,13 +1,21 @@
 use crate::semaphore::{MemoryBudget, MemoryLease};
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{
     Method, StatusCode, Url,
-    header::{AUTHORIZATION, HeaderMap, HeaderValue},
-    multipart::{Form, Part},
+    header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue},
 };
-use std::{fs::File, io::Seek, sync::Arc, time::Duration};
-use tensorlane_protocol::{EndRequest, InitResponse, UploadSpec};
-use tokio::time::{Instant, sleep};
+use std::{
+    fs::File,
+    io::{Seek, SeekFrom},
+    sync::Arc,
+    time::Duration,
+};
+use tensorlane_protocol::{EndRequest, InitResponse, TUS_VERSION, UploadSpec, upload_chunk_bytes};
+use tokio::{
+    io::AsyncReadExt,
+    time::{Instant, sleep},
+};
 use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
@@ -16,9 +24,15 @@ pub struct HttpClient {
     base: Url,
 }
 
-enum Body<'a> {
+enum Body {
     Bytes(Vec<u8>),
-    Upload(&'a UploadSpec, &'a File),
+}
+
+/// A failed resumable-upload request: retried after reading the stored offset,
+/// or fatal.
+enum Failure {
+    Retry(String),
+    Fatal(anyhow::Error),
 }
 
 pub async fn connect(addr: &str, key: Option<&str>) -> Result<HttpClient> {
@@ -71,11 +85,166 @@ impl HttpClient {
         Ok((status, headers, bytes))
     }
 
+    /// Uploads `file` with the tus protocol: `POST /uploads` creates the upload with
+    /// its first chunk (a small file is one request), `PATCH /uploads/{id}` sends
+    /// each further chunk. After any failure the client reads the stored offset with
+    /// `HEAD` and continues from there, so a failure resends at most one chunk.
     pub async fn upload(&self, id: &str, spec: &UploadSpec, file: &File) -> Result<()> {
-        let body = Some(Body::Upload(spec, file));
-        self.send(Method::PUT, &["uploads", id], body, &[], None)
-            .await?;
-        Ok(())
+        let chunk = upload_chunk_bytes(spec.size);
+        let metadata = format!(
+            "id {},spec {}",
+            STANDARD.encode(id),
+            STANDARD.encode(serde_json::to_vec(spec)?)
+        );
+        let path = format!("/uploads/{id}");
+        // None until the upload is known to exist.
+        let mut offset: Option<u64> = None;
+        let mut resync = false;
+        let mut attempt = 0;
+        let mut failing: Option<(Instant, Instant)> = None;
+        loop {
+            let result = if resync {
+                match self.tus(Method::HEAD, &["uploads", id], &[], None).await {
+                    Ok(stored) => {
+                        offset = Some(stored);
+                        resync = false;
+                        continue;
+                    }
+                    Err(Failure::Retry(error)) if error.starts_with("TensorLane HTTP 404") => {
+                        offset = None;
+                        resync = false;
+                        continue;
+                    }
+                    Err(failure) => Err(failure),
+                }
+            } else if let Some(sent) = offset {
+                let length = chunk.min(spec.size - sent);
+                let headers = [("Upload-Offset", sent.to_string())];
+                let body = Some((file, sent, length));
+                let result = self
+                    .tus(Method::PATCH, &["uploads", id], &headers, body)
+                    .await;
+                match result {
+                    // A conflict at an offset the server still reports is not a lost
+                    // reply (for example a cancelled run).
+                    Err(Failure::Retry(error)) if error.starts_with("TensorLane HTTP 409") => {
+                        match self.tus(Method::HEAD, &["uploads", id], &[], None).await {
+                            Ok(stored) if stored == sent => {
+                                Err(Failure::Fatal(anyhow::anyhow!(error)))
+                            }
+                            Ok(stored) => {
+                                offset = Some(stored);
+                                continue;
+                            }
+                            Err(failure) => Err(failure),
+                        }
+                    }
+                    result => result,
+                }
+            } else {
+                let headers = [
+                    ("Upload-Length", spec.size.to_string()),
+                    ("Upload-Metadata", metadata.clone()),
+                ];
+                let body = Some((file, 0, chunk.min(spec.size)));
+                self.tus(Method::POST, &["uploads"], &headers, body).await
+            };
+            match result {
+                Ok(stored) => {
+                    if let Some((since, _)) = failing.take() {
+                        eprintln!("TensorLane {path} recovered after {:.0?}", since.elapsed());
+                    }
+                    attempt = 0;
+                    if stored == spec.size {
+                        return Ok(());
+                    }
+                    offset = Some(stored);
+                }
+                Err(Failure::Fatal(error)) => return Err(error),
+                Err(Failure::Retry(error)) => {
+                    let now = Instant::now();
+                    if failing.is_none_or(|(_, logged)| now - logged >= Duration::from_secs(60)) {
+                        let since = failing.map_or(now, |(since, _)| since);
+                        eprintln!(
+                            "TensorLane {path} failing for {:.0?}, retrying: {error}",
+                            since.elapsed()
+                        );
+                        failing = Some((since, now));
+                    }
+                    let backoff = Duration::from_millis((100u64 << attempt.min(7)).min(10_000));
+                    let jitter =
+                        Duration::from_millis((uuid::Uuid::new_v4().as_u128() % 20) as u64);
+                    sleep(backoff + jitter).await;
+                    attempt += 1;
+                    resync = true;
+                }
+            }
+        }
+    }
+
+    /// One resumable-upload request, with `length` bytes of `file` from `start` as
+    /// its body; returns the stored offset (`Upload-Offset`).
+    async fn tus(
+        &self,
+        method: Method,
+        parts: &[&str],
+        headers: &[(&str, String)],
+        body: Option<(&File, u64, u64)>,
+    ) -> std::result::Result<u64, Failure> {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| Failure::Fatal(anyhow::anyhow!("invalid HTTP base address")))?
+            .pop_if_empty()
+            .extend(parts);
+        let mut request = self
+            .client
+            .request(method.clone(), url)
+            .header("Tus-Resumable", TUS_VERSION);
+        for (name, value) in headers {
+            request = request.header(*name, value);
+        }
+        if let Some((file, start, length)) = body {
+            let mut input = file.try_clone().map_err(|e| Failure::Fatal(e.into()))?;
+            input
+                .seek(SeekFrom::Start(start))
+                .map_err(|e| Failure::Fatal(e.into()))?;
+            let stream = ReaderStream::new(tokio::fs::File::from_std(input).take(length));
+            request = request
+                .header(CONTENT_TYPE, "application/offset+octet-stream")
+                .header(CONTENT_LENGTH, length)
+                .body(reqwest::Body::wrap_stream(stream));
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| Failure::Retry(format!("{error:#}")))?;
+        let status = response.status();
+        if status.is_success() {
+            return response
+                .headers()
+                .get("Upload-Offset")
+                .and_then(|v| v.to_str().ok()?.parse().ok())
+                .ok_or_else(|| {
+                    Failure::Fatal(anyhow::anyhow!("TensorLane upload response has no offset"))
+                });
+        }
+        let bytes = response.bytes().await.unwrap_or_default();
+        let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+        let error = format!("TensorLane HTTP {status}: {message}");
+        // A PATCH conflict or missing upload is resolved by reading the stored offset;
+        // a HEAD 404 means the upload must be created.
+        let resolvable = match status {
+            StatusCode::CONFLICT | StatusCode::NOT_FOUND => method == Method::PATCH,
+            _ => false,
+        } || (method == Method::HEAD && status == StatusCode::NOT_FOUND);
+        if retryable(status) || resolvable {
+            Err(Failure::Retry(error))
+        } else {
+            Err(Failure::Fatal(anyhow::anyhow!(error)))
+        }
     }
 
     pub async fn batch(
@@ -115,7 +284,7 @@ impl HttpClient {
         &self,
         method: Method,
         parts: &[&str],
-        body: Option<Body<'_>>,
+        body: Option<Body>,
         headers: &[(&str, String)],
         memory: Option<(Arc<MemoryBudget>, u64)>,
     ) -> Result<(StatusCode, HeaderMap, Vec<u8>, Option<MemoryLease>)> {
@@ -138,16 +307,6 @@ impl HttpClient {
             }
             match &body {
                 Some(Body::Bytes(bytes)) => request = request.body(bytes.clone()),
-                Some(Body::Upload(spec, file)) => {
-                    let mut input = file.try_clone()?;
-                    input.rewind()?;
-                    let stream = ReaderStream::new(tokio::fs::File::from_std(input));
-                    let part =
-                        Part::stream_with_length(reqwest::Body::wrap_stream(stream), spec.size)
-                            .file_name("file");
-                    let form = Form::new().text("spec", serde_json::to_string(spec)?);
-                    request = request.multipart(form.part("file", part));
-                }
                 None => {}
             }
             let (error, retry_after) = match request.send().await {
@@ -196,10 +355,7 @@ impl HttpClient {
                         .ok()
                         .and_then(|v| v["message"].as_str().map(str::to_owned))
                         .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-                    let retryable = status == StatusCode::REQUEST_TIMEOUT
-                        || status == StatusCode::TOO_MANY_REQUESTS
-                        || status.is_server_error();
-                    if !retryable {
+                    if !retryable(status) {
                         bail!("TensorLane HTTP {status}: {message}");
                     }
                     (format!("TensorLane HTTP {status}: {message}"), retry_after)
@@ -221,4 +377,13 @@ impl HttpClient {
             attempt += 1;
         }
     }
+}
+
+/// Statuses worth retrying: timeouts, rate limits, server errors and 499 (a proxy
+/// that dropped the request).
+fn retryable(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.as_u16() == 499
+        || status.is_server_error()
 }
