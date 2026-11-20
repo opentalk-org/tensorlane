@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, Weak},
+    time::{Duration, Instant},
 };
 use tensorlane_protocol::{AssetDownload, AssetMetadata, Checkpoint, InitResponse};
 use tokio::{fs, sync::Semaphore};
@@ -20,6 +21,9 @@ use crate::{
 
 pub(super) const LOAD_MEMORY_UNIT: usize = 1024;
 type LoadingPools = HashMap<(Uuid, String), Weak<Semaphore>>;
+/// How long an active run's config is served from memory before ClickHouse is
+/// asked again: a cancellation written elsewhere takes effect within this time.
+const ACTIVE_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct Runtime {
@@ -37,6 +41,7 @@ pub struct Runtime {
     pub upload_slots: Arc<Semaphore>,
     pub(super) loader: Arc<dyn Loader>,
     load_memory: Arc<Mutex<LoadingPools>>,
+    active_runs: Arc<Mutex<HashMap<Uuid, (Instant, Config)>>>,
 }
 
 pub enum Batch {
@@ -82,6 +87,7 @@ impl Runtime {
             asset_slots: Arc::new(Semaphore::new(128)),
             upload_slots: Arc::new(Semaphore::new(2)),
             load_memory: Arc::new(Mutex::new(HashMap::new())),
+            active_runs: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -146,15 +152,25 @@ impl Runtime {
     }
 
     pub async fn active(&self, id: Uuid) -> Result<Config> {
+        if let Some((checked, config)) = self.active_runs.lock().unwrap().get(&id)
+            && checked.elapsed() < ACTIVE_TTL
+        {
+            return Ok(config.clone());
+        }
         let record = self.repo.get(id).await?.context("run not found")?;
         ensure!(
             record.status != Some(RunStatus::Cancelled),
             "run is cancelled"
         );
-        Config::parse(&record.config)
+        let config = Config::parse(&record.config)?;
+        let mut active_runs = self.active_runs.lock().unwrap();
+        active_runs.retain(|_, (checked, _)| checked.elapsed() < ACTIVE_TTL);
+        active_runs.insert(id, (Instant::now(), config.clone()));
+        Ok(config)
     }
 
     pub async fn end(&self, id: Uuid, failed: bool) -> Result<()> {
+        self.active_runs.lock().unwrap().remove(&id);
         let record = self.repo.get(id).await?.context("run not found")?;
         if matches!(
             record.status,
@@ -287,6 +303,43 @@ mod tests {
         assert_eq!(same.available_permits(), 100);
         assert_eq!(second.available_permits(), 0);
         drop((second_permit, third_permit, other_run_permit));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_configs_are_cached_until_expiry_or_end() -> Result<()> {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("test"))
+            .build();
+        let runtime = Runtime::new(
+            clickhouse::Client::default().with_url("http://127.0.0.1:9"),
+            aws_sdk_s3::Client::from_conf(config),
+            "test",
+            PathBuf::from("unused"),
+            crate::cache_limits::Budget::new(PathBuf::from("unused"), u64::MAX),
+            CancellationToken::new(),
+            "checkpoints",
+            "metrics",
+        )?;
+        let document = serde_json::json!({"queries": {"training": {"sql": "SELECT 1"}}});
+        let config = Config::parse(document.as_object().unwrap())?;
+        let (fresh, expired) = (Uuid::new_v4(), Uuid::new_v4());
+        runtime.active_runs.lock().unwrap().extend([
+            (fresh, (Instant::now(), config.clone())),
+            (expired, (Instant::now() - ACTIVE_TTL, config)),
+        ]);
+        assert!(
+            runtime
+                .active(fresh)
+                .await?
+                .queries
+                .contains_key("training")
+        );
+        assert!(runtime.active(expired).await.is_err());
+        assert!(runtime.end(fresh, false).await.is_err());
+        assert!(runtime.active(fresh).await.is_err());
         Ok(())
     }
 }
